@@ -51,9 +51,18 @@ fi
 # Cached after the first run, so this costs a fraction of a second.
 docker build -q -t "$IMAGE" -f Dockerfile.toolchain . >/dev/null
 
+# Joining the stack's own network is how the conformance suite reaches a Server
+# that publishes no port to the outside — which is the case in CI, and is the
+# arrangement a real deployment has anyway.
+if [ -n "${AJ_DOCKER_NETWORK:-}" ]; then
+    NETWORK="--network=$AJ_DOCKER_NETWORK"
+else
+    NETWORK=''
+fi
+
 run() {
     # shellcheck disable=SC2086
-    docker run --rm $TTY \
+    docker run --rm $TTY $NETWORK \
         -v "$HOST_DIR:/work" \
         -v "$CARGO_VOLUME:/cargo" \
         -v "$TARGET_VOLUME:/work/target" \

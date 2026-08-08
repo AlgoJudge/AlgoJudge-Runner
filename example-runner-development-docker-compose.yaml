@@ -33,7 +33,10 @@ services:
 
   server:
     build:
-      context: ../AlgoJudge-Server
+      # A sibling checkout by default, which is how the workspace is laid out.
+      # Overridable because GitHub Actions cannot check a repository out above
+      # its own workspace, so CI puts it in a subdirectory and says so here.
+      context: ${AJ_SERVER_CONTEXT:-../AlgoJudge-Server}
       dockerfile: AlgoJudge.Server/Dockerfile
     restart: unless-stopped
     depends_on:

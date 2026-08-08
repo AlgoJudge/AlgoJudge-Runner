@@ -53,20 +53,29 @@ jobs:
       - name: Check out
         uses: actions/checkout@v7
 
-      # The stack builds the Server from a sibling checkout, exactly as it does
-      # on a developer's machine.
-      - name: Check out the Server beside it
+      # The stack builds the Server from source. A checkout may not go above
+      # the workspace, so it lands in a subdirectory and the compose file is
+      # told where to look.
+      - name: Check out the Server
         uses: actions/checkout@v7
         with:
           repository: AlgoJudge/AlgoJudge-Server
-          path: ../AlgoJudge-Server
+          path: algojudge-server
 
       - name: Bring up PostgreSQL, the Server and the Runner
+        env:
+          AJ_SERVER_CONTEXT: ./algojudge-server
         run: >
           docker compose -f example-runner-development-docker-compose.yaml
           up -d --build --wait
 
+      # On the stack's network, addressing the Server by its service name. No
+      # published port is involved, so this works the same here as it would
+      # against a deployment.
       - name: Prove the protocol against a real Server
+        env:
+          AJ_DOCKER_NETWORK: algojudge-runner-dev_default
+          AJ_TEST_SERVER: http://server:8080/api/v1
         run: ./x test --test conformance -- --include-ignored --test-threads=1
 
       - name: What the Runner said
