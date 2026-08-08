@@ -1,0 +1,15 @@
+[package]
+name = "aj-package"
+description = "The standard-io@1 package: safe extraction, config.yml, tests and groups."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_yaml_ng.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zip.workspace = true
