@@ -1,0 +1,26 @@
+[package]
+name = "aj-protocol"
+description = "The Server-Runner contract: identity, the handshake, leases, files."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+rand_core.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# A session cookie, for the manager half of the conformance harness: approving a
+# Runner is an ordinary manager act and does not use a Runner token.
+reqwest = { workspace = true, features = ["cookies"] }

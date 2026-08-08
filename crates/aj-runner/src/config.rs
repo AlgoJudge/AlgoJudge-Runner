@@ -1,0 +1,99 @@
+//! Configuration, in the shape the rest of the product already uses.
+//!
+//! Prefix `AJ_`, `__` between sections — the same convention the Server reads
+//! (`builder.Configuration.AddEnvironmentVariables(prefix: "AJ_")`). One
+//! convention across two components means an operator writing a Compose file
+//! does not have to remember which service spells it which way.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+pub struct Config {
+    /// **Including `/api/v1`.** The Server serves nothing outside that prefix.
+    pub base_url: String,
+    pub name: String,
+    pub key_path: PathBuf,
+    pub problem_types: Vec<String>,
+
+    pub poll_min: Duration,
+    pub poll_max: Duration,
+    pub heartbeat: Duration,
+
+    /// A request. The Server clamps it to `[60, 3600]` and answers with the
+    /// deadline it actually granted.
+    pub lease_seconds: u32,
+
+    pub cache_path: PathBuf,
+    pub cache_max_bytes: u64,
+}
+
+impl Config {
+    pub fn from_environment() -> anyhow::Result<Self> {
+        let base_url = var("Server__BaseUrl").ok_or_else(|| {
+            anyhow::anyhow!(
+                "AJ_Server__BaseUrl is required, and must include /api/v1 \
+                 (for example http://server:8080/api/v1)"
+            )
+        })?;
+
+        if !base_url.contains("/api/") {
+            // Said plainly at start rather than discovered as a wall of 404s:
+            // the Server's path guard answers with an empty body, so a base URL
+            // missing the prefix fails with nothing to read.
+            anyhow::bail!("AJ_Server__BaseUrl is {base_url:?}, which has no /api/v1 prefix");
+        }
+
+        Ok(Self {
+            base_url,
+            name: var("Runner__Name").unwrap_or_else(default_name),
+            key_path: var("Runner__KeyPath")
+                .unwrap_or_else(|| "/var/lib/algojudge-runner/identity.key".into())
+                .into(),
+            problem_types: var("Runner__ProblemTypes")
+                .unwrap_or_else(|| "standard-io@1".into())
+                .split(',')
+                .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty())
+                .collect(),
+
+            poll_min: Duration::from_secs(number("Poll__MinSeconds", 1)),
+            poll_max: Duration::from_secs(number("Poll__MaxSeconds", 30)),
+            heartbeat: Duration::from_secs(number("Heartbeat__Seconds", 60)),
+
+            lease_seconds: number("Lease__RequestSeconds", 600) as u32,
+
+            cache_path: var("Cache__Path")
+                .unwrap_or_else(|| "/var/cache/algojudge-runner".into())
+                .into(),
+            cache_max_bytes: number("Cache__MaxBytes", 10 * 1024 * 1024 * 1024),
+        })
+    }
+}
+
+fn var(key: &str) -> Option<String> {
+    std::env::var(format!("AJ_{key}"))
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+
+/// A malformed number is a refusal, not a silent default.
+///
+/// Falling back would mean an operator who typed `AJ_Poll__MaxSeconds=3O` — a
+/// letter O — gets thirty seconds and never learns why their setting did
+/// nothing.
+fn number(key: &str, fallback: u64) -> u64 {
+    match var(key) {
+        None => fallback,
+        Some(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("AJ_{key} is {value:?}, which is not a number")),
+    }
+}
+
+fn default_name() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or_else(|| "algojudge-runner".into())
+}
