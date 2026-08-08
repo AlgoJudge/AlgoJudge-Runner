@@ -378,33 +378,37 @@ async fn the_lease_deadline_comes_from_the_server_not_from_the_request() {
         "a claim must carry the deadline the Server granted",
     );
 
-    // **Renewal replaces the deadline; it does not extend it.** Claimed for ten
-    // minutes and renewed asking for one second — clamped to the sixty-second
-    // floor — the deadline moves *earlier*, not later.
-    //
-    // Found by this test failing on an assertion that renewal only ever moves
-    // forward. It does not, and a Runner that renewed with a small number while
-    // still working would shorten its own lease and hand the job to somebody
-    // else. Hence the rule this client follows: **ask for the same interval
-    // every time, and believe the answer.**
-    let shortened = server
+    // **Renewing never shortens.** This test originally asserted the opposite —
+    // that renewal only ever moves the deadline forward — and failed, because
+    // the Server replaced the deadline outright: claimed for ten minutes,
+    // renewed asking for one second (clamped to the sixty-second floor), and
+    // the deadline moved eight minutes *closer*. The Server was changed on
+    // 2026-08-09 to keep the later of the two, because a call named "renew"
+    // must not be able to hand a job away from the Runner that is working on
+    // it.
+    let renewed = server
         .renew(&job.job_id, &job.lease_token, Some(1))
         .await
         .expect("renewal");
-    assert_eq!(shortened.lease_token, job.lease_token);
+    assert_eq!(renewed.lease_token, job.lease_token);
+    // Compared to the millisecond rather than exactly. PostgreSQL stores
+    // microseconds and the Server's clock keeps hundred-nanosecond ticks, so the
+    // deadline a claim returns straight from memory has more precision than the
+    // same deadline read back afterwards — the tail differs by a couple of
+    // hundred nanoseconds with nothing having moved.
     assert!(
-        shortened.lease_expires_at < job.lease_expires_at,
-        "renewal replaces rather than extends: {} should be before {}",
-        shortened.lease_expires_at,
+        to_millis(&renewed.lease_expires_at) >= to_millis(&job.lease_expires_at),
+        "renewing moved the deadline from {} back to {}",
         job.lease_expires_at,
+        renewed.lease_expires_at,
     );
 
-    // Asking for the full interval again puts it back out.
-    let renewed = server
-        .renew(&job.job_id, &job.lease_token, Some(600))
+    // And asking for more than is held does move it out.
+    let extended = server
+        .renew(&job.job_id, &job.lease_token, Some(3600))
         .await
         .expect("renewal");
-    assert!(renewed.lease_expires_at > shortened.lease_expires_at);
+    assert!(extended.lease_expires_at > renewed.lease_expires_at);
 
     let _ = server
         .report(
@@ -721,6 +725,16 @@ async fn claim_ours(server: &Server) -> aj_protocol::wire::ClaimedJob {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     panic!("nothing was queued within fifteen seconds — did the submission fail?");
+}
+
+/// An ISO-8601 instant cut to the millisecond, so two of them compare on what
+/// both sides actually agree about. Lexicographic order is date order for this
+/// format, which is why these stay strings.
+fn to_millis(at: &str) -> String {
+    match at.find('.') {
+        Some(dot) => at.chars().take(dot + 4).collect(),
+        None => at.to_owned(),
+    }
 }
 
 fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
