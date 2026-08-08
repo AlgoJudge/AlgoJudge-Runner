@@ -1,0 +1,16 @@
+[package]
+name = "aj-standard-io"
+description = "The standard-io@1 handler: comparison, the checker contract, scoring."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aj-package = { path = "../aj-package" }
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

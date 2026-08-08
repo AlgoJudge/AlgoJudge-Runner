@@ -4,6 +4,7 @@ members = [
     "crates/aj-package",
     "crates/aj-protocol",
     "crates/aj-runner",
+    "crates/aj-standard-io",
     "crates/aj-sandbox",
 ]
 

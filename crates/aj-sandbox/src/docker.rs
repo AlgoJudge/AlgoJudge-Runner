@@ -183,12 +183,23 @@ impl Sandbox for Docker {
         // cgroup v2 is a hard requirement, and the runtime is the honest place
         // to ask: reading `/sys/fs/cgroup` from inside the Runner's own
         // container answers a different question.
+        //
+        // **What v1 does and does not do**, measured rather than assumed
+        // (2026-08-09, Docker Desktop 24.0.7 on a WSL2 kernel): it *enforces*
+        // the limits. A container over its memory limit is OOM-killed and
+        // `OOMKilled` is reported, and the whole adversarial suite passes. What
+        // it does not give is honest **measurement** — `memory.peak` and
+        // `cpu.stat` are v2 interfaces, and `isolate` 2.x dropped v1 outright.
+        // So the refusal below is about the number shown beside a verdict, not
+        // about whether the sandbox holds.
         let info = self.client.info().await?;
         match info.cgroup_version {
             Some(SystemInfoCgroupVersionEnum::_2) => Ok(()),
             other => Err(Error::Refused(format!(
-                "this host reports cgroup version {other:?}, and the Runner requires v2 — \
-                 memory limits and process-tree accounting are not reliable on v1",
+                "this host reports cgroup version {other:?}, and the Runner requires v2. \
+                 The limits are enforced on v1, but peak memory and CPU time cannot be \
+                 measured honestly, and a number shown to a participant beside their \
+                 verdict has to be right",
             ))),
         }
     }

@@ -37,9 +37,9 @@ async fn sandbox() -> Docker {
     //
     // It exists because a developer machine is often Docker Desktop, which may
     // still report v1, and the alternative is that the isolation suite is never
-    // run outside CI. Most of what it asserts — read-only root, no network, the
-    // output cap, the wall clock, the process limit — does not depend on the
-    // cgroup version at all.
+    // run outside CI. **Every case here passes on v1**, memory included — what
+    // v1 lacks is honest measurement of peak memory and CPU time, which is what
+    // the Runner refuses over and which nothing in this file asserts.
     if let Err(e) = docker.preflight().await {
         assert!(
             std::env::var("AJ_SANDBOX_ALLOW_CGROUP_V1").is_ok(),
@@ -52,15 +52,6 @@ async fn sandbox() -> Docker {
     docker.ensure_image(IMAGE).await.expect("the test image");
     docker.sweep().await.expect("a clean slate");
     docker
-}
-
-/// Whether the host can be trusted to enforce a memory limit precisely.
-///
-/// cgroup v1 does enforce `memory.limit_in_bytes`, but its accounting and its
-/// OOM reporting are the reason v2 is required in the first place, so a memory
-/// assertion here would be measuring the host rather than the sandbox.
-fn cgroup_v2() -> bool {
-    std::env::var("AJ_SANDBOX_ALLOW_CGROUP_V1").is_err()
 }
 
 fn shell(script: &str) -> Profile {
@@ -162,28 +153,21 @@ async fn a_fork_bomb_cannot_outgrow_its_process_limit() {
 async fn exhausting_memory_is_an_out_of_memory_kill() {
     let docker = sandbox().await;
 
-    // Skipped rather than weakened where the host cannot enforce it.
+    // Allocation has to be fast and unambiguous, or this test measures the
+    // workload rather than the limit.
     //
-    // Observed on Docker Desktop 24.0.7 (WSL2 kernel 5.15, cgroup v1) on
-    // 2026-08-09: a program growing a string without bound under a 16 MiB limit
-    // ran for the **full twenty seconds** and was then killed by this harness's
-    // wall clock, exit 137, with `OOMKilled` never reported. The limit was not
-    // enforced in any way an evaluation could observe.
-    //
-    // That is the cgroup v2 requirement earning itself: on v1 a memory-limit
-    // verdict would silently become a time-limit one, and a participant would be
-    // told to make their solution faster when the problem was that it was too
-    // large.
-    if !cgroup_v2() {
-        eprintln!("skipped: this host cannot enforce a memory limit observably");
-        return;
-    }
-
+    // A first version grew a string in `awk`, which in busybox is quadratic:
+    // under a 16 MiB limit it never reached the limit inside twenty seconds and
+    // was killed by the wall clock instead. That was read as "the host does not
+    // enforce memory limits" and it was **wrong** — a direct probe on the same
+    // host (cgroup v1) showed `OOMKilled=true`. Writing to a tmpfs charges pages
+    // to the cgroup immediately and gets there in a fraction of a second.
     let outcome = docker
         .run(
-            &shell("awk 'BEGIN { s = \"\"; while (1) { s = s \"xxxxxxxxxxxxxxxx\" } }'")
-                .memory_kib(16 * 1024)
-                .wall_clock(Duration::from_secs(20)),
+            &shell("dd if=/dev/zero of=/tmp/big bs=1M count=512")
+                .memory_kib(32 * 1024)
+                .tmpfs_kib(1024 * 1024)
+                .wall_clock(Duration::from_secs(30)),
         )
         .await
         .expect("the run");
