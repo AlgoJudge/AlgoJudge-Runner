@@ -1,0 +1,10 @@
+# Build output lives in a named Docker volume, not here — see `./x`. This entry
+# is for anyone who runs cargo directly on a host that has it.
+/target/
+
+# A Runner's identity and its cache are per installation and never shared. The
+# key in particular must not reach a repository: there is no rotation, so a
+# leaked one is a Runner that has to be revoked and re-registered.
+*.key
+*.key.partial
+/cache/

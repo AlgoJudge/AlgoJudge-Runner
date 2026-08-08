@@ -5,56 +5,88 @@ Isolated execution and evaluation of submitted solutions for
 
 ## Status
 
-**Not implemented.** This repository currently holds a licence, a contributor
-list and its development instructions — no code, no build, no tests.
+**The protocol, and nothing else yet.** This Runner registers, is approved,
+authenticates, claims jobs, holds and renews a lease, downloads and verifies
+packages, and reports results idempotently. It does **not** compile or run
+anything — the verdict it reports is fabricated, on purpose, so that the
+protocol could be finished and proven before a sandbox existed.
 
-It is published so the intended architecture is visible while the component is
-designed. Nothing here is usable yet.
+Evaluation is the next milestone.
 
 ## What it is for
 
-The Runner is the component that actually runs untrusted code. It is deliberately
-interchangeable: the Server must never depend on any particular Runner
-implementation, and several may coexist — a native one, a Judge0 adapter, one
-per specialised task type.
+The Runner is the component that actually runs untrusted code. It is
+deliberately interchangeable: the Server must never depend on any particular
+Runner implementation, and several may coexist.
 
-The intended contract:
+The contract is
+`AlgoJudge-Design/specifications/server-runner/SERVER_RUNNER_API.md`, v1.0,
+**`Accepted` 2026-08-08**, with nine conformance cases in
+`AlgoJudge.Server.Tests/RunnerConformanceTests.cs`.
 
-1. the Runner opens an **outbound** connection to the Server, so it can live
-   behind NAT and needs no public address
-2. it authenticates as a machine client and publishes its capabilities —
-   supported task types, languages, tags
-3. it claims a compatible job, downloads the runner package and verifies it
-4. it prepares an isolated environment, compiles, runs the tests, applies limits
-5. it reports progress, then submits the result **idempotently**
-6. infrastructure failures are reported separately from solution verdicts
+Three properties of it shape everything here:
 
-## Decisions taken
+1. **The Runner opens an outbound connection.** The Server never calls a Runner,
+   which is what lets one sit behind a domestic router with no public address.
+2. **There is no socket for a Runner.** The queue is polled, and an empty one
+   answers `204` — a normal state, not an error. This is simpler than a socket,
+   survives a dropped connection with no reconnection logic, and cannot deliver
+   a job twice.
+3. **The Runner is stateless apart from a package cache.** One that dies
+   mid-evaluation resumes nothing and nobody comes back for that work. The
+   Server's **lease** is the whole recovery story: it expires, the job returns
+   to the queue, and the Runner that woke up late is refused rather than allowed
+   to overwrite whoever holds it now.
 
-- **The first version uses Judge0 as the sandbox.** The coupling to Judge0
-  belongs here, never in the Server.
-- `EvaluationJob` is deferred as a Server entity. Evaluation is tracked on
-  `Result`, which names the Runner that is evaluating or has evaluated a
-  submission.
-- The Server–Runner protocol is a **proposal**, not an accepted specification.
-  It lives in `AlgoJudge-Design` as `proposals/Server-Runner-api.md`, status
-  `Proposed`. It does not yet cover atomic job reservation, leases, heartbeat,
-  cancellation, versioning or key rotation — all of which have to be settled
-  before this is built.
+## How it is built
+
+**Rust**, one static `x86_64-unknown-linux-musl` binary with every backend
+compiled in and chosen by configuration, shipped in a minimal image.
+`linux/amd64`; **cgroup v2 is required** and is checked at start.
+
+A `.deb` with a systemd unit is supported and **not preferred in production**:
+the Runner needs a container runtime anyway, so a package that suggests
+otherwise invites installing it where it cannot work.
+
+Rust does not have to be installed to work on this. `cargo` runs in a pinned
+container:
+
+```sh
+./x build
+./x test
+./x fmt
+./x clippy
+```
+
+## Isolation
+
+**Sibling containers.** The Runner is trusted and holds the container runtime's
+socket; the containers that run submissions never do. Each step of the pipeline
+— compile, run, check — has its own profile, and every one of them drops all
+capabilities, disables the network, mounts a read-only root filesystem, runs as
+an unprivileged user, and caps memory, processes, CPU, wall time and output.
+One container **per test**, never reused.
+
+Two models are rejected, with the reasons written down in `docs/SECURITY.md`:
+**privileged Docker-in-Docker**, and **passing the socket into the submission
+container**. That document also states plainly that mounting a socket read-only
+restricts nothing that matters — the boundary is the host, which is why the
+evaluation host is treated as compromised by assumption: no secrets,
+reproducible, nothing else on it.
+
+`isolate` 2.x is accepted conditionally as the deepest supervisor, after a spike
+on cgroup delegation and the capabilities it needs.
 
 ## Security requirements
 
-These are requirements, not descriptions of existing behaviour. Every submission
-is untrusted and must be assumed hostile: attempts to read system files and
-secrets, write outside the working directory, spawn processes, fork-bomb,
+Every submission is untrusted and assumed hostile: attempts to read system files
+and secrets, write outside the working directory, spawn processes, fork-bomb,
 exhaust memory or CPU, produce unbounded output, reach the network, survive past
 the end of a test, or interfere with another job.
 
-The minimum bar: an isolated environment, no network by default, restricted
-privileges, a separate working directory, limits on CPU, wall time, memory,
-processes, disk and output, killing the whole process tree, no secrets inside
-the sandbox, cleanup after every outcome including timeout and cancellation, and
-audit logging.
+These are held to by an **adversarial suite that runs in CI**, one case per
+attack with the outcome it must produce. A suite that is not a gate is not a
+gate.
 
 An earlier LXD-based prototype from the engineering thesis is a source of
 security **test cases**, not a production specification.

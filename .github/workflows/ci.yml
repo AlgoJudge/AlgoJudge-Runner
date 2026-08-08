@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # The same compiler `./x` uses, pinned by digest rather than by tag so that
+    # CI and a developer's machine cannot drift onto two versions without
+    # either of them being told.
+    container:
+      image: rust@sha256:3b2879047d42784ca9403ad20c51ed3df361a50f1df96f5777d39b4e33aa65cd
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # `rust:slim` installs the minimal profile, which has neither.
+      - name: Add the components the gate needs
+        run: rustup component add rustfmt clippy
+
+      # Cheapest first: formatting fails in a second, a release build takes
+      # minutes, and there is no reason to spend the minutes to learn about a
+      # missing newline.
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --release
+
+      # Unit tests only. Anything that needs a Server, a database or a container
+      # runtime is `#[ignore]`d and runs in `integration` below.
+      - name: Test
+        run: cargo test --workspace
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # The stack builds the Server from a sibling checkout, exactly as it does
+      # on a developer's machine.
+      - name: Check out the Server beside it
+        uses: actions/checkout@v7
+        with:
+          repository: AlgoJudge/AlgoJudge-Server
+          path: ../AlgoJudge-Server
+
+      - name: Bring up PostgreSQL, the Server and the Runner
+        run: >
+          docker compose -f example-runner-development-docker-compose.yaml
+          up -d --build --wait
+
+      - name: Prove the protocol against a real Server
+        run: ./x test --test conformance -- --include-ignored --test-threads=1
+
+      - name: What the Runner said
+        if: always()
+        run: >
+          docker compose -f example-runner-development-docker-compose.yaml
+          logs --no-color runner
+
+      - name: Tear it down
+        if: always()
+        run: >
+          docker compose -f example-runner-development-docker-compose.yaml
+          down -v
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # Built, not pushed. No registry has been chosen, and building is what
+      # catches a Dockerfile that stopped matching the workspace.
+      - name: Build the container image
+        run: docker build -t algojudge-runner:ci .

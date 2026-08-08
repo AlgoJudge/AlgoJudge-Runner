@@ -1,0 +1,78 @@
+# PostgreSQL, the Server and a Runner, for development and for the tests that
+# need all three.
+#
+#   docker compose -f example-runner-development-docker-compose.yaml up -d --build --wait
+#   ./x test --test conformance -- --include-ignored
+#   docker compose -f example-runner-development-docker-compose.yaml down -v
+#
+# **Not the production stack.** That belongs in `AlgoJudge-Ops` and does not
+# exist yet. This one builds the Server from a sibling checkout, so it needs
+# `AlgoJudge-Server` beside this repository, and it publishes the Server's port
+# so a test on the host can drive it.
+
+name: algojudge-runner-dev
+
+services:
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    # One level above PGDATA on purpose: PostgreSQL 18 keeps its data in
+    # `/var/lib/postgresql/18/docker`, and mounting the inner path shadows the
+    # version directory the image creates.
+    volumes:
+      - algojudge_runner_dev_db:/var/lib/postgresql
+    environment:
+      POSTGRES_PASSWORD: algojudge
+      POSTGRES_USER: algojudge
+      POSTGRES_DB: algojudge
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U algojudge -d algojudge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: ../AlgoJudge-Server
+      dockerfile: AlgoJudge.Server/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Published so a test on the host can drive the manager and participant
+    # halves. Overridable because 8080 is a popular port and a developer may
+    # already have something on it — including another AlgoJudge stack.
+    ports:
+      - "127.0.0.1:${AJ_SERVER_PORT:-8080}:8080"
+    environment:
+      DOTNET_ENVIRONMENT: Development
+      AJ_ConnectionStrings__DbConnectionString: Host=postgres;Database=algojudge;Username=algojudge;Password=algojudge
+
+  runner:
+    build:
+      context: .
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      # The compose network name, not localhost: this is the Runner's own view
+      # of the Server, and it is a different address from the browser's.
+      AJ_Server__BaseUrl: http://server:8080/api/v1
+      AJ_Runner__Name: runner-dev
+      AJ_Runner__ProblemTypes: standard-io@1
+      # Short, so a developer watching the log sees it ask rather than wondering
+      # whether it is alive. Production leaves these alone.
+      AJ_Poll__MinSeconds: "1"
+      AJ_Poll__MaxSeconds: "5"
+      RUST_LOG: info,aj_protocol=debug
+    volumes:
+      - algojudge_runner_dev_identity:/var/lib/algojudge-runner
+      - algojudge_runner_dev_cache:/var/cache/algojudge-runner
+    # No ports. The Runner opens every connection itself, which is what lets a
+    # real one live behind NAT with no inbound access at all.
+
+volumes:
+  algojudge_runner_dev_db:
+  algojudge_runner_dev_identity:
+  algojudge_runner_dev_cache:
