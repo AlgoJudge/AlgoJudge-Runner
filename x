@@ -60,9 +60,24 @@ else
     NETWORK=''
 fi
 
+# The sandbox tests start sibling containers, so they need the runtime socket —
+# the same thing the Runner itself holds in production.
+#
+# Opt-in, and worth being clear about what it costs: **anything that can reach
+# this socket is root on the host.** Mounting it read-only would not change that;
+# the flag applies to the socket file, not to the API spoken over it. It is here
+# because running the isolation tests requires being the component that starts
+# containers, and it is off by default so an ordinary `./x test` does not quietly
+# take that privilege.
+if [ -n "${AJ_DOCKER_SOCKET:-}" ]; then
+    SOCKET='-v /var/run/docker.sock:/var/run/docker.sock'
+else
+    SOCKET=''
+fi
+
 run() {
     # shellcheck disable=SC2086
-    docker run --rm $TTY $NETWORK \
+    docker run --rm $TTY $NETWORK $SOCKET \
         -v "$HOST_DIR:/work" \
         -v "$CARGO_VOLUME:/cargo" \
         -v "$TARGET_VOLUME:/work/target" \
@@ -70,7 +85,9 @@ run() {
         -e CARGO_HOME=/cargo \
         -e CARGO_TERM_COLOR=always \
         -e AJ_TEST_SERVER \
+        -e AJ_SANDBOX_ALLOW_CGROUP_V1 \
         -e RUST_LOG \
+        -e "AJ_HOST_WORKDIR=$HOST_DIR" \
         --add-host=host.docker.internal:host-gateway \
         "$IMAGE" "$@"
 }

@@ -1,0 +1,16 @@
+[package]
+name = "aj-sandbox"
+description = "L3: running untrusted code, and stopping when it misbehaves."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bollard.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

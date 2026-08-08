@@ -1,10 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["crates/aj-package", "crates/aj-protocol", "crates/aj-runner"]
+members = [
+    "crates/aj-package",
+    "crates/aj-protocol",
+    "crates/aj-runner",
+    "crates/aj-sandbox",
+]
 
-# `aj-sandbox` and `aj-standard-io` arrive with the rest of the evaluation
-# pipeline. Creating them empty now would add two crates that compile to nothing
-# and two names in every dependency graph, to no end.
+# `aj-standard-io` — the handler that ties a package to a sandbox — arrives
+# next. Creating it empty now would add a crate that compiles to nothing and a
+# name in every dependency graph, to no end.
 
 [workspace.package]
 version = "0.1.0"
@@ -19,7 +24,12 @@ repository = "https://github.com/AlgoJudge/AlgoJudge-Runner"
 # graph, and it is what a reviewer reads to answer "which version". A comment
 # claiming a version here would be a second source that drifts from the first.
 anyhow = "1.0"
+async-trait = "0.1"
 base64 = "0.22"
+# The container layer. Speaks to Docker and to Podman, which keeps the
+# evaluation host's runtime a deployment choice rather than a code one.
+bollard = "0.19"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 hex = "0.4"
 # The same `rand_core` `ed25519-dalek` itself uses, so the graph holds one copy.

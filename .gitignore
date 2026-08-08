@@ -8,3 +8,4 @@
 *.key
 *.key.partial
 /cache/
+.sandbox-fixtures/

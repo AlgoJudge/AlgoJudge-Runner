@@ -90,6 +90,33 @@ jobs:
           docker compose -f example-runner-development-docker-compose.yaml
           down -v
 
+  # The release gate for the evaluation pipeline (D-8, 2026-08-06). Every case is
+  # a thing untrusted code will try; a suite that is not a gate is not a gate.
+  #
+  # It runs here rather than only on a developer's machine because this host has
+  # **cgroup v2**, which the Runner requires and which Docker Desktop may not
+  # provide — the memory case is skipped without it, and skipping it locally is
+  # exactly why it has to be asserted somewhere.
+  adversarial:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Show what this host can enforce
+        run: docker info --format 'cgroup {{.CgroupVersion}} / {{.CgroupDriver}}, kernel {{.KernelVersion}}'
+
+      - name: Run the adversarial suite
+        env:
+          AJ_DOCKER_SOCKET: "1"
+        run: >
+          ./x test -p aj-sandbox --test adversarial
+          -- --include-ignored --test-threads=1
+
+      - name: Leave no sandboxes behind
+        if: always()
+        run: docker ps -aq --filter label=algojudge.sandbox=1 | xargs -r docker rm -f
+
   docker:
     runs-on: ubuntu-latest
     steps:
