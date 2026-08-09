@@ -45,7 +45,18 @@ async fn main() -> anyhow::Result<()> {
     // cannot enforce a limit does not produce errors — it produces wrong
     // verdicts, which look like somebody's solution being wrong.
     let sandbox = aj_sandbox::Docker::connect()?;
-    sandbox.preflight().await?;
+    if let Err(e) = sandbox.preflight().await {
+        if !config.allow_cgroup_v1 {
+            return Err(e.into());
+        }
+        // Said on every start, at the loudest level there is, because a
+        // development override that is quiet is a production setting waiting to
+        // happen. It cannot be reported to the Server's panel: `MachineDto` is
+        // a closed shape and drops anything it does not name.
+        tracing::error!(
+            "STARTING BELOW SPECIFICATION — {e}.              AJ_Sandbox__AllowCgroupV1 is set. Times and memory reported beside              a verdict on this host are not to be trusted."
+        );
+    }
 
     // Job containers are siblings, so they outlive the process that made them.
     // Anything left by a previous incarnation goes before this one starts.

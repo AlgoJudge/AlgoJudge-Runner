@@ -39,6 +39,15 @@ pub struct Config {
     pub work_host_path: PathBuf,
 
     pub images: aj_standard_io::Images,
+
+    /// Starts anyway on a host that reports cgroup v1.
+    ///
+    /// **Off by default, and loud when on.** The limits are enforced on v1, but
+    /// peak memory and CPU time cannot be measured honestly there — and those
+    /// numbers are shown to a participant beside their verdict. This exists
+    /// because a developer machine is often Docker Desktop, which may still
+    /// report v1, and the alternative is a development stack that cannot start.
+    pub allow_cgroup_v1: bool,
 }
 
 impl Config {
@@ -85,6 +94,8 @@ impl Config {
 
             work_path: work.clone().into(),
             work_host_path: var("Work__HostPath").unwrap_or(work).into(),
+
+            allow_cgroup_v1: var("Sandbox__AllowCgroupV1").is_some(),
 
             images: aj_standard_io::Images {
                 cpp: var("Sandbox__Image__Cpp")

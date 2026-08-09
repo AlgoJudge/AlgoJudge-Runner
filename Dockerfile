@@ -19,17 +19,24 @@ WORKDIR /src
 # Manifests first, so a change to the source does not re-resolve or re-download
 # the dependency graph.
 COPY Cargo.toml Cargo.lock ./
+COPY crates/aj-package/Cargo.toml crates/aj-package/
 COPY crates/aj-protocol/Cargo.toml crates/aj-protocol/
 COPY crates/aj-runner/Cargo.toml crates/aj-runner/
-RUN mkdir -p crates/aj-protocol/src crates/aj-runner/src \
-    && echo '' > crates/aj-protocol/src/lib.rs \
+COPY crates/aj-sandbox/Cargo.toml crates/aj-sandbox/
+COPY crates/aj-standard-io/Cargo.toml crates/aj-standard-io/
+RUN for crate in aj-package aj-protocol aj-sandbox aj-standard-io; do \
+        mkdir -p "crates/$crate/src" && echo '' > "crates/$crate/src/lib.rs"; \
+    done \
+    && mkdir -p crates/aj-runner/src \
     && echo 'fn main() {}' > crates/aj-runner/src/main.rs \
     && cargo build --release --target x86_64-unknown-linux-musl \
-    && rm -r crates/aj-protocol/src crates/aj-runner/src
+    && rm -r crates/*/src
 
 COPY crates crates
-# The stub's fingerprint would otherwise let cargo think the crates are current.
-RUN touch crates/aj-protocol/src/lib.rs crates/aj-runner/src/main.rs \
+# The stubs' fingerprints would otherwise let cargo think the crates are
+# current. `find` rather than a list, so adding a crate does not silently ship a
+# binary built from an empty one.
+RUN find crates -name '*.rs' -exec touch {} + \
     && cargo build --release --target x86_64-unknown-linux-musl
 
 # The two directories the Runner writes to, created here so that a **named

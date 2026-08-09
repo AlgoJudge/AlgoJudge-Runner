@@ -116,6 +116,17 @@ containers, and both are easy to lose an afternoon to:
   bind mount is resolved by the daemon, so a path that is real to a
   containerised Runner and meaningless to the daemon produces an **empty
   directory** rather than an error — and tests then run against nothing.
+- `AJ_Sandbox__AllowCgroupV1` starts on a host the Runner would otherwise
+  refuse. Development only, and it says so at `ERROR` on every start; a quiet
+  override is a production setting waiting to happen.
+
+Two things about the socket, both learned the hard way. Docker Desktop's socket
+is `root:root` mode **755** — writable only by root — so a non-root container
+cannot use it and there is no group to join; on Linux it is `root:docker` mode
+660 and `group_add` is the answer, which keeps the process unprivileged. And a
+round is opened by the scheduler's scan rather than by the request that created
+it, so a submission sent in that gap is a genuine 404 and a test waits rather
+than retrying.
 
 When this repository is checked out inside the AlgoJudge workspace,
 `../PROJECT_CONTEXT.md` is the primary architecture context and takes precedence

@@ -67,10 +67,17 @@ Nothing here is claimed without a test that runs it.
 | `cargo test` | the pure parts — the checker contract, comparison, scoring, the archive defences |
 | `--test conformance` | the wire protocol, against a real Server, with this Runner as the client |
 | `--test adversarial` | the isolation, against real containers, one case per attack |
-| `--test judging` | a real submission compiled, run and marked — the only test that proves the whole thing |
+| `--test judging` | a real submission compiled, run and marked, against the committed package |
+| `--test end_to_end` | **the whole product**: a manager publishes, a participant submits, this Runner judges, and what is asserted is what the participant reads |
 
-The last three need a container runtime and are `#[ignore]`d so an ordinary
+The last four need a container runtime and are `#[ignore]`d so an ordinary
 `./x test` stays fast. All of them run in CI.
+
+`end_to_end` covers **six outcomes in one run** — accepted, wrong answer, time
+limit, compilation error, policy violation, and an infrastructure failure. The
+sixth is the one that is not a verdict: a package the Runner cannot open ends
+`failed` with **no score at all**, because a zero on a board reads as a wrong
+answer about a program that was never run.
 
 ## Isolation
 
@@ -90,6 +97,12 @@ reproducible, nothing else on it.
 
 `isolate` 2.x is accepted conditionally as the deepest supervisor, after a spike
 on cgroup delegation and the capabilities it needs.
+
+**cgroup v2 is required and is checked at start.** The limits are enforced on v1
+too — measured, not assumed — but peak memory and CPU time cannot be read
+honestly there, and those numbers are shown to a participant beside their
+verdict. `AJ_Sandbox__AllowCgroupV1` starts anyway, for a development machine
+whose Docker still reports v1, and says so at `ERROR` on every start.
 
 ## Security requirements
 

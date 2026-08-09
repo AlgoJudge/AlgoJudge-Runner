@@ -62,6 +62,16 @@ jobs:
           repository: AlgoJudge/AlgoJudge-Server
           path: algojudge-server
 
+      # The development compose sets `AJ_Sandbox__AllowCgroupV1`, which is only
+      # consulted when preflight fails — so on a v1 host the stack would start
+      # below specification and this job would pass while measuring nothing.
+      # Asserted rather than trusted.
+      - name: Refuse to judge on a host that cannot measure
+        run: |
+          version=$(docker info --format '{{.CgroupVersion}}')
+          echo "cgroup version $version"
+          test "$version" = "2"
+
       - name: Bring up PostgreSQL, the Server and the Runner
         env:
           AJ_SERVER_CONTEXT: ./algojudge-server
@@ -77,6 +87,21 @@ jobs:
           AJ_DOCKER_NETWORK: algojudge-runner-dev_default
           AJ_TEST_SERVER: http://server:8080/api/v1
         run: ./x test --test conformance -- --include-ignored --test-threads=1
+
+      # The milestone: a submission goes in and the right mark comes out, with
+      # the Runner in the stack doing the judging and nobody helping it.
+      - name: Build the language images
+        run: |
+          docker build -t algojudge/lang-cpp:local    images/cpp
+          docker build -t algojudge/lang-python:local images/python
+
+      - name: Judge every outcome, end to end
+        env:
+          AJ_DOCKER_NETWORK: algojudge-runner-dev_default
+          AJ_TEST_SERVER: http://server:8080/api/v1
+        run: >
+          ./x test -p aj-runner --test end_to_end
+          -- --include-ignored --test-threads=1
 
       - name: What the Runner said
         if: always()
