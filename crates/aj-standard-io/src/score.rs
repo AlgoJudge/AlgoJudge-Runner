@@ -314,9 +314,9 @@ groups:
         let (config, tests) = package();
         let mut outcomes = all_passing();
         outcomes[3].status = Status::Error;
-        outcomes[3].note = "Przekroczenie limitu czasu".into();
+        outcomes[3].note = "Time limit exceeded".into();
 
         let judged = judge(&config, &tests, &outcomes);
-        assert_eq!(judged.verdict, "Przekroczenie limitu czasu");
+        assert_eq!(judged.verdict, "Time limit exceeded");
     }
 }

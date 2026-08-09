@@ -224,7 +224,7 @@ int main() { long long a, b; std::cin >> a >> b; while (true) { } }
         document["tests"][0]["note"]
             .as_str()
             .unwrap()
-            .contains("limitu czasu"),
+            .contains("Time limit exceeded"),
         "got {}",
         document["tests"][0]["note"],
     );
@@ -249,11 +249,11 @@ int main() { long long a, b; std::cin >> a >> b; volatile int *p = nullptr; *p =
     let note = document["tests"][0]["note"].as_str().unwrap().to_owned();
 
     assert!(
-        note.contains("naruszenie ochrony pamięci"),
+        note.contains("segmentation fault"),
         "a crash should say what kind, got {note}",
     );
     assert!(
-        !note.contains("limitu czasu"),
+        !note.contains("Time limit exceeded"),
         "a crash must not be reported as a time limit, got {note}",
     );
 }
@@ -265,7 +265,7 @@ int main() { long long a, b; std::cin >> a >> b; volatile int *p = nullptr; *p =
 async fn a_submission_that_does_not_build_says_why() {
     let judged = verdict(judge("cpp-broken", "cpp", "int main() { this is not c++ }").await);
 
-    assert_eq!(judged.judgement.verdict, "Błąd kompilacji");
+    assert_eq!(judged.judgement.verdict, "Compilation error");
     assert_eq!(judged.judgement.score, 0.0);
 
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
@@ -286,7 +286,7 @@ async fn a_submission_that_does_not_build_says_why() {
 async fn a_python_syntax_error_is_a_compilation_error_and_not_three_failures() {
     let judged = verdict(judge("python-broken", "python", "if True\n  print(1)\n").await);
 
-    assert_eq!(judged.judgement.verdict, "Błąd kompilacji");
+    assert_eq!(judged.judgement.verdict, "Compilation error");
 
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
     assert_eq!(document["compilation"]["status"], "ERROR");

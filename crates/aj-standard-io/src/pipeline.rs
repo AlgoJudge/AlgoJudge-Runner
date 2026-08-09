@@ -253,9 +253,9 @@ impl<S: Sandbox> Pipeline<S> {
             // What the machinery did to it comes first: none of these is the
             // program having answered wrongly.
             let stopped = match run.stopped {
-                Stopped::WallClock => Some("Przekroczenie limitu czasu"),
-                Stopped::Memory => Some("Przekroczenie limitu pamięci"),
-                Stopped::Output => Some("Przekroczenie limitu wyjścia"),
+                Stopped::WallClock => Some("Time limit exceeded"),
+                Stopped::Memory => Some("Memory limit exceeded"),
+                Stopped::Output => Some("Output limit exceeded"),
                 Stopped::OnItsOwn => None,
             };
             if let Some(note) = stopped {
@@ -461,19 +461,19 @@ fn unpack(collected: &Option<Vec<u8>>, into: &Path) -> Result<(), String> {
 /// question is decided this wording must not promise more than it knows.
 fn how_it_died(exit_code: i64) -> String {
     let signal = match exit_code - 128 {
-        4 => "nieprawidłowa instrukcja",
-        6 => "przerwany przez abort()",
-        7 => "błąd magistrali",
-        8 => "błąd arytmetyczny, na przykład dzielenie przez zero",
-        9 => "zabity",
-        11 => "naruszenie ochrony pamięci",
-        13 => "zapis do zamkniętego strumienia",
-        15 => "zakończony",
+        4 => "illegal instruction",
+        6 => "aborted",
+        7 => "bus error",
+        8 => "arithmetic error, such as division by zero",
+        9 => "killed",
+        11 => "segmentation fault",
+        13 => "wrote to a closed stream",
+        15 => "terminated",
         _ => {
-            return format!("Błąd wykonania, kod {exit_code}");
+            return format!("Runtime error, exit code {exit_code}");
         }
     };
-    format!("Błąd wykonania: {signal} (kod {exit_code})")
+    format!("Runtime error: {signal} (exit code {exit_code})")
 }
 
 fn failed(test: &aj_package::Test, time_ms: u64, note: &str) -> TestOutcome {
@@ -536,7 +536,7 @@ fn compilation_failed(job: &Job<'_>, log: &str) -> Evaluated {
     let outcomes: Vec<TestOutcome> = job
         .tests
         .iter()
-        .map(|test| failed(test, 0, "Błąd kompilacji"))
+        .map(|test| failed(test, 0, "Compilation error"))
         .collect();
 
     let judgement = judge(job.config, job.tests, &outcomes);
@@ -544,7 +544,7 @@ fn compilation_failed(job: &Job<'_>, log: &str) -> Evaluated {
 
     Evaluated::Judged(Box::new(Verdict {
         judgement: Judgement {
-            verdict: "Błąd kompilacji".into(),
+            verdict: "Compilation error".into(),
             ..judgement.clone()
         },
         details,
@@ -601,14 +601,14 @@ mod tests {
     /// as the number it is rather than dressed up as a signal.
     #[test]
     fn a_fatal_signal_is_named_and_a_plain_exit_code_is_not() {
-        assert!(how_it_died(139).contains("naruszenie ochrony pamięci"));
-        assert!(how_it_died(136).contains("dzielenie przez zero"));
-        assert!(how_it_died(134).contains("abort()"));
+        assert!(how_it_died(139).contains("segmentation fault"));
+        assert!(how_it_died(136).contains("division by zero"));
+        assert!(how_it_died(134).contains("aborted"));
 
         // Not a signal: 3 is just what the program returned.
-        assert_eq!(how_it_died(3), "Błąd wykonania, kod 3");
+        assert_eq!(how_it_died(3), "Runtime error, exit code 3");
         // 128 itself is an exit code, not signal zero.
-        assert_eq!(how_it_died(128), "Błąd wykonania, kod 128");
+        assert_eq!(how_it_died(128), "Runtime error, exit code 128");
     }
 
     #[test]

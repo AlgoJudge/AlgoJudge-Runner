@@ -96,6 +96,21 @@ the package. Two rules are easy to get wrong and matter to a participant:
   failed, not that the answer was wrong. Conflating them turns a bug in a
   checker into a rejected submission.
 
+### What language a message is in (2026-08-09)
+
+**Anything the Runner writes itself is English.** Verdicts, `note`, the
+compilation summary, policy rule names, log lines: `Time limit exceeded`,
+`Runtime error: segmentation fault (exit code 139)`, `forbidden module os`.
+
+**Anything another system produced travels verbatim**, in whatever language it
+arrived in, and is never translated or reworded: the compiler's own output, an
+interpreter's traceback, a checker's comment. Those are diagnostics from a tool
+that is not us, and rewriting them loses the thing a participant would search
+for.
+
+The Runner does not know who is reading, so it does not choose a language for
+them — it emits one, consistently, and translation belongs where the reader is.
+
 The forbidden-word dictionary runs **before compilation** and is a **policy
 control, not a security control**. It yields `PolicyViolation` with score 0, the
 code is never built or run, the participant sees which rule was broken, and the

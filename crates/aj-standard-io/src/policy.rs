@@ -202,7 +202,7 @@ impl Dictionary {
                 patterns(
                     &stripped,
                     &rules.denied_patterns,
-                    "Zakazane wywołanie",
+                    "forbidden call",
                     &mut found,
                 );
             }
@@ -360,7 +360,7 @@ fn headers(source: &str, rules: &LanguageRules, found: &mut Vec<Violation>) {
             });
         if denied {
             found.push(Violation {
-                rule: format!("Zakazany nagłówek <{named}>"),
+                rule: format!("forbidden header <{named}>"),
                 matched: named.to_owned(),
                 line: line_of(source, capture.get(0).expect("the whole match").start()),
             });
@@ -436,7 +436,7 @@ fn imports(source: &str, rules: &LanguageRules, found: &mut Vec<Violation>) {
         let root = named.split('.').next().unwrap_or(named);
         if denied.contains(root) {
             found.push(Violation {
-                rule: format!("Zakazany moduł {root}"),
+                rule: format!("forbidden module {root}"),
                 matched: named.to_owned(),
                 line: line_of(source, capture.get(0).expect("the whole match").start()),
             });
@@ -454,7 +454,7 @@ fn builtins(source: &str, rules: &LanguageRules, found: &mut Vec<Violation>) {
         };
         for hit in pattern.find_iter(source) {
             found.push(Violation {
-                rule: format!("Zakazana funkcja wbudowana {builtin}"),
+                rule: format!("forbidden builtin {builtin}"),
                 matched: builtin.clone(),
                 line: line_of(source, hit.start()),
             });

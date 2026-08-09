@@ -163,7 +163,7 @@ pub fn details(judged: &Judgement, config: &Config) -> Details {
         Compilation {
             // Nothing was compiled, and saying `OK` would imply something was.
             status: Status::Warning,
-            log: "nic nie było kompilowane — zadanie typu output-only".into(),
+            log: "nothing was compiled: this is an output-only problem".into(),
         },
     );
     document.kind = "output-only";
