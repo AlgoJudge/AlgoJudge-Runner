@@ -196,7 +196,7 @@ async fn measure_trial(
         .await
         .map_err(|e| e.to_string())?;
 
-    let package = work.places.join("package");
+    let package = unpacked_into(&work.places);
     aj_package::extract(
         archive.path(),
         &package.here,
@@ -310,7 +310,7 @@ async fn judge(
         .await
         .map_err(|e| e.to_string())?;
 
-    let package = work.places.join("package");
+    let package = unpacked_into(&work.places);
     aj_package::extract(
         archive.path(),
         &package.here,
@@ -423,6 +423,27 @@ fn finish(evaluated: Evaluated, lease_token: &str) -> Result<(ReportResult, Atta
 /// A per-job directory that removes itself.
 struct Scratch {
     places: Places,
+}
+
+/// Where a job's package is unpacked: **inside that job's own scratch**.
+///
+/// A named function rather than a `join` at two call sites, because what it
+/// carries is not visible from either — and because the alternative is the sort
+/// of change nobody would recognise as a security decision.
+///
+/// **Every path a sandbox mounts comes from `job.work` or `job.package`**
+/// (`pipeline.rs`), and `Scratch` is per job. So while the package is unpacked
+/// *into* the scratch, two concurrently judged submissions share no mounted
+/// inode — and file locks, which are shared across mount namespaces on one
+/// inode, cannot pass between them.
+///
+/// Unpacking straight from the cache instead would save the copy and look like
+/// a performance change. It would also give every submission of a problem the
+/// same inodes, and with them a channel between contestants that nothing in a
+/// review would flag. `docs/SECURITY.md` §6 records the measurement; the test
+/// below is what stops it.
+fn unpacked_into(work: &Places) -> Places {
+    work.join("package")
 }
 
 impl Scratch {
@@ -567,3 +588,48 @@ fn total_memory_bytes() -> Option<u64> {
 const FIVE: Duration = Duration::from_secs(5);
 const THIRTY: Duration = Duration::from_secs(30);
 const REPORT_ATTEMPTS: u32 = 5;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Two jobs share no mounted path.**
+    ///
+    /// The property, asserted directly rather than through the syscall that
+    /// would exploit its absence. File locks pass between processes holding one
+    /// inode across mount-namespace boundaries — demonstrated on 2026-08-09 —
+    /// and denying `flock` would close that one road while leaving POSIX record
+    /// locks, `F_NOTIFY` and anything else two processes can do to one inode.
+    ///
+    /// What actually protects us is that there is no shared inode to hold. So
+    /// that is what is pinned here: every path a sandbox mounts comes from
+    /// `job.work` or `job.package`, `Scratch` is per job, and the package is
+    /// unpacked inside it.
+    #[test]
+    fn two_jobs_mount_nothing_in_common() {
+        let root = std::path::Path::new("/var/lib/algojudge");
+        let host = std::path::Path::new("/host/algojudge");
+
+        let one = Scratch::new(root, host, "job-one").expect("scratch");
+        let two = Scratch::new(root, host, "job-two").expect("scratch");
+
+        assert_ne!(one.places.on_host, two.places.on_host, "scratch is per job");
+
+        // As the daemon resolves them: a bind mount is resolved on the host, so
+        // two jobs sharing an inode would share it through `on_host` whatever
+        // this process sees.
+        let first = unpacked_into(&one.places).on_host;
+        let second = unpacked_into(&two.places).on_host;
+
+        assert!(
+            first.starts_with(&one.places.on_host),
+            "a package unpacked outside its job's scratch is shared with every other job: {first:?}",
+        );
+        assert!(second.starts_with(&two.places.on_host));
+        assert!(
+            !first.starts_with(&second) && !second.starts_with(&first),
+            "two jobs' packages must not nest: {first:?} and {second:?}",
+        );
+        assert_ne!(first, second);
+    }
+}
