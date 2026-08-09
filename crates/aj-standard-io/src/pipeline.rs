@@ -32,6 +32,30 @@ pub struct Places {
     pub on_host: PathBuf,
 }
 
+/// What a running submission is given of the package: **one input file.**
+///
+/// A named function with a test rather than an expression at the call site,
+/// because getting it wrong is silent and expensive. `tests/` holds
+/// `<name>.in` beside `<name>.out`, so mounting the directory whole hands the
+/// submission the answer key — `cat /in/1a.out` prints what it was asked to
+/// compute, and the run still looks like an ordinary correct solution.
+///
+/// That was the arrangement until 2026-08-09. The only thing standing in front
+/// of it was the forbidden-word dictionary catching `fopen`, `ifstream` and
+/// `open`; `docs/SECURITY.md` §4 states that the dictionary is a **policy**
+/// control and that every rule in it is expected to be bypassable. An answer
+/// key must not rest on a control the project itself calls bypassable.
+///
+/// The program is started as `exec … < /in/<name>.in`, so one file is all it
+/// ever needed. The checker still receives both, because comparing them is its
+/// job and it is not the participant's code.
+fn input_mount(package: &Path, test: &str) -> Mount {
+    Mount::read_only(
+        package.join("tests").join(format!("{test}.in")),
+        format!("{INPUT}/{test}.in"),
+    )
+}
+
 impl Places {
     pub fn same(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
@@ -219,7 +243,7 @@ impl<S: Sandbox> Pipeline<S> {
                     // rather than from this deadline.
                     .wall_clock(Duration::from_millis(limits.time_ms) + Duration::from_secs(1))
                     .mount(Mount::read_only(&artefacts.on_host, PROGRAM))
-                    .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT)),
+                    .mount(input_mount(&job.package.on_host, &test.name)),
                 )
                 .await
                 .map_err(|e| format!("a test could not be run: {e}"))?;
@@ -517,6 +541,28 @@ pub fn scratch(root: &Path, job_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The answer key is not in the container the submission runs in.
+    ///
+    /// Asserted on the mount rather than by trying to read it from a
+    /// submission, because every way of reading a file is already refused by
+    /// the word dictionary — so a test written that way would pass for the
+    /// wrong reason and keep passing after the dictionary was relaxed.
+    #[test]
+    fn a_running_submission_is_given_its_input_and_not_the_answers() {
+        let mount = input_mount(Path::new("/cache/pkg"), "1a");
+
+        assert_eq!(mount.from, Path::new("/cache/pkg/tests/1a.in"));
+        assert_eq!(mount.to, "/in/1a.in");
+        assert!(!mount.writable);
+
+        // The shape that leaked: the directory itself, which carries `1a.out`.
+        assert_ne!(
+            mount.from,
+            Path::new("/cache/pkg/tests"),
+            "mounting the directory hands over the answer key",
+        );
+    }
 
     #[test]
     fn a_place_carries_both_views_through_a_join() {
