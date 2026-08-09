@@ -83,11 +83,31 @@ pub enum Evaluated {
 pub struct Pipeline<S> {
     sandbox: S,
     images: Images,
+    /// Which core the next timed run is pinned to.
+    ///
+    /// Rotated rather than fixed: pinning every job to core 0 would make a
+    /// machine with sixteen of them evaluate on one, and two Runners sharing a
+    /// host would fight over it. The build is not pinned — it is not the step
+    /// being timed, and it is the one that benefits from more.
+    next_core: std::sync::atomic::AtomicUsize,
 }
 
 impl<S: Sandbox> Pipeline<S> {
     pub fn new(sandbox: S, images: Images) -> Self {
-        Self { sandbox, images }
+        Self {
+            sandbox,
+            images,
+            next_core: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn core(&self) -> usize {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        self.next_core
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % cores
     }
 
     pub async fn evaluate(&self, job: &Job<'_>) -> Evaluated {
@@ -191,6 +211,7 @@ impl<S: Sandbox> Pipeline<S> {
                     )
                     .memory_kib(limits.memory_kib)
                     .pids(16)
+                    .cpuset(self.core())
                     .max_output_bytes(64 * 1024 * 1024)
                     // **The limit plus a grace.** A program stuck in an
                     // uninterruptible syscall has to be reaped from

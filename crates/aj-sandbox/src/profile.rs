@@ -62,6 +62,16 @@ pub struct Profile {
     /// A writable scratch area, mounted `noexec`.
     pub tmpfs_kib: Option<u64>,
 
+    /// One core, by number, for the step that is being timed.
+    ///
+    /// **Capping CPU is not the same as pinning it.** `--cpus=1` limits how much
+    /// CPU time a program may use per second; it does not stop two threads
+    /// running on two cores and finishing in half the wall-clock time. A problem
+    /// that states a one-second limit means one second of one core, and the
+    /// verdict a participant reads comes from the wall clock — so without this,
+    /// threads buy time the single-thread rule says they may not have.
+    pub cpuset: Option<String>,
+
     /// Lets the container write to its **own** layer — never to the host.
     ///
     /// Off for anything that runs a submission. On for a build, which has to
@@ -105,6 +115,7 @@ impl Profile {
             max_output_bytes: 64 * 1024 * 1024,
             mounts: Vec::new(),
             tmpfs_kib: None,
+            cpuset: None,
             writable_root: false,
             collect: None,
         }
@@ -137,6 +148,11 @@ impl Profile {
 
     pub fn tmpfs_kib(mut self, kib: u64) -> Self {
         self.tmpfs_kib = Some(kib);
+        self
+    }
+
+    pub fn cpuset(mut self, core: usize) -> Self {
+        self.cpuset = Some(core.to_string());
         self
     }
 
