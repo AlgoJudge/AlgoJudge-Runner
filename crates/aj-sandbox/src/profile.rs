@@ -43,7 +43,7 @@ pub struct Profile {
     pub command: Vec<String>,
     pub working_directory: String,
 
-    pub memory_kib: u64,
+    pub memory_bytes: u64,
     pub pids: i64,
     /// Whole cores. Pinning as well as capping is what stops threads buying
     /// wall-clock time that a single-threaded rule says they may not have.
@@ -60,7 +60,7 @@ pub struct Profile {
     pub mounts: Vec<Mount>,
 
     /// A writable scratch area, mounted `noexec`.
-    pub tmpfs_kib: Option<u64>,
+    pub tmpfs_bytes: Option<u64>,
 
     /// How many files it may hold open, and how large one may get.
     ///
@@ -117,13 +117,13 @@ impl Profile {
             image: image.into(),
             command,
             working_directory: "/work".into(),
-            memory_kib: 256 * 1024,
+            memory_bytes: 256 * 1024 * 1024,
             pids: 64,
             cpus: 1.0,
             wall_clock: Duration::from_secs(10),
             max_output_bytes: 64 * 1024 * 1024,
             mounts: Vec::new(),
-            tmpfs_kib: None,
+            tmpfs_bytes: None,
             max_open_files: 256,
             max_file_bytes: 256 * 1024 * 1024,
             cpuset: None,
@@ -132,8 +132,8 @@ impl Profile {
         }
     }
 
-    pub fn memory_kib(mut self, kib: u64) -> Self {
-        self.memory_kib = kib;
+    pub fn memory_bytes(mut self, bytes: u64) -> Self {
+        self.memory_bytes = bytes;
         self
     }
 
@@ -157,8 +157,8 @@ impl Profile {
         self
     }
 
-    pub fn tmpfs_kib(mut self, kib: u64) -> Self {
-        self.tmpfs_kib = Some(kib);
+    pub fn tmpfs_bytes(mut self, bytes: u64) -> Self {
+        self.tmpfs_bytes = Some(bytes);
         self
     }
 
@@ -218,7 +218,7 @@ pub struct Outcome {
     /// The runtime API is not the source: it reports no peak on cgroup v2, and
     /// a container's own cgroup does not outlive it. See `Docker::cgroup_root`
     /// for how the measurement is actually taken.
-    pub peak_memory_kib: Option<u64>,
+    pub peak_memory_bytes: Option<u64>,
 
     /// From `cpu.stat` in the same cgroup: user plus system, for the whole
     /// subtree.

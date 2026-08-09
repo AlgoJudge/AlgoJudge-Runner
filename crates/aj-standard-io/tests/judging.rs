@@ -21,7 +21,7 @@ format: standard-io
 version: 1
 limits:
   timeMs: 2000
-  memoryKib: 262144
+  memoryBytes: 268435456
 groups:
   - group: 0
     points: 0
@@ -183,7 +183,7 @@ async fn a_correct_python_solution_is_accepted() {
 /// The memory a solution used reaches the result document.
 ///
 /// The last thing calibration was waiting for: `PACKAGE_FORMAT.md` lets
-/// `memoryKib` be absent because the Runner could not measure it honestly, and
+/// `memoryBytes` be absent because the Runner could not measure it honestly, and
 /// on a cgroup v2 host with a writable cgroup mount it now can. Absent stays a
 /// legitimate answer, so this skips rather than fails where there is nowhere to
 /// measure from.
@@ -193,10 +193,8 @@ async fn a_judged_solution_reports_what_memory_it_used() {
     let judged = verdict(judge("cpp-memory", "cpp", CORRECT_CPP).await);
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
 
-    // **Mebibytes here**, though the limits are stated in kibibytes and the
-    // measurement is taken in them — `details.rs` says so and this is the one
-    // place the difference is easy to get wrong.
-    let Some(memory) = document["tests"][0]["memoryMb"].as_u64() else {
+    // Bytes, like every memory figure in the product since 2026-08-09.
+    let Some(memory) = document["tests"][0]["memoryBytes"].as_u64() else {
         eprintln!("memory was not measured: no writable cgroup root. Skipping.");
         return;
     };
@@ -205,8 +203,8 @@ async fn a_judged_solution_reports_what_memory_it_used() {
     // rather than a value, because the point is that it is a real measurement
     // and not a plausible-looking constant.
     assert!(
-        (1..256).contains(&memory),
-        "an adding program should use a few MiB, not zero and not hundreds: {memory} MiB",
+        (1024 * 1024..256 * 1024 * 1024).contains(&memory),
+        "an adding program should use a few MiB, not bytes and not gigabytes: {memory} bytes",
     );
 }
 

@@ -175,11 +175,11 @@ impl<S: Sandbox> Pipeline<S> {
                 .sandbox
                 .run(
                     &Profile::new(&language.image, command)
-                        .memory_kib(512 * 1024)
+                        .memory_bytes(512 * 1024 * 1024)
                         .pids(128)
                         .wall_clock(Duration::from_secs(60))
                         .max_output_bytes(256 * 1024)
-                        .tmpfs_kib(64 * 1024)
+                        .tmpfs_bytes(64 * 1024 * 1024)
                         .writable_root()
                         .collect(BUILD_OUTPUT)
                         .mount(Mount::read_only(&source.on_host, SOURCE)),
@@ -233,7 +233,7 @@ impl<S: Sandbox> Pipeline<S> {
                         &language.image,
                         language::with_input(&language.start, &test.name),
                     )
-                    .memory_kib(limits.memory_kib)
+                    .memory_bytes(limits.memory_bytes)
                     .pids(16)
                     .cpuset(self.core())
                     .max_output_bytes(64 * 1024 * 1024)
@@ -316,7 +316,7 @@ impl<S: Sandbox> Pipeline<S> {
                 // participant's run has the same floor, so subtracting it would
                 // make every calibrated limit too tight for the sake of a
                 // number nobody meets.
-                memory_kib: run.peak_memory_kib,
+                memory_bytes: run.peak_memory_bytes,
                 note,
             });
         }
@@ -365,10 +365,10 @@ impl<S: Sandbox> Pipeline<S> {
             .sandbox
             .run(
                 &Profile::new(&language.image, language.build.clone().unwrap_or_default())
-                    .memory_kib(512 * 1024)
+                    .memory_bytes(512 * 1024 * 1024)
                     .pids(128)
                     .wall_clock(Duration::from_secs(60))
-                    .tmpfs_kib(64 * 1024)
+                    .tmpfs_bytes(64 * 1024)
                     .writable_root()
                     .collect(BUILD_OUTPUT)
                     .mount(Mount::read_only(&source.on_host, SOURCE)),
@@ -410,7 +410,7 @@ impl<S: Sandbox> Pipeline<S> {
                         format!("{INPUT}/{test}.out"),
                     ],
                 )
-                .memory_kib(256 * 1024)
+                .memory_bytes(256 * 1024 * 1024)
                 .pids(16)
                 .wall_clock(Duration::from_secs(30))
                 .max_output_bytes(64 * 1024)
@@ -489,7 +489,7 @@ fn failed(test: &aj_package::Test, time_ms: u64, note: &str) -> TestOutcome {
         status: Status::Error,
         percentage: 0,
         time_ms,
-        memory_kib: None,
+        memory_bytes: None,
         note: note.to_owned(),
     }
 }
@@ -563,7 +563,7 @@ fn compilation_failed(job: &Job<'_>, log: &str) -> Evaluated {
 fn limits_of(job: &Job<'_>) -> Limits {
     Limits {
         time_ms: job.config.limits.time_ms,
-        memory_mb: job.config.limits.memory_kib / 1024,
+        memory_bytes: job.config.limits.memory_bytes,
     }
 }
 

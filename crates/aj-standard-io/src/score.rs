@@ -42,7 +42,7 @@ pub struct TestOutcome {
     /// 0–100. A checker's, or 100/0 where there is none.
     pub percentage: u32,
     pub time_ms: u64,
-    pub memory_kib: Option<u64>,
+    pub memory_bytes: Option<u64>,
     /// Reaches the participant, and originates beside untrusted code.
     pub note: String,
 }
@@ -169,7 +169,7 @@ format: standard-io
 version: 1
 limits:
   timeMs: 1000
-  memoryKib: 262144
+  memoryBytes: 262144
 groups:
   - group: 0
     points: 0
@@ -218,7 +218,7 @@ groups:
             status,
             percentage,
             time_ms: 10,
-            memory_kib: None,
+            memory_bytes: None,
             note: String::new(),
         }
     }

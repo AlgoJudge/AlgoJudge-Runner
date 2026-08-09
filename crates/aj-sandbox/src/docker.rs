@@ -116,8 +116,7 @@ impl Docker {
     fn measure(path: &std::path::Path) -> (Option<u64>, Option<std::time::Duration>) {
         let peak = std::fs::read_to_string(path.join("memory.peak"))
             .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(|bytes| bytes / 1024);
+            .and_then(|s| s.trim().parse::<u64>().ok());
 
         // `usage_usec` is the whole subtree's CPU time, user plus system.
         let cpu = std::fs::read_to_string(path.join("cpu.stat"))
@@ -201,7 +200,7 @@ impl Docker {
     }
 
     fn host_config(&self, profile: &Profile, cgroup_parent: Option<&str>) -> HostConfig {
-        let memory = (profile.memory_kib * 1024) as i64;
+        let memory = profile.memory_bytes as i64;
 
         HostConfig {
             // Under the Runner's own cgroup when there is one, so that a peak
@@ -254,14 +253,14 @@ impl Docker {
                     .collect(),
             ),
 
-            tmpfs: profile.tmpfs_kib.map(|kib| {
+            tmpfs: profile.tmpfs_bytes.map(|bytes| {
                 HashMap::from([(
                     "/tmp".to_owned(),
                     // Writable and **not executable**: a directory a submission
                     // can write to and then execute from is the shortest route
                     // from "produced output" to "ran something we did not
                     // compile".
-                    format!("rw,noexec,nosuid,size={kib}k"),
+                    format!("rw,noexec,nosuid,size={bytes}"),
                 )])
             }),
 
@@ -358,7 +357,7 @@ impl Sandbox for Docker {
         if let Some((here, _)) = &cgroup {
             if let Ok(outcome) = outcome.as_mut() {
                 let (peak, cpu) = Self::measure(here);
-                outcome.peak_memory_kib = peak;
+                outcome.peak_memory_bytes = peak;
                 outcome.cpu_time = cpu;
             }
             let _ = std::fs::remove_dir(here);
@@ -448,7 +447,7 @@ impl Docker {
             // Filled by `run` from the cgroup, where there is one. Absent is
             // the honest answer on a host that gave the Runner nowhere to
             // measure from.
-            peak_memory_kib: None,
+            peak_memory_bytes: None,
             cpu_time: None,
             collected,
         })

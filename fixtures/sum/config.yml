@@ -10,13 +10,13 @@ version: 1
 
 limits:
   timeMs: 1000
-  memoryKib: 262144      # 256 MiB
+  memoryBytes: 268435456      # 256 MiB
 
 # Python is slower and needs more room.
 overrideLimits:
   python:
     timeMs: 3000
-    memoryKib: 524288    # 512 MiB
+    memoryBytes: 536870912    # 512 MiB
 
 groups:
   - group: 0
@@ -41,6 +41,6 @@ modelSolutions:
 
 calibration:
   time:   { factor: 3, add: 0, roundTo: 100 }
-  memory: { factor: 1, add: 16384, roundTo: 1024 }
+  memory: { factor: 1, add: 16777216, roundTo: 1048576 }
 
 extraCompilationFiles: []

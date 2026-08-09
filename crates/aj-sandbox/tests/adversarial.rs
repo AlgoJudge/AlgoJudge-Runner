@@ -167,24 +167,24 @@ async fn peak_memory_is_measured_and_is_the_programs_own() {
     let outcome = docker
         .run(
             &shell("dd if=/dev/zero of=/tmp/block bs=1M count=64 2>/dev/null")
-                .memory_kib(512 * 1024)
-                .tmpfs_kib(128 * 1024),
+                .memory_bytes(512 * 1024 * 1024)
+                .tmpfs_bytes(128 * 1024 * 1024),
         )
         .await
         .expect("the run");
 
-    let Some(peak_kib) = outcome.peak_memory_kib else {
+    let Some(peak) = outcome.peak_memory_bytes else {
         eprintln!("peak memory was not measured: no writable cgroup root. Skipping.");
         return;
     };
 
     assert!(
-        peak_kib >= 64 * 1024,
-        "64 MiB was written, so the peak cannot be below it: got {peak_kib} KiB",
+        peak >= 64 * 1024 * 1024,
+        "64 MiB was written, so the peak cannot be below it: got {peak} bytes",
     );
     assert!(
-        peak_kib < 128 * 1024,
-        "the floor is about 2 MiB, so twice the allocation means the wrong cgroup: got {peak_kib} KiB",
+        peak < 128 * 1024 * 1024,
+        "the floor is about 2 MiB, so twice the allocation means the wrong cgroup: got {peak} bytes",
     );
 
     assert!(
@@ -216,8 +216,8 @@ async fn exhausting_memory_is_an_out_of_memory_kill() {
     let outcome = docker
         .run(
             &shell("dd if=/dev/zero of=/tmp/big bs=1M count=512")
-                .memory_kib(32 * 1024)
-                .tmpfs_kib(1024 * 1024)
+                .memory_bytes(32 * 1024 * 1024)
+                .tmpfs_bytes(1024 * 1024 * 1024)
                 .wall_clock(Duration::from_secs(30)),
         )
         .await
@@ -261,7 +261,7 @@ async fn scratch_space_is_writable_and_not_executable() {
                 "cp /bin/echo /tmp/e 2>/dev/null || { echo NOWRITE; exit 0; }; \
                  /tmp/e ran 2>/dev/null || echo NOEXEC",
             )
-            .tmpfs_kib(16 * 1024),
+            .tmpfs_bytes(16 * 1024 * 1024),
         )
         .await
         .expect("the run");
@@ -383,13 +383,13 @@ async fn nothing_survives_from_one_run_to_the_next() {
     let docker = sandbox().await;
 
     let first = docker
-        .run(&shell("echo remembered > /tmp/state; echo written").tmpfs_kib(1024))
+        .run(&shell("echo remembered > /tmp/state; echo written").tmpfs_bytes(1024 * 1024))
         .await
         .expect("the first run");
     assert_eq!(String::from_utf8_lossy(&first.stdout).trim(), "written");
 
     let second = docker
-        .run(&shell("cat /tmp/state 2>/dev/null || echo GONE").tmpfs_kib(1024))
+        .run(&shell("cat /tmp/state 2>/dev/null || echo GONE").tmpfs_bytes(1024 * 1024))
         .await
         .expect("the second run");
 
@@ -436,7 +436,7 @@ async fn a_program_cannot_write_a_file_larger_than_it_is_allowed() {
     let outcome = docker
         .run(
             &shell("dd if=/dev/zero of=/tmp/big bs=1M count=64 2>/dev/null; wc -c < /tmp/big")
-                .tmpfs_kib(256 * 1024)
+                .tmpfs_bytes(256 * 1024 * 1024)
                 .max_file_bytes(1024 * 1024)
                 .wall_clock(Duration::from_secs(20)),
         )
