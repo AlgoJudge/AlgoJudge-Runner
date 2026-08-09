@@ -12,6 +12,7 @@ name = "algojudge-runner"
 path = "src/main.rs"
 
 [dependencies]
+aj-output-only = { path = "../aj-output-only" }
 aj-package = { path = "../aj-package" }
 aj-protocol = { path = "../aj-protocol" }
 aj-sandbox = { path = "../aj-sandbox" }

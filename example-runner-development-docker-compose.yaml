@@ -76,7 +76,7 @@ services:
       # of the Server, and it is a different address from the browser's.
       AJ_Server__BaseUrl: http://server:8080/api/v1
       AJ_Runner__Name: runner-dev
-      AJ_Runner__ProblemTypes: standard-io@1
+      AJ_Runner__ProblemTypes: standard-io@1,output-only@1
       # Short, so a developer watching the log sees it ask rather than wondering
       # whether it is alive. Production leaves these alone.
       AJ_Poll__MinSeconds: "1"

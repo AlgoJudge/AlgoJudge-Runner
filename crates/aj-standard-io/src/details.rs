@@ -21,6 +21,7 @@ use crate::score::{Judgement, Status};
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Details {
+    /// `standard-io`, `output-only` — what a Client's renderer keys on.
     pub kind: &'static str,
     pub version: u32,
     pub limits: Limits,

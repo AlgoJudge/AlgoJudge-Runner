@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/aj-output-only",
     "crates/aj-package",
     "crates/aj-protocol",
     "crates/aj-runner",

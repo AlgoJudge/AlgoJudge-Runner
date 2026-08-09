@@ -88,11 +88,21 @@ pub struct Source {
 
 impl Config {
     pub fn parse(yaml: &str) -> Result<Self> {
+        Config::parse_as(yaml, FORMAT)
+    }
+
+    /// The same shape, under another problem type's discriminator.
+    ///
+    /// The *shape* — limits, groups, tests — is shared between problem types;
+    /// the *name* is not. Splitting them here was the first thing adding a
+    /// second type required, and it is a change inside one crate rather than a
+    /// second parser.
+    pub fn parse_as(yaml: &str, format: &str) -> Result<Self> {
         let config: Config = serde_yaml_ng::from_str(yaml)?;
 
         // A Runner that does not know the version refuses the package rather
         // than guessing at what changed in it.
-        if config.format != FORMAT || config.version != VERSION {
+        if config.format != format || config.version != VERSION {
             return Err(Error::UnknownFormat {
                 format: config.format,
                 version: config.version,

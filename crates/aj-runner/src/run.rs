@@ -211,9 +211,6 @@ async fn judge(
 
     let declared = std::fs::read_to_string(package.here.join("config.yml"))
         .map_err(|e| format!("config.yml could not be read: {e}"))?;
-    let package_config = aj_package::Config::parse(&declared).map_err(|e| e.to_string())?;
-    let tests =
-        aj_package::TestSet::read(&package.here, &package_config).map_err(|e| e.to_string())?;
 
     // The submission itself, by the name the Server gives it.
     let submitted = job
@@ -226,26 +223,81 @@ async fn judge(
         .fetch(server, &submitted.file_id, &submitted.sha256)
         .await
         .map_err(|e| e.to_string())?;
-    let source = std::fs::read(source.path()).map_err(|e| e.to_string())?;
 
-    let language = job.language.as_deref().unwrap_or("cpp");
+    // **The whole of what a second problem type costs.** Everything above and
+    // below is shared; this is the dispatch, and adding a third type is another
+    // arm plus a crate. Nothing about it reaches the Server.
+    match job.problem_type.as_str() {
+        "standard-io@1" => {
+            let package_config = aj_package::Config::parse(&declared).map_err(|e| e.to_string())?;
+            let tests = aj_package::TestSet::read(&package.here, &package_config)
+                .map_err(|e| e.to_string())?;
+            let bytes = std::fs::read(source.path()).map_err(|e| e.to_string())?;
+            let language = job.language.as_deref().unwrap_or("cpp");
 
-    let evaluated = pipeline
-        .evaluate(&aj_standard_io::Job {
-            config: &package_config,
-            tests: &tests,
-            language,
-            source: &source,
-            package,
-            work: work.places.join("scratch"),
-        })
-        .await;
+            let evaluated = pipeline
+                .evaluate(&aj_standard_io::Job {
+                    config: &package_config,
+                    tests: &tests,
+                    language,
+                    source: &bytes,
+                    package,
+                    work: work.places.join("scratch"),
+                })
+                .await;
+            finish(evaluated, &job.lease_token)
+        }
 
+        "output-only@1" => {
+            let package_config = aj_package::Config::parse_as(&declared, "output-only")
+                .map_err(|e| e.to_string())?;
+            let tests = aj_package::TestSet::read(&package.here, &package_config)
+                .map_err(|e| e.to_string())?;
+
+            let into = work.places.join("answers").here;
+            let answers = if submitted.file_name.ends_with(".zip") {
+                // Untrusted, and the only untrusted archive the product opens.
+                aj_output_only::Answers::unpack(source.path(), &into)?
+            } else if tests.len() == 1 {
+                let bytes = std::fs::read(source.path()).map_err(|e| e.to_string())?;
+                let only = tests.iter().next().expect("one test").name.clone();
+                aj_output_only::Answers::single(&bytes, &only, &into)?
+            } else {
+                return Err(format!(
+                    "this problem has {} tests, so the answers arrive as an archive,                      and {} is not one",
+                    tests.len(),
+                    submitted.file_name,
+                ));
+            };
+
+            let judgement = aj_output_only::mark(&package.here, &package_config, &tests, &answers);
+            let details = aj_output_only::details(&judgement, &package_config);
+
+            Ok((
+                ReportResult::judged(
+                    &job.lease_token,
+                    judgement.score,
+                    judgement.max_score,
+                    &judgement.verdict,
+                ),
+                Attachments {
+                    log: String::new(),
+                    details: Some(details.to_bytes()),
+                },
+            ))
+        }
+
+        other => Err(format!("this Runner does not evaluate {other}")),
+    }
+}
+
+/// Turns what the pipeline decided into what the Server is told.
+fn finish(evaluated: Evaluated, lease_token: &str) -> Result<(ReportResult, Attachments), String> {
     match evaluated {
         Evaluated::Failed(reason) => Err(reason),
         Evaluated::Judged(verdict) => Ok((
             ReportResult::judged(
-                &job.lease_token,
+                lease_token,
                 verdict.judgement.score,
                 verdict.judgement.max_score,
                 &verdict.judgement.verdict,

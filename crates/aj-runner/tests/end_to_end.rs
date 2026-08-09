@@ -134,6 +134,48 @@ impl Session {
             .unwrap_or(false)
     }
 
+    /// A submission that is a **file** rather than source.
+    ///
+    /// The Server already takes either — "one of the two, never both: the form
+    /// offers an editor or a file field, and which it offers is the problem
+    /// type's business". That sentence was written before a second problem type
+    /// existed, and it is why this needed nothing.
+    async fn submit_file(&self, activity: &str, name: &str, bytes: Vec<u8>) -> String {
+        let checksum = hex::encode(Sha256::digest(&bytes));
+
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(name.to_owned())
+            .mime_str("application/zip")
+            .expect("a media type");
+
+        let response = self
+            .http
+            .post(format!(
+                "{}/activities/{activity}/problems/A/submissions",
+                api()
+            ))
+            .multipart(
+                reqwest::multipart::Form::new()
+                    .part("file", part)
+                    .text("sha256", checksum),
+            )
+            .send()
+            .await
+            .expect("the submission");
+
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "submitting a file answered {status}: {text}"
+        );
+
+        serde_json::from_str::<Value>(&text).unwrap()["id"]
+            .as_str()
+            .expect("a submission id")
+            .to_owned()
+    }
+
     async fn submit(&self, activity: &str, source: &str, language: &str) -> String {
         let checksum = hex::encode(Sha256::digest(source.as_bytes()));
 
@@ -190,6 +232,19 @@ async fn approve_the_runner(admin: &Session) {
 /// Publishes a problem carrying the committed package, and returns the
 /// activity's slug.
 async fn publish(admin: &Session, package: Vec<u8>) -> String {
+    publish_of_type(admin, package, "standard-io@1").await
+}
+
+fn fixture(name: &str) -> Vec<u8> {
+    std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures")
+            .join(name),
+    )
+    .unwrap_or_else(|e| panic!("the committed {name}: {e}"))
+}
+
+async fn publish_of_type(admin: &Session, package: Vec<u8>, problem_type: &str) -> String {
     let slug = unique("E2E");
 
     let activity = admin
@@ -232,9 +287,9 @@ async fn publish(admin: &Session, package: Vec<u8>) -> String {
         .post(
             "/problems",
             json!({
-                "slug": unique("suma").to_lowercase(),
-                "name": "Suma dwóch liczb",
-                "type": "standard-io@1",
+                "slug": unique("zadanie").to_lowercase(),
+                "name": "Zadanie",
+                "type": problem_type,
             }),
         )
         .await;
@@ -439,4 +494,57 @@ async fn a_package_that_will_not_open_is_not_scored_as_a_wrong_answer() {
         "an evaluation that never happened must carry no score — absent, not zero: {judged}",
     );
     assert!(judged["verdict"].is_null(), "and no verdict: {judged}");
+}
+
+// ── M3: the invariant ───────────────────────────────────────────────────────
+
+/// A second problem type, judged end to end, **with no Server change at all**.
+///
+/// "Adding a problem type does not require a Server change" has been asserted
+/// from the beginning and nothing had ever checked it. This is the check. What
+/// it exercises is everything that could plausibly have needed one:
+///
+/// - the submission is a **file**, not source in an editor;
+/// - the package declares no language and needs no compiler;
+/// - nothing untrusted is executed, so there is no sandbox in the path.
+///
+/// The mechanical half of the criterion — an empty `git diff` on the Server and
+/// a byte-identical `openapi.json` — is asserted outside this test, because a
+/// test cannot honestly assert something about a repository it is not in.
+#[tokio::test]
+#[ignore = "needs the development stack"]
+async fn a_second_problem_type_is_judged_without_the_server_learning_about_it() {
+    let admin = Session::as_("admin", "admin-development-only").await;
+    approve_the_runner(&admin).await;
+
+    let activity = publish_of_type(&admin, fixture("squares.zip"), "output-only@1").await;
+
+    let participant = Session::as_("student", "student-development-only").await;
+    participant
+        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .await;
+    wait_until_open(&participant, &activity).await;
+
+    let right = participant
+        .submit_file(&activity, "answers.zip", fixture("squares-answers.zip"))
+        .await;
+    let nearly = participant
+        .submit_file(
+            &activity,
+            "answers.zip",
+            fixture("squares-answers-wrong.zip"),
+        )
+        .await;
+
+    let judged = settled(&participant, &activity, &right).await;
+    assert_eq!(judged["state"], "completed", "{judged}");
+    assert_eq!(judged["verdict"], "Accepted", "{judged}");
+    assert_eq!(judged["score"], 100.0, "{judged}");
+
+    // One wrong answer, in group 2. The group rule then takes that group and
+    // leaves the other — the same scoring the other type gets, because scoring
+    // is shared and only the evaluation differs.
+    let judged = settled(&participant, &activity, &nearly).await;
+    assert_eq!(judged["score"], 50.0, "{judged}");
+    assert_ne!(judged["verdict"], "Accepted", "{judged}");
 }

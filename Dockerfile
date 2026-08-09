@@ -19,13 +19,18 @@ WORKDIR /src
 # Manifests first, so a change to the source does not re-resolve or re-download
 # the dependency graph.
 COPY Cargo.toml Cargo.lock ./
+COPY crates/aj-output-only/Cargo.toml crates/aj-output-only/
 COPY crates/aj-package/Cargo.toml crates/aj-package/
 COPY crates/aj-protocol/Cargo.toml crates/aj-protocol/
 COPY crates/aj-runner/Cargo.toml crates/aj-runner/
 COPY crates/aj-sandbox/Cargo.toml crates/aj-sandbox/
 COPY crates/aj-standard-io/Cargo.toml crates/aj-standard-io/
-RUN for crate in aj-package aj-protocol aj-sandbox aj-standard-io; do \
-        mkdir -p "crates/$crate/src" && echo '' > "crates/$crate/src/lib.rs"; \
+# Discovered rather than listed. A named list went stale the first time a crate
+# was added, and the image quietly kept building the previous binary — the tests
+# then failed somewhere else entirely. A missing `COPY` above now fails here
+# instead, because cargo cannot load a workspace member whose manifest is absent.
+RUN for dir in crates/*/; do \
+        mkdir -p "$dir/src" && echo '' > "$dir/src/lib.rs"; \
     done \
     && mkdir -p crates/aj-runner/src \
     && echo 'fn main() {}' > crates/aj-runner/src/main.rs \

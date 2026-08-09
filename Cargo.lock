@@ -18,6 +18,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aj-output-only"
+version = "0.1.0"
+dependencies = [
+ "aj-package",
+ "aj-standard-io",
+ "tracing",
+]
+
+[[package]]
 name = "aj-package"
 version = "0.1.0"
 dependencies = [
@@ -49,6 +58,7 @@ dependencies = [
 name = "aj-runner"
 version = "0.1.0"
 dependencies = [
+ "aj-output-only",
  "aj-package",
  "aj-protocol",
  "aj-sandbox",

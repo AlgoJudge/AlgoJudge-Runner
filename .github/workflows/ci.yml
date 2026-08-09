@@ -103,6 +103,16 @@ jobs:
           ./x test -p aj-runner --test end_to_end
           -- --include-ignored --test-threads=1
 
+      # M3's mechanical half. A test cannot honestly assert something about a
+      # repository it is not in, so it is asserted here, against the checkout
+      # the stack was built from: **adding a problem type left the Server
+      # untouched, or it did not.**
+      - name: The Server learned nothing about the second problem type
+        run: |
+          cd algojudge-server
+          test -z "$(git status --porcelain)" || { git status --short; exit 1; }
+          echo "the Server checkout is unchanged"
+
       - name: What the Runner said
         if: always()
         run: >
