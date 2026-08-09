@@ -16,6 +16,13 @@
 //! Runner** (D-10): a package names the profile rather than restating sixty
 //! words, so a task written today still gets a reviewed set tomorrow.
 //!
+//! **In this version the profile is fixed and no package configures it**
+//! (decided 2026-08-09). `PACKAGE_FORMAT.md` has no `policy` section and is not
+//! gaining one now — a format section invented ahead of anyone needing it
+//! acquires a shape nobody chose. The profile being *versioned* is what keeps
+//! that reversible: when a package can vary the rules, one that names
+//! `standard-io/default@1` keeps working unchanged.
+//!
 //! Two languages are enforced — C++ and Python, the two the Runner judges. Rust
 //! and Java are carried in the file and are **not** applied, because enforcing a
 //! dictionary for a language nothing can submit would be a rule nobody could
