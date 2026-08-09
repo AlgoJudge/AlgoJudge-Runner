@@ -58,24 +58,47 @@ pub struct Docker {
     /// Creating a directory in a mounted cgroup2 needs **write permission, not
     /// a capability** — which is why this costs far less than the
     /// `CAP_SYS_ADMIN` that `isolate` wanted for the same numbers (D-13).
-    cgroup_root: Option<std::path::PathBuf>,
+    ///
+    /// Resolved by [`Self::preflight`], because deciding it needs the daemon
+    /// (see there). Unset means measurement is off, and **that must never stop
+    /// a container from starting**: the limits are applied by the runtime and
+    /// hold either way.
+    cgroup_root: std::sync::OnceLock<Option<std::path::PathBuf>>,
 }
 
 impl Docker {
     pub fn connect() -> Result<Self> {
         Ok(Self {
             client: bollard::Docker::connect_with_local_defaults()?,
-            cgroup_root: Self::usable_cgroup_root(),
+            cgroup_root: std::sync::OnceLock::new(),
         })
     }
 
-    /// The configured root, kept only if this process can actually write there.
+    /// Where this Runner may make a cgroup — **and only under the `cgroupfs`
+    /// driver.**
     ///
-    /// Checked once at start rather than per run, and by **trying** rather than
-    /// by inspecting permissions: the Runner is usually itself in a container,
-    /// and whether `/sys/fs/cgroup` came in writable is a deployment fact no
-    /// mode bit reliably answers.
-    fn usable_cgroup_root() -> Option<std::path::PathBuf> {
+    /// Under the `systemd` driver a cgroup parent is not a path: the daemon
+    /// refuses anything that is not a slice, with
+    /// `cgroup-parent for systemd cgroup should be a valid slice named as
+    /// "xxx.slice"`, and slices belong to systemd rather than to whoever calls
+    /// `mkdir`. Passing a path there does not degrade the measurement — it
+    /// **refuses the container**, which is why this is decided once, from what
+    /// the daemon reports, rather than assumed.
+    ///
+    /// Found by CI and not locally: this workstation runs `cgroupfs` and the
+    /// runner runs `systemd`, so every container in the adversarial suite failed
+    /// to start on a host the author never used.
+    fn resolve_cgroup_root(&self, driver: Option<String>) -> Option<std::path::PathBuf> {
+        let driver = driver.unwrap_or_default();
+        if driver != "cgroupfs" {
+            tracing::info!(
+                driver = %driver,
+                "peak memory will not be measured: a cgroup parent is only a path \
+                 under the cgroupfs driver",
+            );
+            return None;
+        }
+
         let root = std::path::PathBuf::from(
             std::env::var("AJ_Sandbox__CgroupRoot").unwrap_or_else(|_| "/sys/fs/cgroup".to_owned()),
         );
@@ -102,7 +125,7 @@ impl Docker {
     /// coincide when the host's hierarchy is mounted as-is, which is the
     /// documented arrangement.
     fn cgroup_for(&self, name: &str) -> Option<(std::path::PathBuf, String)> {
-        let root = self.cgroup_root.as_ref()?;
+        let root = self.cgroup_root.get()?.as_ref()?;
         let ours = root.join(name);
         std::fs::create_dir(&ours).ok()?;
         Some((ours, format!("/algojudge/{name}")))
@@ -301,6 +324,13 @@ impl Sandbox for Docker {
         // So the refusal below is about the number shown beside a verdict, not
         // about whether the sandbox holds.
         let info = self.client.info().await?;
+
+        // Decided here because it needs the daemon's answer, and cached because
+        // it cannot change while the daemon is the same one.
+        let _ = self
+            .cgroup_root
+            .set(self.resolve_cgroup_root(info.cgroup_driver.map(|d| d.to_string())));
+
         match info.cgroup_version {
             Some(SystemInfoCgroupVersionEnum::_2) => Ok(()),
             other => Err(Error::Refused(format!(
