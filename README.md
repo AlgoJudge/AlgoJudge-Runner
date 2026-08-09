@@ -38,6 +38,43 @@ Three properties of it shape everything here:
    to the queue, and the Runner that woke up late is refused rather than allowed
    to overwrite whoever holds it now.
 
+## The published images
+
+Pushing a `v*` tag publishes **three images under one version**, to GitHub's
+container registry:
+
+```bash
+docker pull ghcr.io/algojudge/algojudge-runner:1.2.3
+docker pull ghcr.io/algojudge/lang-cpp:1.2.3
+docker pull ghcr.io/algojudge/lang-python:1.2.3
+```
+
+**All three, because a Runner without the language images judges nothing** — and
+because the compiler version is a capability this Runner *reports*, so the
+toolchain that shipped with a version carries that version's number. They are
+built, checked and pushed together, or not at all.
+
+`1.2.3`, `1.2`, `1` and `latest` point at the same image; **a prerelease
+(`v1.2.3-rc.1`) publishes only its own tag**, so nothing moving ever points at a
+release candidate.
+
+The Runner is `linux/amd64` only. That is not an oversight: cgroup v2 on amd64 is
+what the measurement rests on, and a submission's container has to match the
+architecture of the host that runs it — an arm64 language image could not be used
+by any Runner that exists.
+
+A deployment names the language images explicitly, because the built-in defaults
+(`algojudge/lang-cpp:local`) are what the development stack builds locally:
+
+```sh
+AJ_Sandbox__Image__Cpp=ghcr.io/algojudge/lang-cpp:1.2.3
+AJ_Sandbox__Image__Python=ghcr.io/algojudge/lang-python:1.2.3
+```
+
+Pin the same version the Runner is, unless there is a reason not to: that pairing
+is what the release was tested as.
+
+
 ## How it is built
 
 **Rust**, one static `x86_64-unknown-linux-musl` binary with every backend

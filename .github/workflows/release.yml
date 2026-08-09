@@ -1,0 +1,137 @@
+name: Release
+
+# **A tag is the only thing here that publishes anything.** Pushing one is a
+# person's act; nothing that lands on `main` reaches the registry on its own.
+#
+# The convention is `v<major>.<minor>.<patch>`, and a prerelease is
+# `v1.2.3-rc.1`. The `v*` filter is what enforces the prefix — the arithmetic
+# below only strips it.
+#
+# **Three images, one version.** A Runner without the language images judges
+# nothing, and the compiler version is a capability it *reports* — so the
+# toolchain that shipped with a Runner is the toolchain that carries its version
+# number. They are pushed together or not at all.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  # The one thing in this repository that writes anything outside itself.
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  # **Not cancelled.** A run interrupted between two `docker push` calls leaves
+  # a version half in the registry, which is worse than a duplicate run.
+  cancel-in-progress: false
+
+jobs:
+  images:
+    name: Publish the Runner and its language images
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The ancestry check below reads history, and a shallow clone has none.
+          fetch-depth: 0
+
+      # A tag on a scratch branch is not a release. This is the cheap half of
+      # the gate; the other half is the CI run on the commit itself, which this
+      # workflow deliberately does not reproduce — a tag points at a commit, and
+      # that commit's own run is the evidence.
+      - name: The tag must be on main
+        run: |
+          git fetch --no-tags --depth=1 origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD || {
+            echo "$GITHUB_REF_NAME does not point at a commit on main" >&2
+            exit 1
+          }
+
+      - name: Work out the version and the tags
+        id: v
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+
+          # Refused rather than guessed at. `+build` metadata is legal semver
+          # and illegal in a Docker tag, so it is caught here rather than
+          # discovered by a push that fails halfway through.
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "$GITHUB_REF_NAME is not v<major>.<minor>.<patch>[-prerelease]" >&2
+            exit 1
+          fi
+
+          case "$version" in
+            # **A prerelease gets its own tag and nothing else.** The point of
+            # one is that somebody has to ask for it by name; `latest` or a
+            # moving major following it would hand it to everybody who did not.
+            *-*) tags="$version" ;;
+            *)   tags="$version ${version%.*} ${version%%.*} latest" ;;
+          esac
+
+          # ghcr rejects a path with a capital letter — `invalid reference
+          # format` — and the owner here is spelled `AlgoJudge`.
+          owner=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "registry=ghcr.io/$owner" >> "$GITHUB_OUTPUT"
+          echo "Publishing $version as: $tags"
+
+      # `image.source` is not decoration: it is what makes GitHub attach each
+      # package to this repository, so a package page links back to the code
+      # rather than standing on its own.
+      - name: Build all three
+        run: |
+          # An array rather than a string of flags: one label carries a URL and
+          # another a timestamp, and word-splitting a string is how one of them
+          # eventually arrives as two arguments.
+          labels=(
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+            --label "org.opencontainers.image.revision=$GITHUB_SHA"
+            --label "org.opencontainers.image.version=${{ steps.v.outputs.version }}"
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          )
+
+          docker build "${labels[@]}" -t algojudge-runner:release .
+          docker build "${labels[@]}" -t lang-cpp:release    images/cpp
+          docker build "${labels[@]}" -t lang-python:release images/python
+
+      # **The Runner's image has no shell**, so there is exactly one thing that
+      # can be run in it: the Runner. Started with no configuration it refuses
+      # and says which setting is missing, which proves the static binary in a
+      # distroless image actually runs — the failure this catches is a build
+      # that produced something unexecutable.
+      - name: The Runner runs
+        run: |
+          said=$(docker run --rm algojudge-runner:release 2>&1 || true)
+          printf '%s\n' "$said" | grep -q 'AJ_Server__BaseUrl is required' || {
+            echo "the Runner did not start and ask for its configuration:" >&2
+            printf '%s\n' "$said" >&2
+            exit 1
+          }
+
+      # A language image with no toolchain in it would fail every submission
+      # with an infrastructure failure, one per test, and look like the Runner.
+      - name: The toolchains are in the language images
+        run: |
+          docker run --rm lang-cpp:release    g++ --version
+          docker run --rm lang-python:release python3 --version
+
+      - name: Log in to ghcr.io
+        run: |
+          printf '%s' '${{ github.token }}' \
+            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      # Pushed last and together, after all three have been built and checked,
+      # so a broken language image cannot leave a published Runner pointing at
+      # a version of it that does not exist.
+      - name: Push
+        run: |
+          for image in algojudge-runner lang-cpp lang-python; do
+            for tag in ${{ steps.v.outputs.tags }}; do
+              docker tag "$image:release" "${{ steps.v.outputs.registry }}/$image:$tag"
+              docker push "${{ steps.v.outputs.registry }}/$image:$tag"
+            done
+          done
