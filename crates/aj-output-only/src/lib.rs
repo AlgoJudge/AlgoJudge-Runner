@@ -24,7 +24,7 @@ use std::path::Path;
 use aj_package::{Config, TestSet};
 use aj_standard_io::compare::compare;
 use aj_standard_io::details::{Compilation, Details, Limits};
-use aj_standard_io::score::{judge, Judgement, Status, TestOutcome};
+use aj_standard_io::score::{judge, Judgement, Reason, Status, TestOutcome};
 
 /// What the participant sent, unpacked: their answer for each test.
 pub struct Answers {
@@ -131,6 +131,8 @@ pub fn mark(package: &Path, config: &Config, tests: &TestSet, answers: &Answers)
             time_ms: 0,
             memory_bytes: None,
             note: found.note(),
+            // Nothing was run, so the only way to fail is the answer itself.
+            reason: (!found.equal()).then_some(Reason::WrongAnswer),
         });
     }
 
@@ -148,6 +150,9 @@ fn missing(test: &aj_package::Test, why: &str) -> TestOutcome {
         time_ms: 0,
         memory_bytes: None,
         note: why.to_owned(),
+        // An answer that was never uploaded is an answer that is not right.
+        // There is no run to have gone wrong in.
+        reason: Some(Reason::WrongAnswer),
     }
 }
 

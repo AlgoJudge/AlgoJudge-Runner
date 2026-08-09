@@ -533,3 +533,36 @@ async fn a_trial_measures_every_model_solution_per_group() {
         measured.measured,
     );
 }
+
+/// The reason a test failed reaches the document as a **value**.
+///
+/// The point of the field: a Client can show a clock beside a time limit and a
+/// different thing beside a crash without matching on prose. Asserted on two
+/// different failures, because a field that is always the same value is not
+/// carrying information.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_failure_says_why_as_a_value_and_not_only_as_prose() {
+    let looping = r#"
+#include <iostream>
+int main() { long long a, b; std::cin >> a >> b; while (true) { } }
+"#;
+    let timed = verdict(judge("cpp-reason-loop", "cpp", looping).await);
+    let timed_doc: serde_json::Value = serde_json::from_slice(&timed.details.to_bytes()).unwrap();
+    assert_eq!(timed_doc["tests"][0]["reason"], "timeLimit");
+
+    let crashing = r#"
+#include <iostream>
+int main() { long long a, b; std::cin >> a >> b; volatile int *p = nullptr; *p = 1; }
+"#;
+    let crashed = verdict(judge("cpp-reason-crash", "cpp", crashing).await);
+    let crashed_doc: serde_json::Value =
+        serde_json::from_slice(&crashed.details.to_bytes()).unwrap();
+    assert_eq!(crashed_doc["tests"][0]["reason"], "runtimeError");
+
+    // A test that passed carries no reason: `status` already says so, and a
+    // reason beside a pass would be a reason for nothing.
+    let fine = verdict(judge("cpp-reason-ok", "cpp", CORRECT_CPP).await);
+    let fine_doc: serde_json::Value = serde_json::from_slice(&fine.details.to_bytes()).unwrap();
+    assert!(fine_doc["tests"][0].get("reason").is_none());
+}

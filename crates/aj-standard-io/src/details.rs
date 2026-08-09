@@ -16,7 +16,7 @@
 
 use serde::Serialize;
 
-use crate::score::{Judgement, Status};
+use crate::score::{Judgement, Reason, Status};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +74,10 @@ pub struct TestReport {
     /// rendered as text; nothing here escapes it, and nothing downstream should
     /// treat it as markup.
     pub note: String,
+    /// Why, as a value. Absent on a test that passed — `status` already says
+    /// that, and a reason beside a pass would be a reason for nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Reason>,
 }
 
 impl Details {
@@ -107,6 +111,7 @@ impl Details {
                     score: t.score,
                     max_score: t.max_score,
                     note: t.outcome.note.clone(),
+                    reason: t.outcome.reason,
                 })
                 .collect(),
         }
@@ -158,6 +163,7 @@ mod tests {
                     time_ms: 20,
                     memory_bytes: Some(12 * 1024 * 1024),
                     note: String::new(),
+                    reason: None,
                 },
                 score: 70.0,
                 max_score: 100.0,

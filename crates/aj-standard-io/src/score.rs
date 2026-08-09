@@ -33,6 +33,32 @@ impl Status {
     }
 }
 
+/// **Why** a test did not pass, as a value rather than as a sentence.
+///
+/// `Status` says whether; this says which. Without it the only thing telling a
+/// time limit from a crash is the prose in `note`, so a Client that wanted to
+/// show a clock beside one and not the other would have to match on the text —
+/// which cannot be translated, cannot be counted, and breaks the day somebody
+/// rewords a message.
+///
+/// **The vocabulary belongs to the problem type**, not to the Server, which
+/// stores this document without reading it. A type that needs another reason
+/// adds one here and nothing else changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Reason {
+    /// It ran, it finished, and the answer was not right.
+    WrongAnswer,
+    TimeLimit,
+    MemoryLimit,
+    OutputLimit,
+    /// It stopped on its own with a non-zero status. `note` says which signal.
+    RuntimeError,
+    /// The activity's rules refused it before anything was built.
+    PolicyViolation,
+    CompilationError,
+}
+
 /// What running one test produced, before it is worth anything.
 #[derive(Debug, Clone)]
 pub struct TestOutcome {
@@ -45,6 +71,8 @@ pub struct TestOutcome {
     pub memory_bytes: Option<u64>,
     /// Reaches the participant, and originates beside untrusted code.
     pub note: String,
+    /// Absent on a test that passed. See [`Reason`].
+    pub reason: Option<Reason>,
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +248,7 @@ groups:
             time_ms: 10,
             memory_bytes: None,
             note: String::new(),
+            reason: (!status.passed()).then_some(Reason::WrongAnswer),
         }
     }
 

@@ -22,4 +22,4 @@ pub use details::{Details, GroupReport, TestReport};
 pub use language::{Images, Language};
 pub use pipeline::{Evaluated, Job, Pipeline, Places, Verdict};
 pub use policy::{Dictionary, Violation};
-pub use score::{judge, Judgement, Status, TestOutcome};
+pub use score::{judge, Judgement, Reason, Status, TestOutcome};
