@@ -343,6 +343,30 @@ async fn nothing_survives_from_one_run_to_the_next() {
         .expect("the second run");
 
     assert_eq!(String::from_utf8_lossy(&second.stdout).trim(), "GONE");
+
+    // **`/dev/shm` as well**, which no profile here asks for.
+    //
+    // The container runtime mounts it as a 64 MiB tmpfs in every container and
+    // a read-only root filesystem does not cover it — so a program that can
+    // write nowhere else can still write there. It is charged to the memory
+    // limit like any other tmpfs, and it is new with the container, but neither
+    // of those is obvious from reading the profile. Asserted so that a runtime
+    // change which started sharing it would fail here rather than in a contest.
+    let wrote = docker
+        .run(&shell("echo remembered > /dev/shm/state && echo written"))
+        .await
+        .expect("a run that writes to /dev/shm");
+    assert_eq!(
+        String::from_utf8_lossy(&wrote.stdout).trim(),
+        "written",
+        "/dev/shm is expected to be writable; if this fails the note above is stale",
+    );
+
+    let looked = docker
+        .run(&shell("cat /dev/shm/state 2>/dev/null || echo GONE"))
+        .await
+        .expect("the run that looks for it");
+    assert_eq!(String::from_utf8_lossy(&looked.stdout).trim(), "GONE");
 }
 
 // ── A8 — it writes rather than prints ───────────────────────────────────────
