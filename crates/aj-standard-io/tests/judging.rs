@@ -467,3 +467,102 @@ async fn the_committed_package_judges_a_correct_solution() {
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
     assert_eq!(document["tests"].as_array().unwrap().len(), 5);
 }
+
+/// Measuring the committed package's own model solutions.
+///
+/// The end of the calibration chain: two model solutions, two languages, and a
+/// row per group per language — which is what makes "one `.cpp` sets the limits
+/// for everybody" a *choice* rather than the only thing possible.
+///
+/// Uses `fixtures/sum`, the package that ships, so this fails if the format and
+/// the code ever part company.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_trial_measures_every_model_solution_per_group() {
+    let pipeline = pipeline().await;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/sum");
+    let on_host = match std::env::var("AJ_HOST_WORKDIR") {
+        Ok(host) => {
+            let separator = if host.contains('\\') { "\\" } else { "/" };
+            PathBuf::from(host).join(format!("fixtures{separator}sum"))
+        }
+        Err(_) => root.clone(),
+    };
+    let package = Places {
+        here: root.clone(),
+        on_host,
+    };
+
+    let declared = std::fs::read_to_string(root.join("config.yml")).unwrap();
+    let config = Config::parse(&declared).unwrap();
+    let tests = TestSet::read(&root, &config).unwrap();
+
+    let measured = aj_standard_io::measure(&pipeline, &config, &tests, &package, &work("trial"))
+        .await
+        .expect("the package's own model solutions should measure");
+
+    assert!(!measured.measured.is_empty(), "nothing was measured");
+
+    // Two models, so every row names its language: a row without one would be
+    // the package's own limit, which is not what two references produce.
+    assert!(
+        measured.measured.iter().all(|m| m.language.is_some()),
+        "with several models every row names a language: {:?}",
+        measured.measured,
+    );
+
+    let languages: std::collections::BTreeSet<_> = measured
+        .measured
+        .iter()
+        .filter_map(|m| m.language.clone())
+        .collect();
+    assert_eq!(
+        languages,
+        ["cpp".to_owned(), "python".to_owned()]
+            .into_iter()
+            .collect(),
+        "both declared model solutions should have been run",
+    );
+
+    // A measurement of nothing is not a measurement. Every group that has tests
+    // reports a time, and time is never zero for a program that actually ran.
+    assert!(
+        measured.measured.iter().all(|m| m.time_ms > 0),
+        "a measured group with no time did not run: {:?}",
+        measured.measured,
+    );
+}
+
+/// The reason a test failed reaches the document as a **value**.
+///
+/// The point of the field: a Client can show a clock beside a time limit and a
+/// different thing beside a crash without matching on prose. Asserted on two
+/// different failures, because a field that is always the same value is not
+/// carrying information.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_failure_says_why_as_a_value_and_not_only_as_prose() {
+    let looping = r#"
+#include <iostream>
+int main() { long long a, b; std::cin >> a >> b; while (true) { } }
+"#;
+    let timed = verdict(judge("cpp-reason-loop", "cpp", looping).await);
+    let timed_doc: serde_json::Value = serde_json::from_slice(&timed.details.to_bytes()).unwrap();
+    assert_eq!(timed_doc["tests"][0]["reason"], "timeLimit");
+
+    let crashing = r#"
+#include <iostream>
+int main() { long long a, b; std::cin >> a >> b; volatile int *p = nullptr; *p = 1; }
+"#;
+    let crashed = verdict(judge("cpp-reason-crash", "cpp", crashing).await);
+    let crashed_doc: serde_json::Value =
+        serde_json::from_slice(&crashed.details.to_bytes()).unwrap();
+    assert_eq!(crashed_doc["tests"][0]["reason"], "runtimeError");
+
+    // A test that passed carries no reason: `status` already says so, and a
+    // reason beside a pass would be a reason for nothing.
+    let fine = verdict(judge("cpp-reason-ok", "cpp", CORRECT_CPP).await);
+    let fine_doc: serde_json::Value = serde_json::from_slice(&fine.details.to_bytes()).unwrap();
+    assert!(fine_doc["tests"][0].get("reason").is_none());
+}

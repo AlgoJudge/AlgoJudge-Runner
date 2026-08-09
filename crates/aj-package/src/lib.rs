@@ -17,6 +17,6 @@ pub mod error;
 pub mod testset;
 
 pub use archive::{extract, Limits as ArchiveLimits};
-pub use config::Config;
+pub use config::{Calibration, Config, Measurement};
 pub use error::{Error, Result};
 pub use testset::{Test, TestSet};

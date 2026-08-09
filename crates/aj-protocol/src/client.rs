@@ -142,6 +142,68 @@ impl Server {
         read(response).await.map(Some)
     }
 
+    /// Takes one trial, or `None`.
+    ///
+    /// A second endpoint rather than a flag on `claim`, matching the Server: a
+    /// Runner that has not been taught about trials keeps working, and a queue
+    /// of trials can never delay the queue that decides somebody's mark.
+    pub async fn claim_trial(&self, lease_seconds: Option<u32>) -> Result<Option<ClaimedTrial>> {
+        let response = accept(
+            self.bearer(self.http.post(self.url("runner/trials/claim")))
+                .json(&ClaimRequest { lease_seconds })
+                .send()
+                .await?,
+        )
+        .await?;
+
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        read(response).await.map(Some)
+    }
+
+    /// Says what a trial measured, or why it measured nothing.
+    ///
+    /// Idempotent on the lease token, as a job report is: a resend after a lost
+    /// acknowledgement answers `duplicate: true` rather than recording a second
+    /// measurement.
+    pub async fn report_trial(
+        &self,
+        trial_id: &str,
+        report: &TrialReport,
+    ) -> Result<TrialReportAccepted> {
+        let response = self
+            .bearer(
+                self.http
+                    .post(self.url(&format!("runner/trials/{trial_id}/report"))),
+            )
+            .json(report)
+            .send()
+            .await?;
+        read(accept(response).await?).await
+    }
+
+    /// Extends a **trial's** lease. Same deadline, same reason, its own path.
+    pub async fn renew_trial(
+        &self,
+        trial_id: &str,
+        lease_token: &str,
+        lease_seconds: Option<u32>,
+    ) -> Result<TrialLease> {
+        let response = self
+            .bearer(
+                self.http
+                    .post(self.url(&format!("runner/trials/{trial_id}/lease"))),
+            )
+            .json(&LeaseRequest {
+                lease_token: lease_token.to_owned(),
+                lease_seconds,
+            })
+            .send()
+            .await?;
+        read(accept(response).await?).await
+    }
+
     /// Extends a lease this Runner still holds.
     ///
     /// The deadline exists so a job survives a Runner that died, not so it

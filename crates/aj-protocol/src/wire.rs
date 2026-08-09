@@ -89,6 +89,54 @@ pub struct ClaimRequest {
     pub lease_seconds: Option<u32>,
 }
 
+/// One trial: a package to time, belonging to no problem.
+///
+/// Deliberately not `ClaimedJob` with empty fields. A trial has no submission,
+/// no attempt and no problem version, and a shared type would carry four
+/// `Option`s that mean "this is the other kind" — which every reader would then
+/// have to check, and one would forget.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimedTrial {
+    pub trial_id: String,
+    pub lease_token: String,
+    /// **Authoritative**, as for a job: the request was a suggestion.
+    pub lease_expires_at: String,
+    pub problem_type: String,
+    pub package_file_id: String,
+    pub package_sha256: String,
+}
+
+/// What a trial produced, or why it produced nothing.
+///
+/// **Never both, and never a score.** A trial that failed says so; a trial that
+/// worked carries a measurement the Server stores without reading.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrialReport {
+    pub lease_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measurement: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrialLease {
+    pub trial_id: String,
+    pub lease_token: String,
+    pub lease_expires_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrialReportAccepted {
+    pub trial_id: String,
+    pub state: String,
+    pub duplicate: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaimedJob {

@@ -6,6 +6,7 @@
 //! which matters, because these are the rules a participant's mark comes from
 //! and "it looked right when I ran it" is not evidence about a scoring rule.
 
+pub mod calibrate;
 pub mod checker;
 pub mod compare;
 pub mod details;
@@ -14,10 +15,11 @@ pub mod pipeline;
 pub mod policy;
 pub mod score;
 
+pub use calibrate::{measure, Measured};
 pub use checker::{checker_said, Checked};
 pub use compare::{compare, Comparison};
 pub use details::{Details, GroupReport, TestReport};
 pub use language::{Images, Language};
 pub use pipeline::{Evaluated, Job, Pipeline, Places, Verdict};
 pub use policy::{Dictionary, Violation};
-pub use score::{judge, Judgement, Status, TestOutcome};
+pub use score::{judge, Judgement, Reason, Status, TestOutcome};

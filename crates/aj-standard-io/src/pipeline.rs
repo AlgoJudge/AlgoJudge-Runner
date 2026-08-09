@@ -18,7 +18,7 @@ use crate::checker::{checker_said, Broken};
 use crate::compare::compare;
 use crate::details::{compiled, failed_to_compile, Compilation, Details, Limits};
 use crate::language::{self, Images, BUILD_OUTPUT, INPUT, PROGRAM, SOURCE};
-use crate::score::{judge, Judgement, Status, TestOutcome};
+use crate::score::{judge, Judgement, Reason, Status, TestOutcome};
 
 /// A directory as this process sees it, and as the container runtime does.
 ///
@@ -253,17 +253,22 @@ impl<S: Sandbox> Pipeline<S> {
             // What the machinery did to it comes first: none of these is the
             // program having answered wrongly.
             let stopped = match run.stopped {
-                Stopped::WallClock => Some("Time limit exceeded"),
-                Stopped::Memory => Some("Memory limit exceeded"),
-                Stopped::Output => Some("Output limit exceeded"),
+                Stopped::WallClock => Some(("Time limit exceeded", Reason::TimeLimit)),
+                Stopped::Memory => Some(("Memory limit exceeded", Reason::MemoryLimit)),
+                Stopped::Output => Some(("Output limit exceeded", Reason::OutputLimit)),
                 Stopped::OnItsOwn => None,
             };
-            if let Some(note) = stopped {
-                outcomes.push(failed(test, time_ms, note));
+            if let Some((note, reason)) = stopped {
+                outcomes.push(failed(test, time_ms, note, reason));
                 continue;
             }
             if run.exit_code != 0 {
-                outcomes.push(failed(test, time_ms, &how_it_died(run.exit_code)));
+                outcomes.push(failed(
+                    test,
+                    time_ms,
+                    &how_it_died(run.exit_code),
+                    Reason::RuntimeError,
+                ));
                 continue;
             }
 
@@ -318,6 +323,9 @@ impl<S: Sandbox> Pipeline<S> {
                 // number nobody meets.
                 memory_bytes: run.peak_memory_bytes,
                 note,
+                // Everything the machinery could do to it was handled above, so
+                // a failure this far down is the answer itself.
+                reason: (!status.passed()).then_some(Reason::WrongAnswer),
             });
         }
 
@@ -482,7 +490,7 @@ fn how_it_died(exit_code: i64) -> String {
     format!("Runtime error: {signal} (exit code {exit_code})")
 }
 
-fn failed(test: &aj_package::Test, time_ms: u64, note: &str) -> TestOutcome {
+fn failed(test: &aj_package::Test, time_ms: u64, note: &str, reason: Reason) -> TestOutcome {
     TestOutcome {
         name: test.name.clone(),
         group: test.group,
@@ -491,6 +499,7 @@ fn failed(test: &aj_package::Test, time_ms: u64, note: &str) -> TestOutcome {
         time_ms,
         memory_bytes: None,
         note: note.to_owned(),
+        reason: Some(reason),
     }
 }
 
@@ -506,7 +515,7 @@ fn policy_violation(job: &Job<'_>, broken: &[crate::policy::Violation]) -> Evalu
     let outcomes: Vec<TestOutcome> = job
         .tests
         .iter()
-        .map(|test| failed(test, 0, "Naruszenie regulaminu"))
+        .map(|test| failed(test, 0, "Policy violation", Reason::PolicyViolation))
         .collect();
 
     let judgement = judge(job.config, job.tests, &outcomes);
@@ -542,7 +551,7 @@ fn compilation_failed(job: &Job<'_>, log: &str) -> Evaluated {
     let outcomes: Vec<TestOutcome> = job
         .tests
         .iter()
-        .map(|test| failed(test, 0, "Compilation error"))
+        .map(|test| failed(test, 0, "Compilation error", Reason::CompilationError))
         .collect();
 
     let judgement = judge(job.config, job.tests, &outcomes);

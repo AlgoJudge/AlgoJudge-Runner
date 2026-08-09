@@ -192,16 +192,22 @@ Stated so that absence is not read as a decision:
   mounted read-only see each other's locks, one holding a shared lock and the
   other refused an exclusive one.
 
-  It matters because `pipeline.rs:222` mounts `job.package…/tests` read-only into
-  every test container, and the unpacked package is cached per problem version —
-  so **two submissions to the same problem share that mount**. Concurrently
-  judged, they could signal each other through a lock on a test file. Today that
-  is closed only by `AJ_Concurrency` defaulting to **1**, which is a throughput
-  setting rather than a security control: raising it for speed would open a
-  contestant-to-contestant channel with nothing to notice.
+  **Corrected 2026-08-09: our sandboxes do not share an inode, so this does not
+  reach us.** An earlier version of this section said two submissions to the same
+  problem share the mounted tests, because the package is cached per problem
+  version. What is cached is the **archive**; the extraction target is
+  `Scratch::new(…, job_id)`, a directory per job, so two concurrently judged
+  submissions unpack their own copies and lock nothing in common. The channel is
+  real where a file *is* shared — which is why it is written down — and the
+  architecture that would expose it is one where the unpacked package is mounted
+  from the cache. It is not.
 
-  So the profile is Docker's default **plus a deny on the lock calls** — and it
-  does not need `isolate` to get there.
+  So the lock rule has **no concrete driver here today**, and a custom profile
+  goes back to being defence in depth without a named threat. What would bring it
+  back is a change nobody would think of as a security decision: mounting the
+  unpacked package from the cache instead of unpacking per job, to save the copy.
+  That would be a sensible-looking performance change and would open a
+  contestant-to-contestant channel.
 - **`isolate` as a deeper supervisor.** **Not adopted** — the spike ran on
   2026-08-09 and is in `docs/spikes/ISOLATE.md`. It works in a non-privileged
   container, needing `CAP_SYS_ADMIN` and `CAP_NET_ADMIN` over a self-delegated
