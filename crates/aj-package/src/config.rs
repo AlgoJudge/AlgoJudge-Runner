@@ -33,12 +33,17 @@ pub struct Config {
     #[serde(default)]
     pub checker: Option<Source>,
 
-    /// Used for calibration, never for judging.
+    /// Used for calibration, never for judging. The shorthand for one language.
     #[serde(default)]
     pub model_solution: Option<Source>,
 
+    /// One per language. The same field as `model_solution`, written for more
+    /// than one; a package states one of the two.
     #[serde(default)]
-    pub calibration: Option<serde_yaml_ng::Value>,
+    pub model_solutions: Vec<Source>,
+
+    #[serde(default)]
+    pub calibration: Option<Calibration>,
 
     #[serde(default)]
     pub extra_compilation_files: Vec<String>,
@@ -77,6 +82,90 @@ pub struct Group {
     /// ceiling for every test in the problem.
     #[serde(default)]
     pub limits: Option<PartialLimits>,
+}
+
+/// How a measurement of a model solution becomes a limit, and what was measured.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Calibration {
+    #[serde(default)]
+    pub time: Option<Rule>,
+    #[serde(default)]
+    pub memory: Option<Rule>,
+    /// Written by a trial run: one row per group, and per language where more
+    /// than one model solution was measured.
+    #[serde(default)]
+    pub measured: Vec<Measurement>,
+    #[serde(default)]
+    pub at: Option<String>,
+    #[serde(default)]
+    pub runner: Option<String>,
+}
+
+/// `measured × factor + add`, rounded **up** to `round_to`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Rule {
+    #[serde(default = "one")]
+    pub factor: f64,
+    #[serde(default)]
+    pub add: f64,
+    #[serde(default)]
+    pub round_to: f64,
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+impl Calibration {
+    /// Time ×3 rounded to 100 ms, as the format states the default.
+    pub fn time_rule(&self) -> Rule {
+        self.time.unwrap_or(Rule {
+            factor: 3.0,
+            add: 0.0,
+            round_to: 100.0,
+        })
+    }
+
+    /// Memory **+16 MiB** rounded to 1 MiB. Headroom rather than a multiple,
+    /// because what a weaker solution needs is room, not a proportion.
+    pub fn memory_rule(&self) -> Rule {
+        self.memory.unwrap_or(Rule {
+            factor: 1.0,
+            add: 16.0 * 1024.0,
+            round_to: 1024.0,
+        })
+    }
+}
+
+impl Rule {
+    /// Rounded **up**, because a limit landing below the measurement it came
+    /// from fails the solution it was derived from.
+    pub fn applied(&self, measured: f64) -> f64 {
+        let scaled = measured * self.factor + self.add;
+        if self.round_to > 0.0 {
+            (scaled / self.round_to).ceil() * self.round_to
+        } else {
+            scaled.ceil()
+        }
+    }
+}
+
+/// What one model solution did on one group.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Measurement {
+    pub group: u32,
+    /// Absent means the package's own limits, for every language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    pub time_ms: u64,
+    /// **Absent is not zero.** A Runner that cannot measure peak memory
+    /// honestly reports nothing rather than a number that would be shown to a
+    /// participant beside their verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_kib: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -214,6 +303,19 @@ impl Config {
         }
 
         limits
+    }
+
+    /// Every model solution the package declares, however it declared them.
+    ///
+    /// One field written two ways: `modelSolution` for the common case of a
+    /// single reference, `modelSolutions` when a package measures several
+    /// languages. Reading both here means nothing downstream has to know which
+    /// spelling an author used.
+    pub fn models(&self) -> Vec<&Source> {
+        self.model_solution
+            .iter()
+            .chain(self.model_solutions.iter())
+            .collect()
     }
 
     pub fn group(&self, group: u32) -> Option<&Group> {
@@ -430,6 +532,93 @@ extraCompilationFiles: []
             })))
             .unwrap();
         assert_eq!(lowered.limits.time_ms, 250);
+    }
+
+    // ── calibration ─────────────────────────────────────────────────────────
+
+    /// The specification's own worked example, so this fails if the document
+    /// and the arithmetic ever part company.
+    #[test]
+    fn the_default_rules_are_the_ones_the_format_states() {
+        let calibration = Calibration::default();
+
+        // 240 × 3 + 0 → 720, rounded up to 100 → 800 ms.
+        assert_eq!(calibration.time_rule().applied(240.0), 800.0);
+        // 31000 + 16384 → 47384, rounded up to 1024 → 48128 KiB.
+        assert_eq!(calibration.memory_rule().applied(31000.0), 48128.0);
+    }
+
+    /// **Up, never to nearest.** A limit landing below the measurement it came
+    /// from fails the solution it was derived from.
+    #[test]
+    fn a_derived_limit_is_never_below_the_measurement_it_came_from() {
+        let rule = Rule {
+            factor: 1.0,
+            add: 0.0,
+            round_to: 100.0,
+        };
+
+        assert_eq!(
+            rule.applied(201.0),
+            300.0,
+            "rounding to nearest would give 200"
+        );
+        assert_eq!(
+            rule.applied(200.0),
+            200.0,
+            "and an exact multiple stays put"
+        );
+    }
+
+    const SEVERAL_MODELS: &str = r#"
+format: standard-io
+version: 1
+limits:
+  timeMs: 1000
+  memoryKib: 262144
+groups:
+  - group: 1
+    points: 100
+modelSolutions:
+  - { source: solutions/model.cpp, language: cpp }
+  - { source: solutions/model.py, language: python }
+calibration:
+  measured:
+    - { group: 1, timeMs: 240, memoryKib: 31000 }
+    - { group: 2, timeMs: 900 }
+    - { group: 2, language: python, timeMs: 3100 }
+  at: 2026-08-09T10:00:00Z
+  runner: runner-01
+"#;
+
+    #[test]
+    fn a_package_may_declare_one_model_solution_or_one_per_language() {
+        let one = Config::parse(FROM_THE_SPECIFICATION).unwrap();
+        assert_eq!(one.models().len(), 1);
+        assert_eq!(one.models()[0].language, "cpp");
+
+        let many = Config::parse(SEVERAL_MODELS).unwrap();
+        assert_eq!(many.models().len(), 2);
+        assert_eq!(many.models()[1].language, "python");
+    }
+
+    /// A measurement is per group, because that is where a limit lives: a
+    /// package whose group 2 states three seconds is calibrated wrongly by one
+    /// number for the whole problem.
+    #[test]
+    fn a_measurement_is_recorded_per_group_and_optionally_per_language() {
+        let config = Config::parse(SEVERAL_MODELS).unwrap();
+        let measured = &config.calibration.as_ref().unwrap().measured;
+
+        assert_eq!(measured.len(), 3);
+        assert_eq!(measured[0].group, 1);
+        assert_eq!(measured[0].memory_kib, Some(31000));
+        assert!(measured[1].memory_kib.is_none(), "absent is not zero");
+        assert_eq!(measured[2].language.as_deref(), Some("python"));
+        assert_eq!(
+            config.calibration.as_ref().unwrap().runner.as_deref(),
+            Some("runner-01")
+        );
     }
 
     #[test]

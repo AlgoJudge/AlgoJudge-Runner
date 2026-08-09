@@ -378,8 +378,8 @@ async fn the_committed_package_judges_a_correct_solution() {
     let files = aj_package::extract(&archive, &unpacked, &aj_package::ArchiveLimits::default())
         .expect("the committed package must unpack");
     assert_eq!(
-        files, 13,
-        "the archive holds a config, ten test files, a checker and a model"
+        files, 14,
+        "a config, ten test files, a checker and two model solutions"
     );
 
     let declared = std::fs::read_to_string(unpacked.join("config.yml")).unwrap();

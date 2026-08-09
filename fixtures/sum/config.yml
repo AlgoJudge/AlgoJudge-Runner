@@ -33,9 +33,11 @@ checker:
   source: checker/checker.cpp
   language: cpp
 
-modelSolution:
-  source: solutions/model.cpp
-  language: cpp
+# One per language: a limit derived from C++ alone would be a limit Python
+# cannot meet, and the whole point of measuring is to stop guessing at that.
+modelSolutions:
+  - { source: solutions/model.cpp, language: cpp }
+  - { source: solutions/model.py,  language: python }
 
 calibration:
   time:   { factor: 3, add: 0, roundTo: 100 }
