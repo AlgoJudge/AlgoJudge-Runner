@@ -41,7 +41,9 @@ impl Places {
         }
     }
 
-    fn join(&self, part: &str) -> Places {
+    /// Both views, kept in step. Public because the Runner lays out a job's
+    /// directories and has to keep the daemon's view of every one of them.
+    pub fn join(&self, part: &str) -> Places {
         Places {
             here: self.here.join(part),
             on_host: self.on_host.join(part),

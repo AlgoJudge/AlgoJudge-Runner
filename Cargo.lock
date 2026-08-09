@@ -49,7 +49,10 @@ dependencies = [
 name = "aj-runner"
 version = "0.1.0"
 dependencies = [
+ "aj-package",
  "aj-protocol",
+ "aj-sandbox",
+ "aj-standard-io",
  "anyhow",
  "serde_json",
  "tokio",

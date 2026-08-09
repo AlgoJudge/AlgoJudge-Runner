@@ -12,7 +12,10 @@ name = "algojudge-runner"
 path = "src/main.rs"
 
 [dependencies]
+aj-package = { path = "../aj-package" }
 aj-protocol = { path = "../aj-protocol" }
+aj-sandbox = { path = "../aj-sandbox" }
+aj-standard-io = { path = "../aj-standard-io" }
 
 anyhow.workspace = true
 serde_json.workspace = true
