@@ -120,7 +120,8 @@ suggests otherwise is teaching a false sense of safety.
 
 ## 5. cgroup v2 is required, and why
 
-Checked at start; the Runner refuses without it.
+Checked at start; the Runner refuses without it. **`docs/CGROUP_V2.md` states the
+minimum a host has to satisfy** and how to check it; this section is the reason.
 
 **The limits are enforced on v1** — measured, not assumed: a container over its
 memory limit is OOM-killed there and `OOMKilled` is reported. What v1 cannot do

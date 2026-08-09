@@ -180,11 +180,26 @@ groups:
     points: 70
 "#;
 
+    /// A counter, because the process id alone is not unique enough.
+    ///
+    /// Six tests call this and the harness runs them in parallel in **one**
+    /// process, so a directory named after the process id is the *same*
+    /// directory for all of them — and the `remove_dir_all` below deletes it
+    /// from under whichever test is using it. That surfaces as
+    /// `NotFound` from a `create_dir_all` or a read, which reads like a broken
+    /// fixture rather than a race, and it appears and disappears with how fast
+    /// the machine is.
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
     fn package() -> (Config, TestSet) {
         let config = Config::parse(CONFIG).unwrap();
 
         let mut root = std::env::temp_dir();
-        root.push(format!("aj-score-{}", std::process::id()));
+        root.push(format!(
+            "aj-score-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("tests")).unwrap();
         for name in ["0a", "1a", "1b", "2a"] {
