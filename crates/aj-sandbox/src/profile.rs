@@ -62,6 +62,15 @@ pub struct Profile {
     /// A writable scratch area, mounted `noexec`.
     pub tmpfs_kib: Option<u64>,
 
+    /// How many files it may hold open, and how large one may get.
+    ///
+    /// Neither is the main defence — the tmpfs size bounds what can be written
+    /// and the memory limit bounds the rest — but both are cheap, and `fsize` is
+    /// the one that turns "wrote a hundred gigabytes to scratch" from a slow
+    /// failure into an immediate one.
+    pub max_open_files: i64,
+    pub max_file_bytes: i64,
+
     /// One core, by number, for the step that is being timed.
     ///
     /// **Capping CPU is not the same as pinning it.** `--cpus=1` limits how much
@@ -115,6 +124,8 @@ impl Profile {
             max_output_bytes: 64 * 1024 * 1024,
             mounts: Vec::new(),
             tmpfs_kib: None,
+            max_open_files: 256,
+            max_file_bytes: 256 * 1024 * 1024,
             cpuset: None,
             writable_root: false,
             collect: None,
@@ -148,6 +159,11 @@ impl Profile {
 
     pub fn tmpfs_kib(mut self, kib: u64) -> Self {
         self.tmpfs_kib = Some(kib);
+        self
+    }
+
+    pub fn max_file_bytes(mut self, bytes: i64) -> Self {
+        self.max_file_bytes = bytes;
         self
     }
 

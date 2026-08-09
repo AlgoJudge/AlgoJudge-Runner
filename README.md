@@ -88,7 +88,10 @@ capabilities, disables the network, mounts a read-only root filesystem, runs as
 an unprivileged user, and caps memory, processes, CPU, wall time and output.
 One container **per test**, never reused.
 
-Two models are rejected, with the reasons written down in `docs/SECURITY.md`:
+`docs/SECURITY.md` is written for the person deploying this: what contains a
+submission, **what this arrangement does not buy**, and why the boundary that
+holds is the host rather than the container. Two models are rejected there, with
+their reasons:
 **privileged Docker-in-Docker**, and **passing the socket into the submission
 container**. That document also states plainly that mounting a socket read-only
 restricts nothing that matters — the boundary is the host, which is why the

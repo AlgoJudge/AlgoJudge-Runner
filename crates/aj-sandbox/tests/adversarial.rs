@@ -344,3 +344,39 @@ async fn nothing_survives_from_one_run_to_the_next() {
 
     assert_eq!(String::from_utf8_lossy(&second.stdout).trim(), "GONE");
 }
+
+// ── A8 — it writes rather than prints ───────────────────────────────────────
+
+/// A program cannot fill the host by writing a large file.
+///
+/// The output cap answers a program that *prints* too much; this is the other
+/// half, and the two are different limits with different failure modes. `fsize`
+/// turns "wrote a hundred gigabytes to scratch" into an immediate signal rather
+/// than a slow one, and the tmpfs size is the second bound behind it.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn a_program_cannot_write_a_file_larger_than_it_is_allowed() {
+    let docker = sandbox().await;
+
+    let outcome = docker
+        .run(
+            &shell("dd if=/dev/zero of=/tmp/big bs=1M count=64 2>/dev/null; wc -c < /tmp/big")
+                .tmpfs_kib(256 * 1024)
+                .max_file_bytes(1024 * 1024)
+                .wall_clock(Duration::from_secs(20)),
+        )
+        .await
+        .expect("the run");
+
+    let written: u64 = String::from_utf8_lossy(&outcome.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(u64::MAX);
+
+    assert!(
+        written <= 1024 * 1024,
+        "it wrote {written} bytes against a limit of {}",
+        1024 * 1024,
+    );
+    assert_eq!(leftovers(&docker).await, 0);
+}
