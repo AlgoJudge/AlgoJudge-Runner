@@ -131,6 +131,21 @@ impl Docker {
             nano_cpus: Some((profile.cpus * 1_000_000_000.0) as i64),
             cpuset_cpus: profile.cpuset.clone(),
 
+            // Soft and hard set to the same number: a program that raises its
+            // own soft limit to the hard one has raised nothing.
+            ulimits: Some(vec![
+                bollard::models::ResourcesUlimits {
+                    name: Some("nofile".to_owned()),
+                    soft: Some(profile.max_open_files),
+                    hard: Some(profile.max_open_files),
+                },
+                bollard::models::ResourcesUlimits {
+                    name: Some("fsize".to_owned()),
+                    soft: Some(profile.max_file_bytes),
+                    hard: Some(profile.max_file_bytes),
+                },
+            ]),
+
             binds: Some(
                 profile
                     .mounts
