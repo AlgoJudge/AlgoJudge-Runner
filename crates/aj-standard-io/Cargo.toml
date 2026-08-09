@@ -11,6 +11,9 @@ repository.workspace = true
 aj-package = { path = "../aj-package" }
 aj-sandbox = { path = "../aj-sandbox" }
 
+indexmap.workspace = true
+regex.workspace = true
+serde_yaml_ng.workspace = true
 serde.workspace = true
 tar.workspace = true
 tokio.workspace = true

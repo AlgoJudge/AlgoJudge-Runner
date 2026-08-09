@@ -1,0 +1,312 @@
+# standard-io/default@1 — policy dictionary for problem type standard-io@1
+#
+# Status: Draft. Annex to AlgoJudge-Design/docs/specs/FORBIDDEN_IDENTIFIERS.md
+#
+# THIS IS A POLICY CONTROL, NOT A SECURITY BOUNDARY.
+# Every rule here is expected to be bypassable (token pasting, macro
+# indirection, dlsym, raw syscalls, encoding tricks). The sandbox is what
+# actually stops a malicious program. A match produces the verdict
+# PolicyViolation with score 0; the submission is neither compiled nor run.
+#
+# Shipped with the Runner and versioned (D-10): a package names this profile
+# rather than restating sixty words, so a task written today still gets a
+# reviewed set tomorrow.
+
+version: 1
+id: standard-io/default@1
+
+matching:
+  stripComments: true          # comments removed before matching
+  stripStringLiterals: true    # string and char literals removed before matching
+  wholeToken: true             # \b...\b, never substring
+  caseSensitive: true
+  reportAllMatches: true
+  passes: [source]             # [source, preprocessed] is opt-in per task
+
+# --------------------------------------------------------------------------
+# C / C++
+# --------------------------------------------------------------------------
+languages:
+  cpp:
+    # Rule H — the primary mechanism. Matched as a #include directive.
+    deniedHeaders:
+      - unistd.h
+      - fcntl.h
+      - dlfcn.h
+      - pthread.h
+      - sched.h
+      - spawn.h
+      - poll.h
+      - dirent.h
+      - ftw.h
+      - glob.h
+      - utime.h
+      - libgen.h
+      - wordexp.h
+      - fts.h
+      - mntent.h
+      - paths.h
+      - netdb.h
+      - ifaddrs.h
+      - net/if.h
+      - netinet/in.h
+      - netinet/tcp.h
+      - arpa/inet.h
+      - sys/socket.h
+      - sys/un.h
+      - sys/stat.h
+      - sys/wait.h
+      - sys/mman.h
+      - sys/ptrace.h
+      - sys/syscall.h
+      - sys/resource.h
+      - sys/times.h
+      - sys/uio.h
+      - sys/file.h
+      - sys/ioctl.h
+      - sys/epoll.h
+      - sys/inotify.h
+      - sys/eventfd.h
+      - sys/signalfd.h
+      - sys/timerfd.h
+      - sys/sendfile.h
+      - sys/vfs.h
+      - sys/statvfs.h
+      - sys/mount.h
+      - sys/reboot.h
+      - sys/personality.h
+      - sys/prctl.h
+      - sys/capability.h
+      - sys/xattr.h
+      - sys/sysinfo.h
+      - sys/utsname.h
+      - sys/user.h
+      - sys/io.h
+      - "linux/*"
+      - "asm/*"
+      - "asm-generic/*"
+      - io.h
+      - process.h
+      - windows.h
+      - conio.h
+      - direct.h
+      - fstream
+      - filesystem
+      - thread
+      - future
+      - mutex
+      - shared_mutex
+      - condition_variable
+      - semaphore
+      - latch
+      - barrier
+      - stop_token
+      - execution
+      - syncstream
+      - ext/stdio_filebuf.h
+      - ext/stdio_sync_filebuf.h
+
+    # Rule I — identifiers reachable from PERMITTED headers, and from
+    # <bits/stdc++.h>, which transitively provides <fstream>, <thread>,
+    # <future> and <filesystem> under C++17 and later.
+    groups:
+
+      P:
+        name: "Uruchamianie innego programu"
+        default: on
+        identifiers: [system, popen, pclose]
+        patterns: ['std\s*::\s*system']
+
+      F:
+        name: "Otwieranie pliku"
+        default: on
+        identifiers:
+          - fopen
+          - fopen64
+          - freopen
+          - freopen64
+          - fdopen
+          - fmemopen
+          - open_memstream
+          - fopencookie
+          - tmpfile
+          - tmpfile64
+          - tmpnam
+          - tmpnam_r
+          - tempnam
+          - mkstemp
+          - mkstemps
+          - mkostemp
+          - mkostemps
+          - mkdtemp
+          - realpath
+          - ctermid
+          - cuserid
+          - ifstream
+          - ofstream
+          - fstream
+          - filebuf
+          - wifstream
+          - wofstream
+          - wfstream
+          - wfilebuf
+          - stdio_filebuf
+        patterns: ['std\s*::\s*filesystem']
+
+      D:
+        name: "Zmienianie systemu plików"
+        # OFF by default: `remove` collides with std::remove / std::remove_if,
+        # which is entirely legal. See decision D-8.
+        default: off
+        identifiers: [remove, rename]
+
+      E:
+        name: "Czytanie środowiska"
+        default: on
+        identifiers: [getenv, secure_getenv, setenv, putenv, unsetenv, clearenv, environ]
+
+      L:
+        name: "Ładowanie zewnętrznego kodu"
+        default: on
+        identifiers: [dlopen, dlsym, dlmopen, dlvsym, dlclose, dladdr]
+
+      K:
+        name: "Bezpośrednie wywołanie jądra"
+        default: on
+        identifiers: [syscall, ptrace]
+
+      A:
+        name: "Wstawki asemblerowe"
+        default: on
+        identifiers: [asm, __asm, __asm__]
+
+      T:
+        name: "Tworzenie wątków"
+        default: on
+        identifiers: [pthread_create, pthread_attr_init, thrd_create, omp_set_num_threads]
+        patterns:
+          - 'std\s*::\s*thread'
+          - 'std\s*::\s*jthread'
+          - 'std\s*::\s*async'
+          - 'std\s*::\s*this_thread'
+
+      O:
+        name: "Zmienianie optymalizacji kompilatora"
+        default: on
+        patterns:
+          - '#\s*pragma\s+GCC\s+optimize'
+          - '#\s*pragma\s+GCC\s+target'
+          - '#\s*pragma\s+omp'
+
+    # Reduced set used when passes includes `preprocessed`. System headers
+    # expand into everything, so only the unambiguous groups are re-checked.
+    preprocessedGroups: [P, F, L]
+
+    # Explicitly permitted — recorded so nobody re-adds them from the legacy
+    # list. All of these operate on stdin/stdout/stderr or name no file.
+    neverDenied:
+      - printf
+      - scanf
+      - fprintf        # fprintf(stderr, ...) is explicitly permitted by the OI rules
+      - fscanf
+      - fgetc
+      - fgetc_unlocked
+      - getc
+      - getc_unlocked
+      - getchar
+      - fputc
+      - putc
+      - putchar
+      - putw
+      - getw
+      - fputs
+      - fgets
+      - getline
+      - getdelim
+      - fread          # fread(buf, 1, N, stdin) is the fastest legal input method
+      - fwrite
+      - setbuf
+      - setbuffer
+      - setvbuf
+      - setlinebuf
+      - sync_with_stdio
+      - fseek
+      - ftell
+      - rewind
+      - fgetpos
+      - fsetpos
+      - fflush
+      - fclose
+      - feof
+      - ferror
+      - clearerr
+      - ungetc
+      - fileno
+      - flockfile
+      - funlockfile
+      - signal
+      - raise
+      - sleep
+      - usleep
+      - nice
+      - malloc
+      - sbrk
+      - exit
+      - abort
+      - _exit
+
+# --------------------------------------------------------------------------
+# Python (CPython / PyPy)
+# --------------------------------------------------------------------------
+  python:
+    deniedImports:
+      [os, subprocess, shutil, pathlib, tempfile, glob, fnmatch, fileinput,
+       linecache, socket, socketserver, ssl, select, selectors, asyncio, http,
+       urllib, ftplib, smtplib, telnetlib, xmlrpc, requests, ctypes, cffi, mmap,
+       multiprocessing, threading, concurrent, _thread, signal, resource, pty,
+       tty, termios, fcntl, grp, pwd, spwd, crypt, posix, nt, pipes, sched,
+       importlib, runpy, imp, py_compile, compileall, platform, getpass,
+       webbrowser, distutils, setuptools, pip, venv, zipfile, tarfile, gzip,
+       bz2, lzma, sqlite3, dbm, shelve, marshal, faulthandler, tracemalloc,
+       cProfile]
+    deniedBuiltins: [open, exec, eval, compile, __import__, breakpoint]
+    deniedPatterns: ['sys\.modules', 'sys\.settrace', 'sys\.setprofile']
+    # `sys` and `gc` stay permitted: sys.stdin/stdout and
+    # sys.setrecursionlimit are necessary; gc.disable() is a legitimate
+    # PyPy speed idiom.
+    neverDenied: [sys, gc, input, print, io]
+
+# --------------------------------------------------------------------------
+# Rust — carried here, not yet enforced: the Runner judges C++ and Python.
+# --------------------------------------------------------------------------
+  rust:
+    deniedPaths:
+      [std::fs, std::process, std::net, std::thread, std::os, std::env,
+       std::mem::transmute, libc, windows_sys, nix]
+    deniedIdentifiers:
+      [Command, File, OpenOptions, ReadDir, TcpStream, TcpListener, UdpSocket,
+       JoinHandle]
+    deniedMacros: ['asm!', 'global_asm!', 'naked_asm!', 'include_str!',
+                   'include_bytes!', 'env!', 'option_env!']
+    deniedAttributes: ['#[link]', '#[no_mangle]']
+    optional:
+      unsafe:
+        name: "Kod unsafe"
+        default: off      # decision D-11 — off by default, available per task
+
+# --------------------------------------------------------------------------
+# Java — carried here, not yet enforced.
+# --------------------------------------------------------------------------
+  java:
+    deniedIdentifiers:
+      [java.io.File, FileInputStream, FileOutputStream, FileReader, FileWriter,
+       RandomAccessFile, FileDescriptor, java.nio.file, Files, Paths, java.net,
+       Socket, ServerSocket, URL, URLConnection, HttpClient, ProcessBuilder,
+       Process, Class.forName, java.lang.reflect, sun.misc.Unsafe, Thread,
+       ExecutorService, Executors, ForkJoinPool, java.util.concurrent,
+       MethodHandles, ScriptEngine]
+    deniedPatterns: ['Runtime\s*\.\s*getRuntime', 'System\s*\.\s*load',
+                     'System\s*\.\s*loadLibrary', 'System\s*\.\s*getenv',
+                     'System\s*\.\s*setProperty']
+    neverDenied: [System.exit, System.out, System.err, System.in,
+                  BufferedReader, InputStreamReader, StringBuilder, Scanner]

@@ -269,31 +269,145 @@ async fn a_python_syntax_error_is_a_compilation_error_and_not_three_failures() {
         .contains("syntax"),);
 }
 
-/// The submission runs with no network, exactly as the adversarial suite
-/// asserts for the sandbox — checked here because it is the pipeline's profile
-/// that has to carry it, not just the sandbox's default.
+/// A submission that reaches for the network never gets as far as the sandbox.
+///
+/// This test asserted the opposite first — that the program compiles, fails to
+/// connect, and passes — and it **could not be written that way any more**:
+/// opening a socket in C++ needs `<sys/socket.h>`, `<netinet/in.h>` and
+/// `<arpa/inet.h>`, and all three are on the header deny-list. The dictionary
+/// stops it at the source.
+///
+/// That is a policy control catching it early, **not** the isolation. The
+/// isolation is asserted where it belongs, against a shell that needs no
+/// headers: `aj-sandbox`'s `there_is_no_network`. Both matter, and they are
+/// different claims — a bypass of this one is expected, and the other one is
+/// what actually holds.
 #[tokio::test]
 #[ignore = "needs a container runtime and the language images"]
-async fn a_submission_cannot_reach_the_network() {
+async fn a_submission_reaching_for_the_network_is_stopped_before_it_is_built() {
     let reaching = r#"
 #include <iostream>
 #include <sys/socket.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
 int main() {
     long long a, b; std::cin >> a >> b;
     int s = socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in to{}; to.sin_family = AF_INET; to.sin_port = htons(80);
-    to.sin_addr.s_addr = inet_addr("1.1.1.1");
-    std::cout << (connect(s, (sockaddr*)&to, sizeof to) == 0 ? -1 : a + b) << "\n";
+    std::cout << (s < 0 ? a + b : -1);
 }
 "#;
     let judged = verdict(judge("cpp-network", "cpp", reaching).await);
 
-    // Connecting fails, so the program prints the right answer and passes.
-    // Were there a network, every test would print -1 and fail.
-    assert_eq!(
-        judged.judgement.verdict, "Accepted",
-        "the sandbox let it out"
+    assert_eq!(judged.judgement.verdict, "PolicyViolation");
+
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    let said = document["compilation"]["log"].as_str().unwrap();
+    assert!(said.contains("sys/socket.h"), "{said}");
+    assert!(said.contains("arpa/inet.h"), "{said}");
+}
+
+// ── The activity's rules ────────────────────────────────────────────────────
+
+/// Never compiled, never run, and told which rule it broke.
+///
+/// The three outcomes a participant must be able to tell apart are "your answer
+/// is wrong", "your code does not build" and "your code is not allowed". This
+/// is the third, and it is neither of the other two.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_submission_that_breaks_the_rules_is_not_compiled() {
+    let forbidden = r#"
+#include <iostream>
+#include <unistd.h>
+int main() { long long a, b; std::cin >> a >> b; system("ls"); std::cout << a + b; }
+"#;
+    let judged = verdict(judge("cpp-policy", "cpp", forbidden).await);
+
+    assert_eq!(judged.judgement.verdict, "PolicyViolation");
+    assert_eq!(judged.judgement.score, 0.0);
+
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    // Not an ERROR: nothing failed to compile, because nothing reached a
+    // compiler.
+    assert_eq!(document["compilation"]["status"], "WARNING");
+
+    let said = document["compilation"]["log"].as_str().unwrap();
+    assert!(
+        said.contains("unistd.h"),
+        "the header rule is not named: {said}"
     );
+    assert!(
+        said.contains("Uruchamianie innego programu"),
+        "the participant is told the rule's name, not its letter: {said}",
+    );
+    assert!(said.contains("wiersz"), "and where it was: {said}");
+}
+
+/// A correct solution that merely *mentions* a forbidden word in a comment is
+/// not a violation. This is the false positive the whole design exists to
+/// avoid, and it is worth asserting through the pipeline and not only in a unit
+/// test.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_comment_about_a_forbidden_call_is_not_a_violation() {
+    let innocent = r#"
+#include <iostream>
+// nie uzywam system() ani fopen - czytam ze standardowego wejscia
+int main() { long long a, b; std::cin >> a >> b; std::cout << a + b; }
+"#;
+    let judged = verdict(judge("cpp-comment", "cpp", innocent).await);
+
+    assert_eq!(judged.judgement.verdict, "Accepted");
+}
+
+// ── The committed package ───────────────────────────────────────────────────
+
+/// Judges the archive in `fixtures/`, through the real extraction path.
+///
+/// Every other test here builds a package as a directory, which skips the part
+/// where a Runner is handed a zip by a Server. This one does not: it is the
+/// closest thing to a real job that does not need a Server.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn the_committed_package_judges_a_correct_solution() {
+    let pipeline = pipeline().await;
+
+    let archive = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/sum.zip");
+    let (here, on_the_host) = fixture("archive");
+    let unpacked = here.join("package");
+
+    let files = aj_package::extract(&archive, &unpacked, &aj_package::ArchiveLimits::default())
+        .expect("the committed package must unpack");
+    assert_eq!(
+        files, 13,
+        "the archive holds a config, ten test files, a checker and a model"
+    );
+
+    let declared = std::fs::read_to_string(unpacked.join("config.yml")).unwrap();
+    let config = Config::parse(&declared).expect("the committed config must read");
+    let tests = TestSet::read(&unpacked, &config).expect("the committed tests must read");
+    assert_eq!(tests.len(), 5);
+    assert_eq!(config.max_score(), 100);
+
+    let evaluated = pipeline
+        .evaluate(&Job {
+            config: &config,
+            tests: &tests,
+            language: "cpp",
+            source: CORRECT_CPP.as_bytes(),
+            package: Places {
+                here: unpacked,
+                on_host: on_the_host.join("package"),
+            },
+            work: work("archive"),
+        })
+        .await;
+
+    let judged = verdict(evaluated);
+    assert_eq!(judged.judgement.verdict, "Accepted");
+    assert_eq!(judged.judgement.score, 100.0);
+
+    // The package declares a checker, so this also proves the checker was
+    // built, run in its own sandbox, and read according to the SIO2 contract.
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    assert_eq!(document["tests"].as_array().unwrap().len(), 5);
 }

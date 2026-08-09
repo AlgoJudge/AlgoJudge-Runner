@@ -16,7 +16,7 @@ use aj_sandbox::{Mount, Profile, Sandbox, Stopped};
 
 use crate::checker::{checker_said, Broken};
 use crate::compare::compare;
-use crate::details::{compiled, failed_to_compile, Details, Limits};
+use crate::details::{compiled, failed_to_compile, Compilation, Details, Limits};
 use crate::language::{self, Images, BUILD_OUTPUT, INPUT, PROGRAM, SOURCE};
 use crate::score::{judge, Judgement, Status, TestOutcome};
 
@@ -110,6 +110,19 @@ impl<S: Sandbox> Pipeline<S> {
         }
         std::fs::write(source.here.join(language.source_name), job.source)
             .map_err(|e| e.to_string())?;
+
+        // ── the activity's rules, before anything is built ──────────────────
+        //
+        // **Before the build, on the raw source** (D-7). A violating submission
+        // is never compiled and never run, the participant is told which rule
+        // matched, and the state stays rejudgeable. It is a policy control and
+        // not a security boundary: a bypass is expected, and containment is the
+        // sandbox's job.
+        let broken = crate::policy::Dictionary::built_in()
+            .check(job.language, &String::from_utf8_lossy(job.source));
+        if !broken.is_empty() {
+            return Ok(policy_violation(job, &broken));
+        }
 
         // ── build ───────────────────────────────────────────────────────────
         let mut log = String::new();
@@ -395,6 +408,49 @@ fn failed(test: &aj_package::Test, time_ms: u64, note: &str) -> TestOutcome {
         memory_kib: None,
         note: note.to_owned(),
     }
+}
+
+/// The submission broke the activity's rules, so nothing was built or run.
+///
+/// Distinct from a compilation error and from an internal error, because those
+/// are three different things to tell a participant: their code is wrong, their
+/// code does not build, or the system failed. This one is none of the three —
+/// their code may be perfect and still not allowed.
+fn policy_violation(job: &Job<'_>, broken: &[crate::policy::Violation]) -> Evaluated {
+    let listed: Vec<String> = broken.iter().map(|v| v.note()).collect();
+
+    let outcomes: Vec<TestOutcome> = job
+        .tests
+        .iter()
+        .map(|test| failed(test, 0, "Naruszenie regulaminu"))
+        .collect();
+
+    let judgement = judge(job.config, job.tests, &outcomes);
+    let details = Details::of(
+        &judgement,
+        limits_of(job),
+        Compilation {
+            // Not an error: nothing failed to compile, because nothing was
+            // offered to a compiler.
+            status: Status::Warning,
+            log: listed.join(
+                "
+",
+            ),
+        },
+    );
+
+    Evaluated::Judged(Box::new(Verdict {
+        judgement: Judgement {
+            verdict: "PolicyViolation".into(),
+            ..judgement.clone()
+        },
+        details,
+        log: listed.join(
+            "
+",
+        ),
+    }))
 }
 
 /// Every test failed for the same reason, and the reason is worth stating once.

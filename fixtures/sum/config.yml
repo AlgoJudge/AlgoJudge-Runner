@@ -1,0 +1,44 @@
+# Sum of two numbers — a real standard-io@1 package.
+#
+# Small on purpose, and complete on purpose: every optional part of the format
+# appears once, so a Runner that judges this has exercised the whole of it —
+# groups, an examples group worth nothing, a per-group limit, a per-language
+# override, a checker, and a model solution.
+
+format: standard-io
+version: 1
+
+limits:
+  timeMs: 1000
+  memoryKib: 262144      # 256 MiB
+
+# Python is slower and needs more room.
+overrideLimits:
+  python:
+    timeMs: 3000
+    memoryKib: 524288    # 512 MiB
+
+groups:
+  - group: 0
+    points: 0
+    examples: true
+  - group: 1
+    points: 40
+  - group: 2
+    points: 60
+    limits:
+      timeMs: 2000       # the large values take longer to read
+
+checker:
+  source: checker/checker.cpp
+  language: cpp
+
+modelSolution:
+  source: solutions/model.cpp
+  language: cpp
+
+calibration:
+  time:   { factor: 3, add: 0, roundTo: 100 }
+  memory: { factor: 1, add: 16384, roundTo: 1024 }
+
+extraCompilationFiles: []
