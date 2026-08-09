@@ -152,7 +152,7 @@ format: standard-io
 version: 1
 limits:
   timeMs: 1000
-  memoryKib: 262144
+  memoryBytes: 268435456
 groups:
   - group: 0
     points: 0

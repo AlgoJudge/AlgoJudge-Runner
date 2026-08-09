@@ -426,7 +426,7 @@ async fn report_with_retries(server: &Server, job: &ClaimedJob, report: &ReportR
 ///
 /// **Stored opaquely, but not shown opaquely.** The Server keeps this as a
 /// string it never parses, and then projects it to a manager through a closed
-/// shape — `os`, `cpu`, `cores`, `memoryMb` (`Api/Contracts/ManagerPanel.cs`).
+/// shape — `os`, `cpu`, `cores`, `memoryBytes` (`Api/Contracts/ManagerPanel.cs`).
 /// Anything else is stored and then silently dropped on the way out, with no
 /// error to say so: a first version of this reported `arch` and it simply never
 /// appeared. So the architecture goes in `cpu`, which is the field that can
@@ -436,7 +436,7 @@ fn machine() -> serde_json::Value {
         "os": std::env::consts::OS,
         "cpu": std::env::consts::ARCH,
         "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
-        "memoryMb": total_memory_mb(),
+        "memoryBytes": total_memory_bytes(),
     })
 }
 
@@ -444,14 +444,15 @@ fn machine() -> serde_json::Value {
 ///
 /// `MemTotal` is stated in kibibytes. Absent rather than zero where it cannot
 /// be read — a zero would show in the panel as a machine with no memory.
-fn total_memory_mb() -> Option<u64> {
+fn total_memory_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     meminfo
         .lines()
         .find_map(|line| line.strip_prefix("MemTotal:"))
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|kib| kib.parse::<u64>().ok())
-        .map(|kib| kib / 1024)
+        // `MemTotal` is stated in kibibytes; everything here is bytes.
+        .map(|kib| kib * 1024)
 }
 
 const FIVE: Duration = Duration::from_secs(5);

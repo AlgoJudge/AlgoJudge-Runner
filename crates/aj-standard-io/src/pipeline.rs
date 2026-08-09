@@ -32,6 +32,30 @@ pub struct Places {
     pub on_host: PathBuf,
 }
 
+/// What a running submission is given of the package: **one input file.**
+///
+/// A named function with a test rather than an expression at the call site,
+/// because getting it wrong is silent and expensive. `tests/` holds
+/// `<name>.in` beside `<name>.out`, so mounting the directory whole hands the
+/// submission the answer key — `cat /in/1a.out` prints what it was asked to
+/// compute, and the run still looks like an ordinary correct solution.
+///
+/// That was the arrangement until 2026-08-09. The only thing standing in front
+/// of it was the forbidden-word dictionary catching `fopen`, `ifstream` and
+/// `open`; `docs/SECURITY.md` §4 states that the dictionary is a **policy**
+/// control and that every rule in it is expected to be bypassable. An answer
+/// key must not rest on a control the project itself calls bypassable.
+///
+/// The program is started as `exec … < /in/<name>.in`, so one file is all it
+/// ever needed. The checker still receives both, because comparing them is its
+/// job and it is not the participant's code.
+fn input_mount(package: &Path, test: &str) -> Mount {
+    Mount::read_only(
+        package.join("tests").join(format!("{test}.in")),
+        format!("{INPUT}/{test}.in"),
+    )
+}
+
 impl Places {
     pub fn same(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
@@ -151,11 +175,11 @@ impl<S: Sandbox> Pipeline<S> {
                 .sandbox
                 .run(
                     &Profile::new(&language.image, command)
-                        .memory_kib(512 * 1024)
+                        .memory_bytes(512 * 1024 * 1024)
                         .pids(128)
                         .wall_clock(Duration::from_secs(60))
                         .max_output_bytes(256 * 1024)
-                        .tmpfs_kib(64 * 1024)
+                        .tmpfs_bytes(64 * 1024 * 1024)
                         .writable_root()
                         .collect(BUILD_OUTPUT)
                         .mount(Mount::read_only(&source.on_host, SOURCE)),
@@ -209,7 +233,7 @@ impl<S: Sandbox> Pipeline<S> {
                         &language.image,
                         language::with_input(&language.start, &test.name),
                     )
-                    .memory_kib(limits.memory_kib)
+                    .memory_bytes(limits.memory_bytes)
                     .pids(16)
                     .cpuset(self.core())
                     .max_output_bytes(64 * 1024 * 1024)
@@ -219,7 +243,7 @@ impl<S: Sandbox> Pipeline<S> {
                     // rather than from this deadline.
                     .wall_clock(Duration::from_millis(limits.time_ms) + Duration::from_secs(1))
                     .mount(Mount::read_only(&artefacts.on_host, PROGRAM))
-                    .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT)),
+                    .mount(input_mount(&job.package.on_host, &test.name)),
                 )
                 .await
                 .map_err(|e| format!("a test could not be run: {e}"))?;
@@ -229,9 +253,9 @@ impl<S: Sandbox> Pipeline<S> {
             // What the machinery did to it comes first: none of these is the
             // program having answered wrongly.
             let stopped = match run.stopped {
-                Stopped::WallClock => Some("Przekroczenie limitu czasu"),
-                Stopped::Memory => Some("Przekroczenie limitu pamięci"),
-                Stopped::Output => Some("Przekroczenie limitu wyjścia"),
+                Stopped::WallClock => Some("Time limit exceeded"),
+                Stopped::Memory => Some("Memory limit exceeded"),
+                Stopped::Output => Some("Output limit exceeded"),
                 Stopped::OnItsOwn => None,
             };
             if let Some(note) = stopped {
@@ -239,11 +263,7 @@ impl<S: Sandbox> Pipeline<S> {
                 continue;
             }
             if run.exit_code != 0 {
-                outcomes.push(failed(
-                    test,
-                    time_ms,
-                    &format!("Błąd wykonania, kod {}", run.exit_code),
-                ));
+                outcomes.push(failed(test, time_ms, &how_it_died(run.exit_code)));
                 continue;
             }
 
@@ -288,9 +308,15 @@ impl<S: Sandbox> Pipeline<S> {
                 status,
                 percentage,
                 time_ms,
-                // Absent until something can measure it honestly — cgroup v2,
-                // or `isolate` underneath.
-                memory_kib: None,
+                // From the run's own cgroup, and **absent when the host gave
+                // the Runner nowhere to measure from** — which is the answer
+                // `PACKAGE_FORMAT.md` asks for rather than a number that is
+                // sometimes wrong. It carries about 2 MiB of container floor
+                // that does not scale, and it is not corrected for: a
+                // participant's run has the same floor, so subtracting it would
+                // make every calibrated limit too tight for the sake of a
+                // number nobody meets.
+                memory_bytes: run.peak_memory_bytes,
                 note,
             });
         }
@@ -339,10 +365,10 @@ impl<S: Sandbox> Pipeline<S> {
             .sandbox
             .run(
                 &Profile::new(&language.image, language.build.clone().unwrap_or_default())
-                    .memory_kib(512 * 1024)
+                    .memory_bytes(512 * 1024 * 1024)
                     .pids(128)
                     .wall_clock(Duration::from_secs(60))
-                    .tmpfs_kib(64 * 1024)
+                    .tmpfs_bytes(64 * 1024)
                     .writable_root()
                     .collect(BUILD_OUTPUT)
                     .mount(Mount::read_only(&source.on_host, SOURCE)),
@@ -384,7 +410,7 @@ impl<S: Sandbox> Pipeline<S> {
                         format!("{INPUT}/{test}.out"),
                     ],
                 )
-                .memory_kib(256 * 1024)
+                .memory_bytes(256 * 1024 * 1024)
                 .pids(16)
                 .wall_clock(Duration::from_secs(30))
                 .max_output_bytes(64 * 1024)
@@ -419,6 +445,43 @@ fn unpack(collected: &Option<Vec<u8>>, into: &Path) -> Result<(), String> {
         .map_err(|e| format!("what the build produced could not be read: {e}"))
 }
 
+/// What to tell a participant whose program did not exit cleanly.
+///
+/// A shell reports a fatal signal as `128 + n`, and `kod 139` is not something
+/// anybody can act on. Naming the signal is the difference between "look at
+/// your memory access" and "look at everything".
+///
+/// **A time limit never reaches here.** That is decided by the Runner killing
+/// the container itself and reported as `Stopped::WallClock`, before the exit
+/// code is consulted at all — so a crash and a timeout come from two different
+/// places and cannot be mistaken for one another.
+///
+/// **One caveat, measured 2026-08-09.** The program runs as **PID 1**, and the
+/// kernel does not deliver a signal with a default disposition to PID 1 unless
+/// it was generated by a hardware fault. `SIGSEGV` and `SIGFPE` are faults and
+/// arrive correctly; `SIGABRT` is raised in software, so glibc's `abort()` —
+/// which is also a failed `assert`, an uncaught C++ exception and a detected
+/// double free — is refused and then dies as `SIGSEGV` instead. Under
+/// `docker --init` the same programs report `134` as they should. So `139` is
+/// honest about "it crashed" and can be wrong about *how*, and until the init
+/// question is decided this wording must not promise more than it knows.
+fn how_it_died(exit_code: i64) -> String {
+    let signal = match exit_code - 128 {
+        4 => "illegal instruction",
+        6 => "aborted",
+        7 => "bus error",
+        8 => "arithmetic error, such as division by zero",
+        9 => "killed",
+        11 => "segmentation fault",
+        13 => "wrote to a closed stream",
+        15 => "terminated",
+        _ => {
+            return format!("Runtime error, exit code {exit_code}");
+        }
+    };
+    format!("Runtime error: {signal} (exit code {exit_code})")
+}
+
 fn failed(test: &aj_package::Test, time_ms: u64, note: &str) -> TestOutcome {
     TestOutcome {
         name: test.name.clone(),
@@ -426,7 +489,7 @@ fn failed(test: &aj_package::Test, time_ms: u64, note: &str) -> TestOutcome {
         status: Status::Error,
         percentage: 0,
         time_ms,
-        memory_kib: None,
+        memory_bytes: None,
         note: note.to_owned(),
     }
 }
@@ -479,7 +542,7 @@ fn compilation_failed(job: &Job<'_>, log: &str) -> Evaluated {
     let outcomes: Vec<TestOutcome> = job
         .tests
         .iter()
-        .map(|test| failed(test, 0, "Błąd kompilacji"))
+        .map(|test| failed(test, 0, "Compilation error"))
         .collect();
 
     let judgement = judge(job.config, job.tests, &outcomes);
@@ -487,7 +550,7 @@ fn compilation_failed(job: &Job<'_>, log: &str) -> Evaluated {
 
     Evaluated::Judged(Box::new(Verdict {
         judgement: Judgement {
-            verdict: "Błąd kompilacji".into(),
+            verdict: "Compilation error".into(),
             ..judgement.clone()
         },
         details,
@@ -500,7 +563,7 @@ fn compilation_failed(job: &Job<'_>, log: &str) -> Evaluated {
 fn limits_of(job: &Job<'_>) -> Limits {
     Limits {
         time_ms: job.config.limits.time_ms,
-        memory_mb: job.config.limits.memory_kib / 1024,
+        memory_bytes: job.config.limits.memory_bytes,
     }
 }
 
@@ -517,6 +580,42 @@ pub fn scratch(root: &Path, job_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The answer key is not in the container the submission runs in.
+    ///
+    /// Asserted on the mount rather than by trying to read it from a
+    /// submission, because every way of reading a file is already refused by
+    /// the word dictionary — so a test written that way would pass for the
+    /// wrong reason and keep passing after the dictionary was relaxed.
+    #[test]
+    fn a_running_submission_is_given_its_input_and_not_the_answers() {
+        let mount = input_mount(Path::new("/cache/pkg"), "1a");
+
+        assert_eq!(mount.from, Path::new("/cache/pkg/tests/1a.in"));
+        assert_eq!(mount.to, "/in/1a.in");
+        assert!(!mount.writable);
+
+        // The shape that leaked: the directory itself, which carries `1a.out`.
+        assert_ne!(
+            mount.from,
+            Path::new("/cache/pkg/tests"),
+            "mounting the directory hands over the answer key",
+        );
+    }
+
+    /// A crash says what kind of crash, and an ordinary non-zero exit is left
+    /// as the number it is rather than dressed up as a signal.
+    #[test]
+    fn a_fatal_signal_is_named_and_a_plain_exit_code_is_not() {
+        assert!(how_it_died(139).contains("segmentation fault"));
+        assert!(how_it_died(136).contains("division by zero"));
+        assert!(how_it_died(134).contains("aborted"));
+
+        // Not a signal: 3 is just what the program returned.
+        assert_eq!(how_it_died(3), "Runtime error, exit code 3");
+        // 128 itself is an exit code, not signal zero.
+        assert_eq!(how_it_died(128), "Runtime error, exit code 128");
+    }
 
     #[test]
     fn a_place_carries_both_views_through_a_join() {

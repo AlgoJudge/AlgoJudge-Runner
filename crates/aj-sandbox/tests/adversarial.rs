@@ -143,6 +143,57 @@ async fn a_fork_bomb_cannot_outgrow_its_process_limit() {
     assert_eq!(leftovers(&docker).await, 0);
 }
 
+// ── What the run cost ───────────────────────────────────────────────────────
+
+/// Peak memory is measured, and it is the program's own.
+///
+/// Not "a number arrived": asserted against a **known allocation**, because a
+/// measurement nobody checked the magnitude of is how a plausible-looking wrong
+/// number reaches a participant. A program that touches 64 MiB must report a
+/// peak at least that large and not wildly more — roughly 2 MiB of floor is
+/// expected and it does not scale, so a generous ceiling still catches an error
+/// of kind rather than of degree.
+///
+/// Skipped rather than failed where the Runner was given nowhere to measure
+/// from: `AJ_DOCKER_SOCKET=1` mounts the cgroup hierarchy, and without it the
+/// honest answer is `None` by design.
+#[tokio::test]
+#[ignore = "needs a container runtime and a writable cgroup mount"]
+async fn peak_memory_is_measured_and_is_the_programs_own() {
+    let docker = sandbox().await;
+
+    // `dd` into the scratch tmpfs: tmpfs pages are charged to the cgroup, so
+    // this allocates 64 MiB in a way that is exact rather than approximate.
+    let outcome = docker
+        .run(
+            &shell("dd if=/dev/zero of=/tmp/block bs=1M count=64 2>/dev/null")
+                .memory_bytes(512 * 1024 * 1024)
+                .tmpfs_bytes(128 * 1024 * 1024),
+        )
+        .await
+        .expect("the run");
+
+    let Some(peak) = outcome.peak_memory_bytes else {
+        eprintln!("peak memory was not measured: no writable cgroup root. Skipping.");
+        return;
+    };
+
+    assert!(
+        peak >= 64 * 1024 * 1024,
+        "64 MiB was written, so the peak cannot be below it: got {peak} bytes",
+    );
+    assert!(
+        peak < 128 * 1024 * 1024,
+        "the floor is about 2 MiB, so twice the allocation means the wrong cgroup: got {peak} bytes",
+    );
+
+    assert!(
+        outcome.cpu_time.is_some(),
+        "cpu.stat sits beside memory.peak in the same cgroup",
+    );
+    assert_eq!(leftovers(&docker).await, 0);
+}
+
 // ── A3 — it eats memory ─────────────────────────────────────────────────────
 
 /// A cgroup OOM, not a timeout. The two are different things to tell a
@@ -165,8 +216,8 @@ async fn exhausting_memory_is_an_out_of_memory_kill() {
     let outcome = docker
         .run(
             &shell("dd if=/dev/zero of=/tmp/big bs=1M count=512")
-                .memory_kib(32 * 1024)
-                .tmpfs_kib(1024 * 1024)
+                .memory_bytes(32 * 1024 * 1024)
+                .tmpfs_bytes(1024 * 1024 * 1024)
                 .wall_clock(Duration::from_secs(30)),
         )
         .await
@@ -210,7 +261,7 @@ async fn scratch_space_is_writable_and_not_executable() {
                 "cp /bin/echo /tmp/e 2>/dev/null || { echo NOWRITE; exit 0; }; \
                  /tmp/e ran 2>/dev/null || echo NOEXEC",
             )
-            .tmpfs_kib(16 * 1024),
+            .tmpfs_bytes(16 * 1024 * 1024),
         )
         .await
         .expect("the run");
@@ -332,17 +383,41 @@ async fn nothing_survives_from_one_run_to_the_next() {
     let docker = sandbox().await;
 
     let first = docker
-        .run(&shell("echo remembered > /tmp/state; echo written").tmpfs_kib(1024))
+        .run(&shell("echo remembered > /tmp/state; echo written").tmpfs_bytes(1024 * 1024))
         .await
         .expect("the first run");
     assert_eq!(String::from_utf8_lossy(&first.stdout).trim(), "written");
 
     let second = docker
-        .run(&shell("cat /tmp/state 2>/dev/null || echo GONE").tmpfs_kib(1024))
+        .run(&shell("cat /tmp/state 2>/dev/null || echo GONE").tmpfs_bytes(1024 * 1024))
         .await
         .expect("the second run");
 
     assert_eq!(String::from_utf8_lossy(&second.stdout).trim(), "GONE");
+
+    // **`/dev/shm` as well**, which no profile here asks for.
+    //
+    // The container runtime mounts it as a 64 MiB tmpfs in every container and
+    // a read-only root filesystem does not cover it — so a program that can
+    // write nowhere else can still write there. It is charged to the memory
+    // limit like any other tmpfs, and it is new with the container, but neither
+    // of those is obvious from reading the profile. Asserted so that a runtime
+    // change which started sharing it would fail here rather than in a contest.
+    let wrote = docker
+        .run(&shell("echo remembered > /dev/shm/state && echo written"))
+        .await
+        .expect("a run that writes to /dev/shm");
+    assert_eq!(
+        String::from_utf8_lossy(&wrote.stdout).trim(),
+        "written",
+        "/dev/shm is expected to be writable; if this fails the note above is stale",
+    );
+
+    let looked = docker
+        .run(&shell("cat /dev/shm/state 2>/dev/null || echo GONE"))
+        .await
+        .expect("the run that looks for it");
+    assert_eq!(String::from_utf8_lossy(&looked.stdout).trim(), "GONE");
 }
 
 // ── A8 — it writes rather than prints ───────────────────────────────────────
@@ -361,7 +436,7 @@ async fn a_program_cannot_write_a_file_larger_than_it_is_allowed() {
     let outcome = docker
         .run(
             &shell("dd if=/dev/zero of=/tmp/big bs=1M count=64 2>/dev/null; wc -c < /tmp/big")
-                .tmpfs_kib(256 * 1024)
+                .tmpfs_bytes(256 * 1024 * 1024)
                 .max_file_bytes(1024 * 1024)
                 .wall_clock(Duration::from_secs(20)),
         )

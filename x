@@ -71,13 +71,27 @@ fi
 # take that privilege.
 if [ -n "${AJ_DOCKER_SOCKET:-}" ]; then
     SOCKET='-v /var/run/docker.sock:/var/run/docker.sock'
+    # And the cgroup hierarchy, **writable**, which is how peak memory is
+    # measured: the Runner makes a cgroup, starts the sandbox under it, and
+    # reads the parent after the child is gone — a container's own cgroup does
+    # not outlive it, and the runtime API reports no peak on v2.
+    #
+    # `--cgroupns=host` matters as much as the mount. Without it this process
+    # sees its own cgroup as the root, and the path it creates is not the path
+    # the daemon resolves `--cgroup-parent` against — so the measurement would
+    # read an empty directory rather than fail.
+    #
+    # Far cheaper than it looks: creating a directory in a mounted cgroup2 needs
+    # write permission, not a capability.
+    CGROUP='--cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup'
 else
     SOCKET=''
+    CGROUP=''
 fi
 
 run() {
     # shellcheck disable=SC2086
-    docker run --rm $TTY $NETWORK $SOCKET \
+    docker run --rm $TTY $NETWORK $SOCKET $CGROUP \
         -v "$HOST_DIR:/work" \
         -v "$CARGO_VOLUME:/cargo" \
         -v "$TARGET_VOLUME:/work/target" \

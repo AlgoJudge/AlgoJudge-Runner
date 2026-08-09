@@ -33,12 +33,17 @@ pub struct Config {
     #[serde(default)]
     pub checker: Option<Source>,
 
-    /// Used for calibration, never for judging.
+    /// Used for calibration, never for judging. The shorthand for one language.
     #[serde(default)]
     pub model_solution: Option<Source>,
 
+    /// One per language. The same field as `model_solution`, written for more
+    /// than one; a package states one of the two.
     #[serde(default)]
-    pub calibration: Option<serde_yaml_ng::Value>,
+    pub model_solutions: Vec<Source>,
+
+    #[serde(default)]
+    pub calibration: Option<Calibration>,
 
     #[serde(default)]
     pub extra_compilation_files: Vec<String>,
@@ -50,7 +55,7 @@ pub struct Config {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Limits {
     pub time_ms: u64,
-    pub memory_kib: u64,
+    pub memory_bytes: u64,
 }
 
 /// One field, the other, or both — a group may state either alone.
@@ -60,7 +65,7 @@ pub struct PartialLimits {
     #[serde(default)]
     pub time_ms: Option<u64>,
     #[serde(default)]
-    pub memory_kib: Option<u64>,
+    pub memory_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -77,6 +82,90 @@ pub struct Group {
     /// ceiling for every test in the problem.
     #[serde(default)]
     pub limits: Option<PartialLimits>,
+}
+
+/// How a measurement of a model solution becomes a limit, and what was measured.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Calibration {
+    #[serde(default)]
+    pub time: Option<Rule>,
+    #[serde(default)]
+    pub memory: Option<Rule>,
+    /// Written by a trial run: one row per group, and per language where more
+    /// than one model solution was measured.
+    #[serde(default)]
+    pub measured: Vec<Measurement>,
+    #[serde(default)]
+    pub at: Option<String>,
+    #[serde(default)]
+    pub runner: Option<String>,
+}
+
+/// `measured × factor + add`, rounded **up** to `round_to`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Rule {
+    #[serde(default = "one")]
+    pub factor: f64,
+    #[serde(default)]
+    pub add: f64,
+    #[serde(default)]
+    pub round_to: f64,
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+impl Calibration {
+    /// Time ×3 rounded to 100 ms, as the format states the default.
+    pub fn time_rule(&self) -> Rule {
+        self.time.unwrap_or(Rule {
+            factor: 3.0,
+            add: 0.0,
+            round_to: 100.0,
+        })
+    }
+
+    /// Memory **+16 MiB** rounded to 1 MiB. Headroom rather than a multiple,
+    /// because what a weaker solution needs is room, not a proportion.
+    pub fn memory_rule(&self) -> Rule {
+        self.memory.unwrap_or(Rule {
+            factor: 1.0,
+            add: 16.0 * 1024.0 * 1024.0,
+            round_to: 1024.0 * 1024.0,
+        })
+    }
+}
+
+impl Rule {
+    /// Rounded **up**, because a limit landing below the measurement it came
+    /// from fails the solution it was derived from.
+    pub fn applied(&self, measured: f64) -> f64 {
+        let scaled = measured * self.factor + self.add;
+        if self.round_to > 0.0 {
+            (scaled / self.round_to).ceil() * self.round_to
+        } else {
+            scaled.ceil()
+        }
+    }
+}
+
+/// What one model solution did on one group.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Measurement {
+    pub group: u32,
+    /// Absent means the package's own limits, for every language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    pub time_ms: u64,
+    /// **Absent is not zero.** A Runner that cannot measure peak memory
+    /// honestly reports nothing rather than a number that would be shown to a
+    /// participant beside their verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -114,7 +203,7 @@ impl Config {
 
     fn validated(self) -> Result<Self> {
         check(self.limits.time_ms, "limits.timeMs")?;
-        check(self.limits.memory_kib, "limits.memoryKib")?;
+        check(self.limits.memory_bytes, "limits.memoryBytes")?;
 
         if self.groups.is_empty() {
             return Err(Error::invalid("a package with no groups scores nothing"));
@@ -216,6 +305,19 @@ impl Config {
         limits
     }
 
+    /// Every model solution the package declares, however it declared them.
+    ///
+    /// One field written two ways: `modelSolution` for the common case of a
+    /// single reference, `modelSolutions` when a package measures several
+    /// languages. Reading both here means nothing downstream has to know which
+    /// spelling an author used.
+    pub fn models(&self) -> Vec<&Source> {
+        self.model_solution
+            .iter()
+            .chain(self.model_solutions.iter())
+            .collect()
+    }
+
     pub fn group(&self, group: u32) -> Option<&Group> {
         self.groups.iter().find(|g| g.group == group)
     }
@@ -232,8 +334,8 @@ fn apply(limits: &mut Limits, over: &PartialLimits) {
     if let Some(time) = over.time_ms {
         limits.time_ms = time;
     }
-    if let Some(memory) = over.memory_kib {
-        limits.memory_kib = memory;
+    if let Some(memory) = over.memory_bytes {
+        limits.memory_bytes = memory;
     }
 }
 
@@ -252,8 +354,8 @@ fn partial(limits: &PartialLimits, what: &str) -> Result<()> {
     if let Some(time) = limits.time_ms {
         check(time, &format!("{what}.timeMs"))?;
     }
-    if let Some(memory) = limits.memory_kib {
-        check(memory, &format!("{what}.memoryKib"))?;
+    if let Some(memory) = limits.memory_bytes {
+        check(memory, &format!("{what}.memoryBytes"))?;
     }
     Ok(())
 }
@@ -270,12 +372,12 @@ version: 1
 
 limits:
   timeMs: 1000
-  memoryKib: 262144
+  memoryBytes: 268435456
 
 overrideLimits:
   python:
     timeMs: 3000
-    memoryKib: 524288
+    memoryBytes: 536870912
 
 groups:
   - group: 0
@@ -300,7 +402,7 @@ modelSolution:
 
 calibration:
   time:   { factor: 3, add: 0, roundTo: 100 }
-  memory: { factor: 1, add: 16384, roundTo: 1024 }
+  memory: { factor: 1, add: 16777216, roundTo: 1048576 }
 
 extraCompilationFiles: []
 "#;
@@ -310,7 +412,7 @@ extraCompilationFiles: []
         let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
 
         assert_eq!(config.limits.time_ms, 1000);
-        assert_eq!(config.limits.memory_kib, 262144);
+        assert_eq!(config.limits.memory_bytes, 268435456);
         assert_eq!(config.groups.len(), 4);
         assert_eq!(config.max_score(), 100);
         assert!(config.group(0).unwrap().examples);
@@ -329,7 +431,7 @@ extraCompilationFiles: []
         // Group 2 states time and not memory, so memory stays global.
         let group2 = config.effective(2, "cpp");
         assert_eq!(group2.time_ms, 2000);
-        assert_eq!(group2.memory_kib, 262144);
+        assert_eq!(group2.memory_bytes, 268435456);
 
         let group1 = config.effective(1, "cpp");
         assert_eq!(group1.time_ms, 1000);
@@ -341,7 +443,7 @@ extraCompilationFiles: []
 
         let python = config.effective(1, "python");
         assert_eq!(python.time_ms, 3000);
-        assert_eq!(python.memory_kib, 524288);
+        assert_eq!(python.memory_bytes, 536870912);
     }
 
     /// Pins the reading documented on `effective`: most specific first. If this
@@ -353,7 +455,7 @@ extraCompilationFiles: []
         let python = config.effective(2, "python");
         assert_eq!(python.time_ms, 2000, "the group's own limit wins");
         assert_eq!(
-            python.memory_kib, 524288,
+            python.memory_bytes, 536870912,
             "and the override still fills the rest"
         );
     }
@@ -365,7 +467,7 @@ extraCompilationFiles: []
         assert_eq!(config.limits.time_ms, 1000);
 
         // The same problem, attached to an activity that gives it longer.
-        let overlay = serde_json::json!({ "limits": { "timeMs": 5000, "memoryKib": 262144 } });
+        let overlay = serde_json::json!({ "limits": { "timeMs": 5000, "memoryBytes": 268435456 } });
         let attached = config.overlaid(Some(&overlay)).unwrap();
 
         assert_eq!(attached.limits.time_ms, 5000);
@@ -419,17 +521,104 @@ extraCompilationFiles: []
         let raised = config
             .clone()
             .overlaid(Some(&serde_json::json!({
-                "limits": { "timeMs": 9000, "memoryKib": 262144 }
+                "limits": { "timeMs": 9000, "memoryBytes": 268435456 }
             })))
             .unwrap();
         assert_eq!(raised.limits.time_ms, 9000);
 
         let lowered = config
             .overlaid(Some(&serde_json::json!({
-                "limits": { "timeMs": 250, "memoryKib": 262144 }
+                "limits": { "timeMs": 250, "memoryBytes": 268435456 }
             })))
             .unwrap();
         assert_eq!(lowered.limits.time_ms, 250);
+    }
+
+    // ── calibration ─────────────────────────────────────────────────────────
+
+    /// The specification's own worked example, so this fails if the document
+    /// and the arithmetic ever part company.
+    #[test]
+    fn the_default_rules_are_the_ones_the_format_states() {
+        let calibration = Calibration::default();
+
+        // 240 × 3 + 0 → 720, rounded up to 100 → 800 ms.
+        assert_eq!(calibration.time_rule().applied(240.0), 800.0);
+        // 31744000 + 16777216 → 48521216, rounded up to 1 MiB → 49283072 bytes.
+        assert_eq!(calibration.memory_rule().applied(31744000.0), 49283072.0);
+    }
+
+    /// **Up, never to nearest.** A limit landing below the measurement it came
+    /// from fails the solution it was derived from.
+    #[test]
+    fn a_derived_limit_is_never_below_the_measurement_it_came_from() {
+        let rule = Rule {
+            factor: 1.0,
+            add: 0.0,
+            round_to: 100.0,
+        };
+
+        assert_eq!(
+            rule.applied(201.0),
+            300.0,
+            "rounding to nearest would give 200"
+        );
+        assert_eq!(
+            rule.applied(200.0),
+            200.0,
+            "and an exact multiple stays put"
+        );
+    }
+
+    const SEVERAL_MODELS: &str = r#"
+format: standard-io
+version: 1
+limits:
+  timeMs: 1000
+  memoryBytes: 268435456
+groups:
+  - group: 1
+    points: 100
+modelSolutions:
+  - { source: solutions/model.cpp, language: cpp }
+  - { source: solutions/model.py, language: python }
+calibration:
+  measured:
+    - { group: 1, timeMs: 240, memoryBytes: 31744000 }
+    - { group: 2, timeMs: 900 }
+    - { group: 2, language: python, timeMs: 3100 }
+  at: 2026-08-09T10:00:00Z
+  runner: runner-01
+"#;
+
+    #[test]
+    fn a_package_may_declare_one_model_solution_or_one_per_language() {
+        let one = Config::parse(FROM_THE_SPECIFICATION).unwrap();
+        assert_eq!(one.models().len(), 1);
+        assert_eq!(one.models()[0].language, "cpp");
+
+        let many = Config::parse(SEVERAL_MODELS).unwrap();
+        assert_eq!(many.models().len(), 2);
+        assert_eq!(many.models()[1].language, "python");
+    }
+
+    /// A measurement is per group, because that is where a limit lives: a
+    /// package whose group 2 states three seconds is calibrated wrongly by one
+    /// number for the whole problem.
+    #[test]
+    fn a_measurement_is_recorded_per_group_and_optionally_per_language() {
+        let config = Config::parse(SEVERAL_MODELS).unwrap();
+        let measured = &config.calibration.as_ref().unwrap().measured;
+
+        assert_eq!(measured.len(), 3);
+        assert_eq!(measured[0].group, 1);
+        assert_eq!(measured[0].memory_bytes, Some(31744000));
+        assert!(measured[1].memory_bytes.is_none(), "absent is not zero");
+        assert_eq!(measured[2].language.as_deref(), Some("python"));
+        assert_eq!(
+            config.calibration.as_ref().unwrap().runner.as_deref(),
+            Some("runner-01")
+        );
     }
 
     #[test]
@@ -469,7 +658,8 @@ extraCompilationFiles: []
     /// silently did not apply.
     #[test]
     fn a_misspelled_field_is_refused_rather_than_ignored() {
-        let yaml = FROM_THE_SPECIFICATION.replace("memoryKib: 262144", "memoryKiB: 262144");
+        let yaml =
+            FROM_THE_SPECIFICATION.replace("memoryBytes: 268435456", "memoryBYTES_TYPO: 262144");
         let error = Config::parse(&yaml).unwrap_err();
         assert!(matches!(error, Error::Malformed(_)), "got {error}");
     }

@@ -124,7 +124,7 @@ mod tests {
         assert!(for_id("python", &images).is_some());
 
         // Java was considered and left out: the JVM reserves address space
-        // rather than allocating it, so `memoryKib` would measure something
+        // rather than allocating it, so `memoryBytes` would measure something
         // different for it than for everything else.
         assert!(for_id("java", &images).is_none());
         assert!(for_id("", &images).is_none());

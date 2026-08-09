@@ -21,7 +21,7 @@ format: standard-io
 version: 1
 limits:
   timeMs: 2000
-  memoryKib: 262144
+  memoryBytes: 268435456
 groups:
   - group: 0
     points: 0
@@ -180,6 +180,34 @@ async fn a_correct_python_solution_is_accepted() {
     assert_eq!(judged.judgement.score, 100.0);
 }
 
+/// The memory a solution used reaches the result document.
+///
+/// The last thing calibration was waiting for: `PACKAGE_FORMAT.md` lets
+/// `memoryBytes` be absent because the Runner could not measure it honestly, and
+/// on a cgroup v2 host with a writable cgroup mount it now can. Absent stays a
+/// legitimate answer, so this skips rather than fails where there is nowhere to
+/// measure from.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_judged_solution_reports_what_memory_it_used() {
+    let judged = verdict(judge("cpp-memory", "cpp", CORRECT_CPP).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+
+    // Bytes, like every memory figure in the product since 2026-08-09.
+    let Some(memory) = document["tests"][0]["memoryBytes"].as_u64() else {
+        eprintln!("memory was not measured: no writable cgroup root. Skipping.");
+        return;
+    };
+
+    // A container floor of roughly 2 MiB, plus whatever the program did. Bounds
+    // rather than a value, because the point is that it is a real measurement
+    // and not a plausible-looking constant.
+    assert!(
+        (1024 * 1024..256 * 1024 * 1024).contains(&memory),
+        "an adding program should use a few MiB, not bytes and not gigabytes: {memory} bytes",
+    );
+}
+
 // ── Every other outcome a participant can get ───────────────────────────────
 
 /// Wrong on one test of one group. The group rule then takes that group to
@@ -224,9 +252,37 @@ int main() { long long a, b; std::cin >> a >> b; while (true) { } }
         document["tests"][0]["note"]
             .as_str()
             .unwrap()
-            .contains("limitu czasu"),
+            .contains("Time limit exceeded"),
         "got {}",
         document["tests"][0]["note"],
+    );
+}
+
+/// A crash and a timeout are different things to be told, and they are decided
+/// in different places: the wall clock is the Runner killing the container, the
+/// crash is the exit code of a container that stopped on its own. This asserts
+/// they do not bleed into each other — a segmentation fault must not be
+/// reported as a time limit, nor the other way round.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_program_that_crashes_is_a_runtime_error_and_not_a_time_limit() {
+    let crashing = r#"
+#include <iostream>
+int main() { long long a, b; std::cin >> a >> b; volatile int *p = nullptr; *p = 1; }
+"#;
+    let judged = verdict(judge("cpp-crash", "cpp", crashing).await);
+
+    assert_eq!(judged.judgement.score, 0.0);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    let note = document["tests"][0]["note"].as_str().unwrap().to_owned();
+
+    assert!(
+        note.contains("segmentation fault"),
+        "a crash should say what kind, got {note}",
+    );
+    assert!(
+        !note.contains("Time limit exceeded"),
+        "a crash must not be reported as a time limit, got {note}",
     );
 }
 
@@ -237,7 +293,7 @@ int main() { long long a, b; std::cin >> a >> b; while (true) { } }
 async fn a_submission_that_does_not_build_says_why() {
     let judged = verdict(judge("cpp-broken", "cpp", "int main() { this is not c++ }").await);
 
-    assert_eq!(judged.judgement.verdict, "Błąd kompilacji");
+    assert_eq!(judged.judgement.verdict, "Compilation error");
     assert_eq!(judged.judgement.score, 0.0);
 
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
@@ -258,7 +314,7 @@ async fn a_submission_that_does_not_build_says_why() {
 async fn a_python_syntax_error_is_a_compilation_error_and_not_three_failures() {
     let judged = verdict(judge("python-broken", "python", "if True\n  print(1)\n").await);
 
-    assert_eq!(judged.judgement.verdict, "Błąd kompilacji");
+    assert_eq!(judged.judgement.verdict, "Compilation error");
 
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
     assert_eq!(document["compilation"]["status"], "ERROR");
@@ -378,8 +434,8 @@ async fn the_committed_package_judges_a_correct_solution() {
     let files = aj_package::extract(&archive, &unpacked, &aj_package::ArchiveLimits::default())
         .expect("the committed package must unpack");
     assert_eq!(
-        files, 13,
-        "the archive holds a config, ten test files, a checker and a model"
+        files, 14,
+        "a config, ten test files, a checker and two model solutions"
     );
 
     let declared = std::fs::read_to_string(unpacked.join("config.yml")).unwrap();

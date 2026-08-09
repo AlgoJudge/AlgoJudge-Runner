@@ -36,7 +36,7 @@ pub struct Details {
 #[serde(rename_all = "camelCase")]
 pub struct Limits {
     pub time_ms: u64,
-    pub memory_mb: u64,
+    pub memory_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,7 +66,7 @@ pub struct TestReport {
     pub status: Status,
     pub time_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_mb: Option<u64>,
+    pub memory_bytes: Option<u64>,
     pub score: f64,
     pub max_score: f64,
     /// **Reaches the participant and originates beside untrusted code** — a
@@ -103,7 +103,7 @@ impl Details {
                     group: t.outcome.group,
                     status: t.outcome.status,
                     time_ms: t.outcome.time_ms,
-                    memory_mb: t.outcome.memory_kib.map(|kib| kib / 1024),
+                    memory_bytes: t.outcome.memory_bytes,
                     score: t.score,
                     max_score: t.max_score,
                     note: t.outcome.note.clone(),
@@ -156,7 +156,7 @@ mod tests {
                     status: Status::Ok,
                     percentage: 100,
                     time_ms: 20,
-                    memory_kib: Some(12 * 1024),
+                    memory_bytes: Some(12 * 1024 * 1024),
                     note: String::new(),
                 },
                 score: 70.0,
@@ -173,7 +173,7 @@ mod tests {
             &judged(),
             Limits {
                 time_ms: 1000,
-                memory_mb: 256,
+                memory_bytes: 256 * 1024 * 1024,
             },
             compiled(),
         );
@@ -183,15 +183,16 @@ mod tests {
         assert_eq!(json["kind"], "standard-io");
         assert_eq!(json["version"], 1);
         assert_eq!(json["limits"]["timeMs"], 1000);
-        assert_eq!(json["limits"]["memoryMb"], 256);
+        assert_eq!(json["limits"]["memoryBytes"], 268435456);
         assert_eq!(json["score"], 70.0);
         assert_eq!(json["maxScore"], 100.0);
         assert_eq!(json["compilation"]["status"], "OK");
         assert_eq!(json["groups"][0]["maxPoints"], 100.0);
         assert_eq!(json["tests"][0]["no"], "1a");
         assert_eq!(
-            json["tests"][0]["memoryMb"], 12,
-            "kibibytes become mebibytes here"
+            json["tests"][0]["memoryBytes"],
+            12 * 1024 * 1024,
+            "bytes here, as everywhere: the measurement crosses no conversion"
         );
         assert_eq!(json["tests"][0]["status"], "OK");
         assert_eq!(json["tests"][0]["note"], "");
@@ -213,19 +214,19 @@ mod tests {
     #[test]
     fn memory_that_was_not_measured_is_absent() {
         let mut judgement = judged();
-        judgement.tests[0].outcome.memory_kib = None;
+        judgement.tests[0].outcome.memory_bytes = None;
 
         let details = Details::of(
             &judgement,
             Limits {
                 time_ms: 1,
-                memory_mb: 1,
+                memory_bytes: 1,
             },
             compiled(),
         );
         let json: serde_json::Value = serde_json::from_slice(&details.to_bytes()).unwrap();
 
-        assert!(json["tests"][0].get("memoryMb").is_none());
+        assert!(json["tests"][0].get("memoryBytes").is_none());
     }
 
     #[test]
@@ -234,7 +235,7 @@ mod tests {
             &judged(),
             Limits {
                 time_ms: 1,
-                memory_mb: 1,
+                memory_bytes: 1,
             },
             failed_to_compile("main.cpp:3:1: error: expected ';'"),
         );

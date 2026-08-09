@@ -10,13 +10,13 @@ version: 1
 
 limits:
   timeMs: 1000
-  memoryKib: 262144      # 256 MiB
+  memoryBytes: 268435456      # 256 MiB
 
 # Python is slower and needs more room.
 overrideLimits:
   python:
     timeMs: 3000
-    memoryKib: 524288    # 512 MiB
+    memoryBytes: 536870912    # 512 MiB
 
 groups:
   - group: 0
@@ -33,12 +33,14 @@ checker:
   source: checker/checker.cpp
   language: cpp
 
-modelSolution:
-  source: solutions/model.cpp
-  language: cpp
+# One per language: a limit derived from C++ alone would be a limit Python
+# cannot meet, and the whole point of measuring is to stop guessing at that.
+modelSolutions:
+  - { source: solutions/model.cpp, language: cpp }
+  - { source: solutions/model.py,  language: python }
 
 calibration:
   time:   { factor: 3, add: 0, roundTo: 100 }
-  memory: { factor: 1, add: 16384, roundTo: 1024 }
+  memory: { factor: 1, add: 16777216, roundTo: 1048576 }
 
 extraCompilationFiles: []

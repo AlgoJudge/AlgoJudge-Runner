@@ -449,7 +449,7 @@ async fn a_runner_judges_every_outcome_a_participant_can_get() {
     assert_eq!(judged["score"], 0.0, "{judged}");
 
     let judged = settled(&participant, &activity, &broken).await;
-    assert_eq!(judged["verdict"], "Błąd kompilacji", "{judged}");
+    assert_eq!(judged["verdict"], "Compilation error", "{judged}");
 
     let judged = settled(&participant, &activity, &forbidden).await;
     assert_eq!(judged["verdict"], "PolicyViolation", "{judged}");

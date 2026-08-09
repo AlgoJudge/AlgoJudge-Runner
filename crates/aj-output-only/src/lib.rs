@@ -129,7 +129,7 @@ pub fn mark(package: &Path, config: &Config, tests: &TestSet, answers: &Answers)
             // Nothing ran, so there is no time to report. Zero is honest here
             // in a way it would not be for a program.
             time_ms: 0,
-            memory_kib: None,
+            memory_bytes: None,
             note: found.note(),
         });
     }
@@ -146,7 +146,7 @@ fn missing(test: &aj_package::Test, why: &str) -> TestOutcome {
         status: Status::Error,
         percentage: 0,
         time_ms: 0,
-        memory_kib: None,
+        memory_bytes: None,
         note: why.to_owned(),
     }
 }
@@ -158,12 +158,12 @@ pub fn details(judged: &Judgement, config: &Config) -> Details {
         judged,
         Limits {
             time_ms: config.limits.time_ms,
-            memory_mb: config.limits.memory_kib / 1024,
+            memory_bytes: config.limits.memory_bytes,
         },
         Compilation {
             // Nothing was compiled, and saying `OK` would imply something was.
             status: Status::Warning,
-            log: "nic nie było kompilowane — zadanie typu output-only".into(),
+            log: "nothing was compiled: this is an output-only problem".into(),
         },
     );
     document.kind = "output-only";

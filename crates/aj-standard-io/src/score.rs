@@ -42,7 +42,7 @@ pub struct TestOutcome {
     /// 0–100. A checker's, or 100/0 where there is none.
     pub percentage: u32,
     pub time_ms: u64,
-    pub memory_kib: Option<u64>,
+    pub memory_bytes: Option<u64>,
     /// Reaches the participant, and originates beside untrusted code.
     pub note: String,
 }
@@ -169,7 +169,7 @@ format: standard-io
 version: 1
 limits:
   timeMs: 1000
-  memoryKib: 262144
+  memoryBytes: 262144
 groups:
   - group: 0
     points: 0
@@ -180,11 +180,26 @@ groups:
     points: 70
 "#;
 
+    /// A counter, because the process id alone is not unique enough.
+    ///
+    /// Six tests call this and the harness runs them in parallel in **one**
+    /// process, so a directory named after the process id is the *same*
+    /// directory for all of them — and the `remove_dir_all` below deletes it
+    /// from under whichever test is using it. That surfaces as
+    /// `NotFound` from a `create_dir_all` or a read, which reads like a broken
+    /// fixture rather than a race, and it appears and disappears with how fast
+    /// the machine is.
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
     fn package() -> (Config, TestSet) {
         let config = Config::parse(CONFIG).unwrap();
 
         let mut root = std::env::temp_dir();
-        root.push(format!("aj-score-{}", std::process::id()));
+        root.push(format!(
+            "aj-score-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("tests")).unwrap();
         for name in ["0a", "1a", "1b", "2a"] {
@@ -203,7 +218,7 @@ groups:
             status,
             percentage,
             time_ms: 10,
-            memory_kib: None,
+            memory_bytes: None,
             note: String::new(),
         }
     }
@@ -299,9 +314,9 @@ groups:
         let (config, tests) = package();
         let mut outcomes = all_passing();
         outcomes[3].status = Status::Error;
-        outcomes[3].note = "Przekroczenie limitu czasu".into();
+        outcomes[3].note = "Time limit exceeded".into();
 
         let judged = judge(&config, &tests, &outcomes);
-        assert_eq!(judged.verdict, "Przekroczenie limitu czasu");
+        assert_eq!(judged.verdict, "Time limit exceeded");
     }
 }

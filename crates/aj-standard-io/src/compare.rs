@@ -49,7 +49,7 @@ impl Comparison {
                 // for every test, and a program that printed a megabyte on one
                 // line would otherwise put it there.
                 format!(
-                    "różnica w elemencie {token}: oczekiwano {}, otrzymano {}",
+                    "token {token} differs: expected {}, got {}",
                     quote(expected),
                     quote(actual),
                 )
@@ -148,7 +148,7 @@ mod tests {
                 actual: "9".into(),
             },
         );
-        assert!(found.note().contains("elemencie 2"));
+        assert!(found.note().contains("token 2"));
     }
 
     #[test]
