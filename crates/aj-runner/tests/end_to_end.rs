@@ -548,3 +548,85 @@ async fn a_second_problem_type_is_judged_without_the_server_learning_about_it() 
     assert_eq!(judged["score"], 50.0, "{judged}");
     assert_ne!(judged["verdict"], "Accepted", "{judged}");
 }
+
+/// One trial, through the whole stack.
+///
+/// The seam nothing else covers. The Server's own suite proves a trial can be
+/// stored, claimed and reported; the Runner's proves a package's model
+/// solutions can be measured. **Neither proves the two halves meet** — and the
+/// endpoints, the wire names and the deletion all live in that gap.
+///
+/// Asserts the two things a trial exists for and the one it must not do: a
+/// measurement arrives, per group, and the package is **gone** afterwards.
+#[tokio::test]
+#[ignore = "needs the development stack and the language images"]
+async fn a_trial_is_measured_end_to_end_and_the_package_does_not_survive() {
+    let admin = Session::as_("admin", "admin-development-only").await;
+    approve_the_runner(&admin).await;
+
+    // The package that ships, so this fails if the format and the code part
+    // company. It declares two model solutions, in two languages.
+    let package = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/sum.zip"),
+    )
+    .expect("the committed package");
+
+    let file_id = admin.upload("sum.zip", "application/zip", package).await;
+
+    let created = admin
+        .post(
+            "/activities/DEV-2026/trials",
+            serde_json::json!({ "problemType": "standard-io@1", "packageFileId": file_id }),
+        )
+        .await;
+
+    let trial = created["id"].as_str().expect("a trial id").to_owned();
+    assert_eq!(created["state"], "queued");
+    assert_eq!(created["hasPackage"], true);
+
+    // Trials are claimed only when there is no marking to do, so this waits on
+    // an idle Runner rather than on a queue position.
+    let mut settled = serde_json::Value::Null;
+    for _ in 0..240 {
+        let seen = admin
+            .get(&format!("/activities/DEV-2026/trials/{trial}"))
+            .await;
+        match seen["state"].as_str().unwrap_or("") {
+            "completed" | "failed" => {
+                settled = seen;
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    }
+
+    assert_eq!(
+        settled["state"], "completed",
+        "the trial did not finish cleanly: {settled}",
+    );
+
+    // The measurement is opaque to the Server, so it arrives as a string and is
+    // parsed here — by the only component that is allowed to know its shape.
+    let measurement = settled["measurement"].as_str().expect("a measurement");
+    let measured: Value = serde_json::from_str(measurement).expect("a measurement document");
+    let rows = measured["measured"].as_array().expect("measured rows");
+
+    assert!(!rows.is_empty(), "nothing was measured: {measurement}");
+    assert!(
+        rows.iter()
+            .all(|row| row["timeMs"].as_u64().unwrap_or(0) > 0),
+        "a measured group with no time did not run: {measurement}",
+    );
+    // Two model solutions, so every row names which language it is for.
+    assert!(
+        rows.iter().all(|row| row["language"].is_string()),
+        "with two models every row names a language: {measurement}",
+    );
+
+    // **The bytes do not survive the trial** (D-12), and the row does.
+    assert_eq!(settled["hasPackage"], false);
+    assert!(
+        !admin.reaches(&format!("/files/{file_id}")).await,
+        "the package was still readable after the trial finished",
+    );
+}
