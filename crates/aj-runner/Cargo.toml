@@ -12,10 +12,21 @@ name = "algojudge-runner"
 path = "src/main.rs"
 
 [dependencies]
+aj-output-only = { path = "../aj-output-only" }
+aj-package = { path = "../aj-package" }
 aj-protocol = { path = "../aj-protocol" }
+aj-sandbox = { path = "../aj-sandbox" }
+aj-standard-io = { path = "../aj-standard-io" }
 
 anyhow.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# Driving the Server as a manager and as a participant, which is a session and
+# a cookie rather than a Runner token.
+reqwest = { workspace = true, features = ["cookies", "multipart"] }
+hex.workspace = true
+sha2.workspace = true

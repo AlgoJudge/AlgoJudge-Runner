@@ -25,6 +25,29 @@ pub struct Config {
 
     pub cache_path: PathBuf,
     pub cache_max_bytes: u64,
+
+    /// Scratch for jobs, in both the views a bind mount needs.
+    ///
+    /// **`AJ_Work__HostPath` is not decoration.** A bind mount is resolved by
+    /// the container runtime's daemon, so when the Runner is itself in a
+    /// container the path it sees is not the path the daemon can open — and a
+    /// path the daemon cannot open produces an **empty directory** rather than
+    /// an error, which means tests silently run against nothing. Where the
+    /// Runner is not containerised the two are the same and this can be left
+    /// alone.
+    pub work_path: PathBuf,
+    pub work_host_path: PathBuf,
+
+    pub images: aj_standard_io::Images,
+
+    /// Starts anyway on a host that reports cgroup v1.
+    ///
+    /// **Off by default, and loud when on.** The limits are enforced on v1, but
+    /// peak memory and CPU time cannot be measured honestly there — and those
+    /// numbers are shown to a participant beside their verdict. This exists
+    /// because a developer machine is often Docker Desktop, which may still
+    /// report v1, and the alternative is a development stack that cannot start.
+    pub allow_cgroup_v1: bool,
 }
 
 impl Config {
@@ -42,6 +65,8 @@ impl Config {
             // missing the prefix fails with nothing to read.
             anyhow::bail!("AJ_Server__BaseUrl is {base_url:?}, which has no /api/v1 prefix");
         }
+
+        let work = var("Work__Path").unwrap_or_else(|| "/var/lib/algojudge-runner/work".into());
 
         Ok(Self {
             base_url,
@@ -66,6 +91,18 @@ impl Config {
                 .unwrap_or_else(|| "/var/cache/algojudge-runner".into())
                 .into(),
             cache_max_bytes: number("Cache__MaxBytes", 10 * 1024 * 1024 * 1024),
+
+            work_path: work.clone().into(),
+            work_host_path: var("Work__HostPath").unwrap_or(work).into(),
+
+            allow_cgroup_v1: var("Sandbox__AllowCgroupV1").is_some(),
+
+            images: aj_standard_io::Images {
+                cpp: var("Sandbox__Image__Cpp")
+                    .unwrap_or_else(|| "algojudge/lang-cpp:local".into()),
+                python: var("Sandbox__Image__Python")
+                    .unwrap_or_else(|| "algojudge/lang-python:local".into()),
+            },
         })
     }
 }

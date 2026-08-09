@@ -1,0 +1,22 @@
+# Kwadraty — an output-only@1 package.
+#
+# The same shape as `standard-io@1` minus everything about running a program:
+# no checker language, no model solution, no `overrideLimits`. The limits are
+# still stated because a participant reads them, and because the shape is
+# shared between problem types rather than owned by one.
+
+format: output-only
+version: 1
+
+limits:
+  timeMs: 1000
+  memoryKib: 262144
+
+groups:
+  - group: 0
+    points: 0
+    examples: true
+  - group: 1
+    points: 50
+  - group: 2
+    points: 50

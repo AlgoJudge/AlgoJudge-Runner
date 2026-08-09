@@ -1,10 +1,17 @@
 [workspace]
 resolver = "2"
-members = ["crates/aj-protocol", "crates/aj-runner"]
+members = [
+    "crates/aj-output-only",
+    "crates/aj-package",
+    "crates/aj-protocol",
+    "crates/aj-runner",
+    "crates/aj-standard-io",
+    "crates/aj-sandbox",
+]
 
-# `aj-package`, `aj-sandbox` and `aj-standard-io` arrive with the evaluation
-# pipeline. Creating them empty now would add three crates that compile to
-# nothing and three names in every dependency graph, to no end.
+# `aj-standard-io` — the handler that ties a package to a sandbox — arrives
+# next. Creating it empty now would add a crate that compiles to nothing and a
+# name in every dependency graph, to no end.
 
 [workspace.package]
 version = "0.1.0"
@@ -19,11 +26,19 @@ repository = "https://github.com/AlgoJudge/AlgoJudge-Runner"
 # graph, and it is what a reviewer reads to answer "which version". A comment
 # claiming a version here would be a second source that drifts from the first.
 anyhow = "1.0"
+async-trait = "0.1"
 base64 = "0.22"
+# The container layer. Speaks to Docker and to Podman, which keeps the
+# evaluation host's runtime a deployment choice rather than a code one.
+bollard = "0.19"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+bytes = "1"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 hex = "0.4"
+indexmap = { version = "2", features = ["serde"] }
 # The same `rand_core` `ed25519-dalek` itself uses, so the graph holds one copy.
 rand_core = { version = "0.6", features = ["getrandom"] }
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "multipart",
@@ -32,11 +47,20 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# `serde_yaml` was archived by its author in 2024. This is the maintained fork,
+# and a package's `config.yml` is written by a problem author rather than by a
+# participant — semi-trusted, not untrusted — but an unmaintained parser on any
+# input path is a liability worth avoiding.
+serde_yaml_ng = "0.10"
 sha2 = "0.10"
+# Reading what a build container produced, which arrives as a tar stream from
+# the runtime API rather than through a writable bind mount.
+tar = "0.4"
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 # The artefact is a static binary in a scratch image; size is worth the link

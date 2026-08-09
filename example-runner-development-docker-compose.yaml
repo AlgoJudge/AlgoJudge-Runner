@@ -55,6 +55,19 @@ services:
     build:
       context: .
     restart: unless-stopped
+    # Root **in its own container**, and only here.
+    #
+    # The image runs as `nonroot`. Docker Desktop's socket is `root:root` mode
+    # 755 — world-readable, not world-writable — so there is no group to join
+    # and a non-root process simply cannot use it. On a Linux host the socket is
+    # `root:docker` mode 660 and the right answer is `group_add: [<docker gid>]`,
+    # which keeps the process unprivileged; **do that in production.**
+    #
+    # What this costs is smaller than it looks, and worth stating rather than
+    # hiding: **anything that can reach that socket is root on the host**, so the
+    # uid inside the container was never the boundary. The boundary is the host,
+    # which is treated as compromised by assumption.
+    user: "0:0"
     depends_on:
       server:
         condition: service_healthy
@@ -63,15 +76,33 @@ services:
       # of the Server, and it is a different address from the browser's.
       AJ_Server__BaseUrl: http://server:8080/api/v1
       AJ_Runner__Name: runner-dev
-      AJ_Runner__ProblemTypes: standard-io@1
+      AJ_Runner__ProblemTypes: standard-io@1,output-only@1
       # Short, so a developer watching the log sees it ask rather than wondering
       # whether it is alive. Production leaves these alone.
       AJ_Poll__MinSeconds: "1"
       AJ_Poll__MaxSeconds: "5"
       RUST_LOG: info,aj_protocol=debug
+      # Scratch, as the **daemon** sees it. It has to match the host side of the
+      # bind mount below: the Runner starts sibling containers and hands them
+      # paths, and the daemon resolves those — a path only this container knows
+      # produces an empty directory rather than an error.
+      AJ_Work__Path: /var/lib/algojudge-runner/work
+      AJ_Work__HostPath: ${PWD}/.runner-work
+      # Docker Desktop may still report cgroup v1, and the Runner refuses it:
+      # the limits hold there, but peak memory and CPU time cannot be measured
+      # honestly, and those numbers are shown to a participant. Set here so a
+      # development stack starts; it has no business in a deployment, and the
+      # Runner says so at the top of every log.
+      AJ_Sandbox__AllowCgroupV1: "1"
     volumes:
       - algojudge_runner_dev_identity:/var/lib/algojudge-runner
       - algojudge_runner_dev_cache:/var/cache/algojudge-runner
+      - ${PWD}/.runner-work:/var/lib/algojudge-runner/work
+      # The Runner is trusted and holds the socket; **nothing it starts ever
+      # does**. Mounting it read-only would restrict nothing that matters — the
+      # flag applies to the socket file, not to the API spoken over it — so the
+      # boundary is the host, which is treated as compromised by assumption.
+      - /var/run/docker.sock:/var/run/docker.sock
     # No ports. The Runner opens every connection itself, which is what lets a
     # real one live behind NAT with no inbound access at all.
 

@@ -1,0 +1,18 @@
+[package]
+name = "aj-output-only"
+description = "The output-only@1 handler: the participant sends answers, not a program."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aj-package = { path = "../aj-package" }
+# For the scoring vocabulary — statuses, groups, the result document — which is
+# shared between problem types rather than owned by `standard-io`. The name is a
+# wart: when a third type arrives those parts want their own crate. Reaching for
+# them here rather than copying them is the point being proved.
+aj-standard-io = { path = "../aj-standard-io" }
+
+tracing.workspace = true
