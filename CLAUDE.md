@@ -72,8 +72,12 @@ accident:
   passing the socket into a submission container are rejected** — see
   `docs/SECURITY.md` for why, including the part where mounting a socket
   read-only restricts nothing that matters.
-- **`isolate` 2.x is accepted conditionally**, after a spike on cgroup
-  delegation and the capabilities it requires.
+- **`isolate` 2.x is not adopted** (spike run 2026-08-09, `docs/spikes/ISOLATE.md`).
+  It works in a non-privileged container, but what it was wanted for — honest
+  CPU-time and peak-memory numbers — comes from the sandbox container's own
+  cgroup on v2 with nothing granted. **Take the number, not the tool**: read
+  `memory.peak` and `cpu.stat`. *Supersedes the 2026-08-06 conditional
+  acceptance.*
 - **Treat the evaluation host as compromised by assumption**: no secrets,
   reproducible, nothing else on it.
 - **`EvaluationJob` is a Server entity.** It exists as a table with a state, a

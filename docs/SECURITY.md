@@ -140,9 +140,14 @@ Stated so that absence is not read as a decision:
 - **A custom seccomp profile.** Docker's default profile applies, which already
   blocks a large set of syscalls; a hand-written one is on the roadmap and is
   easy to get wrong in the direction of breaking a legitimate runtime.
-- **`isolate` as a deeper supervisor.** Provisionally accepted, pending a spike
-  on cgroup delegation inside a non-privileged container. It is what would give
-  honest CPU-time and peak-memory numbers.
+- **`isolate` as a deeper supervisor.** **Not adopted** — the spike ran on
+  2026-08-09 and is in `docs/spikes/ISOLATE.md`. It works in a non-privileged
+  container, needing `CAP_SYS_ADMIN` and `CAP_NET_ADMIN` over a self-delegated
+  cgroup v2 subtree. It was wanted for honest CPU-time and peak-memory numbers,
+  and those turn out to be readable from the sandbox container's own cgroup with
+  **nothing granted** — so the remaining trade was `CAP_SYS_ADMIN`, the
+  capability that permits mounting, in a container that runs untrusted code.
+  Reopening it needs a different argument than measurement.
 - **Rootless Podman**, which is the more defensible posture for §3 and which the
   container client already speaks to.
 
