@@ -138,9 +138,37 @@ start, because a quiet override is a production setting waiting to happen.
 
 Stated so that absence is not read as a decision:
 
-- **A custom seccomp profile.** Docker's default profile applies, which already
-  blocks a large set of syscalls; a hand-written one is on the roadmap and is
-  easy to get wrong in the direction of breaking a legitimate runtime.
+- **A custom seccomp profile.** Docker's builtin profile applies and does real
+  work — measured 2026-08-09: it refuses `keyctl`, `add_key`, `bpf`,
+  `perf_event_open`, `mount`, `setns`, `io_uring_setup`, `open_by_handle_at` and
+  **`unshare(CLONE_NEWUSER)`**, which without the profile *succeeds*.
+
+  **Check that it is on.** `docker info` must report
+  `name=seccomp,profile=builtin`, and a process in the sandbox must show
+  `Seccomp: 2` in `/proc/self/status`. Docker Desktop 24.0.7 on this workstation
+  reported **`profile=unconfined`** — no syscall filtering at all, while this
+  document claimed otherwise. Upgrading to 29.x turned it on. A profile nobody
+  verified is a profile nobody has.
+
+  **What a custom profile would add, with one concrete reason.** `isolate`'s own
+  filter is allow-by-default with four rules, and Docker already covers three:
+  `keyctl`, `AF_VSOCK` and `io_uring_setup`. The fourth it does not cover is
+  **file locks** — `flock` and `fcntl` with `F_SETLK`/`F_OFD_SETLK`/`F_SETLEASE`.
+  Locks are shared across mount-namespace boundaries on a shared inode, and that
+  is **demonstrated here, not theoretical**: two containers with the same volume
+  mounted read-only see each other's locks, one holding a shared lock and the
+  other refused an exclusive one.
+
+  It matters because `pipeline.rs:222` mounts `job.package…/tests` read-only into
+  every test container, and the unpacked package is cached per problem version —
+  so **two submissions to the same problem share that mount**. Concurrently
+  judged, they could signal each other through a lock on a test file. Today that
+  is closed only by `AJ_Concurrency` defaulting to **1**, which is a throughput
+  setting rather than a security control: raising it for speed would open a
+  contestant-to-contestant channel with nothing to notice.
+
+  So the profile is Docker's default **plus a deny on the lock calls** — and it
+  does not need `isolate` to get there.
 - **`isolate` as a deeper supervisor.** **Not adopted** — the spike ran on
   2026-08-09 and is in `docs/spikes/ISOLATE.md`. It works in a non-privileged
   container, needing `CAP_SYS_ADMIN` and `CAP_NET_ADMIN` over a self-delegated
