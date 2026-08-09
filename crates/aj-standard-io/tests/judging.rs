@@ -230,6 +230,34 @@ int main() { long long a, b; std::cin >> a >> b; while (true) { } }
     );
 }
 
+/// A crash and a timeout are different things to be told, and they are decided
+/// in different places: the wall clock is the Runner killing the container, the
+/// crash is the exit code of a container that stopped on its own. This asserts
+/// they do not bleed into each other — a segmentation fault must not be
+/// reported as a time limit, nor the other way round.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_program_that_crashes_is_a_runtime_error_and_not_a_time_limit() {
+    let crashing = r#"
+#include <iostream>
+int main() { long long a, b; std::cin >> a >> b; volatile int *p = nullptr; *p = 1; }
+"#;
+    let judged = verdict(judge("cpp-crash", "cpp", crashing).await);
+
+    assert_eq!(judged.judgement.score, 0.0);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    let note = document["tests"][0]["note"].as_str().unwrap().to_owned();
+
+    assert!(
+        note.contains("naruszenie ochrony pamięci"),
+        "a crash should say what kind, got {note}",
+    );
+    assert!(
+        !note.contains("limitu czasu"),
+        "a crash must not be reported as a time limit, got {note}",
+    );
+}
+
 /// A submission that does not build is a **verdict**, not an infrastructure
 /// failure, and the compiler's own words reach the participant.
 #[tokio::test]
