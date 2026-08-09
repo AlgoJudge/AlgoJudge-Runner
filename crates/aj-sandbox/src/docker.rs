@@ -24,9 +24,9 @@ use bollard::container::LogOutput;
 use bollard::models::SystemInfoCgroupVersionEnum;
 use bollard::models::{ContainerCreateBody, HostConfig};
 use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, InspectContainerOptions,
-    KillContainerOptions, ListContainersOptionsBuilder, LogsOptionsBuilder,
-    RemoveContainerOptionsBuilder, StartContainerOptions, WaitContainerOptions,
+    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, DownloadFromContainerOptionsBuilder,
+    InspectContainerOptions, KillContainerOptions, ListContainersOptionsBuilder,
+    LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions, WaitContainerOptions,
 };
 use futures_util::StreamExt as _;
 
@@ -120,7 +120,7 @@ impl Docker {
             network_mode: Some("none".to_owned()),
             cap_drop: Some(vec!["ALL".to_owned()]),
             security_opt: Some(vec!["no-new-privileges".to_owned()]),
-            readonly_rootfs: Some(true),
+            readonly_rootfs: Some(!profile.writable_root),
 
             memory: Some(memory),
             // Equal to `memory`, not absent. Without this the limit means
@@ -249,33 +249,50 @@ impl Docker {
 
         // Read while it runs, not afterwards. A program flooding its output
         // would otherwise fill the host's disk with a log we then discard.
-        let (overflow_tx, mut overflow_rx) = tokio::sync::oneshot::channel::<()>();
+        //
+        // The collector kills the container itself when the cap is passed and
+        // raises a flag. It used to signal through a `oneshot`, and that was a
+        // **race**: a oneshot resolves when its sender is *dropped* as well as
+        // when it sends, and the sender is dropped every time the collector
+        // finishes normally. Whichever of "the container exited" and "the log
+        // stream ended" won the `select!` decided the verdict — so a fast,
+        // silent program was sometimes reported as having flooded its output,
+        // which on a real submission is a correct solution marked wrong. A flag
+        // read after the wait cannot race with anything.
+        let flooded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let collector = tokio::spawn(collect(
             self.client.clone(),
             name.to_owned(),
             profile.max_output_bytes,
-            overflow_tx,
+            std::sync::Arc::clone(&flooded),
         ));
 
         let mut waiter = self
             .client
             .wait_container(name, None::<WaitContainerOptions>);
 
-        let stopped = tokio::select! {
+        let mut stopped = tokio::select! {
             _ = waiter.next() => Stopped::OnItsOwn,
             _ = tokio::time::sleep(profile.wall_clock) => {
                 tracing::debug!(container = name, "killed at the wall clock");
                 self.kill(name).await;
                 Stopped::WallClock
             }
-            _ = &mut overflow_rx => {
-                tracing::debug!(container = name, "killed for output");
-                self.kill(name).await;
-                Stopped::Output
-            }
         };
 
+        if flooded.load(std::sync::atomic::Ordering::SeqCst) {
+            stopped = Stopped::Output;
+        }
+
         let wall_time = started.elapsed();
+
+        // Read back before the container is removed, and **before** the exit
+        // code is even looked at: a build that failed still has a log worth
+        // having, and the container is gone a moment later either way.
+        let collected = match &profile.collect {
+            None => None,
+            Some(path) => self.take(name, path).await,
+        };
         let (stdout, stderr) = collector
             .await
             .map_err(|e| Error::Refused(format!("the output collector did not finish: {e}")))??;
@@ -304,7 +321,36 @@ impl Docker {
             // Not guessed. See `Outcome`.
             peak_memory_kib: None,
             cpu_time: None,
+            collected,
         })
+    }
+
+    /// Copies a path out of a stopped container, as a tar archive.
+    ///
+    /// `None` rather than an error when it is not there: a build that produced
+    /// nothing is a build that failed, and the caller already knows that from
+    /// the exit code. Turning "no artefact" into an infrastructure failure
+    /// would report a participant's unbuildable submission as the system being
+    /// broken.
+    async fn take(&self, name: &str, path: &str) -> Option<Vec<u8>> {
+        use futures_util::TryStreamExt as _;
+
+        let options = DownloadFromContainerOptionsBuilder::new()
+            .path(path)
+            .build();
+        let collected: std::result::Result<Vec<bytes::Bytes>, _> = self
+            .client
+            .download_from_container(name, Some(options))
+            .try_collect()
+            .await;
+
+        match collected {
+            Ok(chunks) => Some(chunks.concat()),
+            Err(e) => {
+                tracing::debug!(container = name, path, %e, "nothing to collect");
+                None
+            }
+        }
     }
 
     /// Best effort, and deliberately not an error.
@@ -343,7 +389,7 @@ async fn collect(
     client: bollard::Docker,
     name: String,
     cap: u64,
-    overflow: tokio::sync::oneshot::Sender<()>,
+    flooded: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -360,8 +406,6 @@ async fn collect(
                 .build(),
         ),
     );
-
-    let mut overflow = Some(overflow);
 
     while let Some(chunk) = logs.next().await {
         let chunk = match chunk {
@@ -384,8 +428,14 @@ async fn collect(
         if total > cap {
             if !said {
                 said = true;
-                if let Some(tx) = overflow.take() {
-                    let _ = tx.send(());
+                flooded.store(true, std::sync::atomic::Ordering::SeqCst);
+                // Stopped here rather than by the supervisor, so there is no
+                // second party to race with.
+                if let Err(e) = client
+                    .kill_container(&name, None::<KillContainerOptions>)
+                    .await
+                {
+                    tracing::debug!(container = %name, %e, "kill for output did not apply");
                 }
             }
             // Keep exactly the cap, so what is shown is a prefix of what was

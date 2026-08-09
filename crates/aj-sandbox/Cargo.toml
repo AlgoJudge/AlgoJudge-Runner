@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 bollard.workspace = true
+bytes.workspace = true
 futures-util.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

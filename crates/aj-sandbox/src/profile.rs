@@ -61,6 +61,25 @@ pub struct Profile {
 
     /// A writable scratch area, mounted `noexec`.
     pub tmpfs_kib: Option<u64>,
+
+    /// Lets the container write to its **own** layer — never to the host.
+    ///
+    /// Off for anything that runs a submission. On for a build, which has to
+    /// put the program it made somewhere `collect` can read it back from: a
+    /// tmpfs cannot serve, because it is destroyed with the container and the
+    /// archive endpoint then finds nothing. The layer is discarded when the
+    /// container is removed, which is immediately.
+    pub writable_root: bool,
+
+    /// A path inside the container to read back after it exits.
+    ///
+    /// **This is how a build hands over what it made**, instead of being given
+    /// a writable host directory. A bind mount would have to be writable by
+    /// whatever user the container runs as, which is a permission problem on
+    /// every host and a hole on the ones where it is solved by opening the
+    /// directory to everybody. Reading it back through the runtime API means
+    /// the build container gets no writable host path at all.
+    pub collect: Option<String>,
 }
 
 // Standard input is deliberately not a field here. A test's input is mounted
@@ -86,6 +105,8 @@ impl Profile {
             max_output_bytes: 64 * 1024 * 1024,
             mounts: Vec::new(),
             tmpfs_kib: None,
+            writable_root: false,
+            collect: None,
         }
     }
 
@@ -116,6 +137,16 @@ impl Profile {
 
     pub fn tmpfs_kib(mut self, kib: u64) -> Self {
         self.tmpfs_kib = Some(kib);
+        self
+    }
+
+    pub fn writable_root(mut self) -> Self {
+        self.writable_root = true;
+        self
+    }
+
+    pub fn collect(mut self, path: impl Into<String>) -> Self {
+        self.collect = Some(path.into());
         self
     }
 }
@@ -155,6 +186,9 @@ pub struct Outcome {
     /// Absent for the same reason. The verdict for a time limit comes from the
     /// wall clock until something can measure CPU time honestly.
     pub cpu_time: Option<Duration>,
+
+    /// A tar archive of whatever `Profile::collect` named, if anything did.
+    pub collected: Option<Vec<u8>>,
 }
 
 impl Outcome {

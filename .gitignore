@@ -9,3 +9,6 @@
 *.key.partial
 /cache/
 .sandbox-fixtures/
+
+# Throwaway directories from diagnosing a container by hand.
+/.probe/

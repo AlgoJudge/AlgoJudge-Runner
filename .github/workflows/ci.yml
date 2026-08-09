@@ -113,6 +113,20 @@ jobs:
           ./x test -p aj-sandbox --test adversarial
           -- --include-ignored --test-threads=1
 
+      - name: Build the language images
+        run: |
+          docker build -t algojudge/lang-cpp:local    images/cpp
+          docker build -t algojudge/lang-python:local images/python
+
+      # The one that proves the whole thing: a submission goes in, a mark comes
+      # out, and it is the right mark.
+      - name: Judge real submissions
+        env:
+          AJ_DOCKER_SOCKET: "1"
+        run: >
+          ./x test -p aj-standard-io --test judging
+          -- --include-ignored --test-threads=1
+
       - name: Leave no sandboxes behind
         if: always()
         run: docker ps -aq --filter label=algojudge.sandbox=1 | xargs -r docker rm -f

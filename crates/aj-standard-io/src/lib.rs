@@ -9,9 +9,13 @@
 pub mod checker;
 pub mod compare;
 pub mod details;
+pub mod language;
+pub mod pipeline;
 pub mod score;
 
 pub use checker::{checker_said, Checked};
 pub use compare::{compare, Comparison};
 pub use details::{Details, GroupReport, TestReport};
+pub use language::{Images, Language};
+pub use pipeline::{Evaluated, Job, Pipeline, Places, Verdict};
 pub use score::{judge, Judgement, Status, TestOutcome};

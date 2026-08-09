@@ -31,6 +31,7 @@ base64 = "0.22"
 # evaluation host's runtime a deployment choice rather than a code one.
 bollard = "0.19"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+bytes = "1"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 hex = "0.4"
 # The same `rand_core` `ed25519-dalek` itself uses, so the graph holds one copy.
@@ -49,6 +50,9 @@ serde_json = "1.0"
 # input path is a liability worth avoiding.
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
+# Reading what a build container produced, which arrives as a tar stream from
+# the runtime API rather than through a writable bind mount.
+tar = "0.4"
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
