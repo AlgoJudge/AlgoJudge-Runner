@@ -129,6 +129,7 @@ impl Docker {
             memory_swap: Some(memory),
             pids_limit: Some(profile.pids),
             nano_cpus: Some((profile.cpus * 1_000_000_000.0) as i64),
+            cpuset_cpus: profile.cpuset.clone(),
 
             binds: Some(
                 profile

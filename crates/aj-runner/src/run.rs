@@ -250,6 +250,7 @@ async fn judge(
 
         "output-only@1" => {
             let package_config = aj_package::Config::parse_as(&declared, "output-only")
+                .and_then(|c| c.overlaid(job.config.as_ref()))
                 .map_err(|e| e.to_string())?;
             let tests = aj_package::TestSet::read(&package.here, &package_config)
                 .map_err(|e| e.to_string())?;

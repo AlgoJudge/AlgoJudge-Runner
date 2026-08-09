@@ -7,14 +7,14 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
 pub const FORMAT: &str = "standard-io";
 pub const VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
     pub format: String,
@@ -46,7 +46,7 @@ pub struct Config {
 
 /// Milliseconds and **kibibytes**, as `sinolpack` has them — so importing one is
 /// a copy rather than a division with a rounding rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Limits {
     pub time_ms: u64,
@@ -54,7 +54,7 @@ pub struct Limits {
 }
 
 /// One field, the other, or both — a group may state either alone.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PartialLimits {
     #[serde(default)]
@@ -63,7 +63,7 @@ pub struct PartialLimits {
     pub memory_kib: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Group {
     pub group: u32,
@@ -79,7 +79,7 @@ pub struct Group {
     pub limits: Option<PartialLimits>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Source {
     pub source: String,
@@ -139,6 +139,48 @@ impl Config {
         }
 
         Ok(self)
+    }
+
+    /// Applies what the Server merged on top of the package's own configuration.
+    ///
+    /// **The chain is package → `ProblemVersion.Config` → `SeriesProblem.Config`,
+    /// and until now the Runner read only the first link.** The Server merges
+    /// the upper two — member by member at the top level, since it understands
+    /// neither — and sends the result with every job; ignoring it meant one
+    /// library problem attached to two activities with different limits was
+    /// judged under the package's limits in both. The format describes the chain
+    /// as working and the Server computes it; the Runner was throwing it away.
+    ///
+    /// Merged the same way the Server merges: **top-level members replace**. A
+    /// deeper merge would require knowing what the members mean, which is
+    /// exactly what neither side is allowed to know.
+    ///
+    /// An overlay naming something this format has no field for is **refused**,
+    /// not ignored — a misspelled limit is a limit that silently did not apply.
+    pub fn overlaid(self, overlay: Option<&serde_json::Value>) -> Result<Self> {
+        let Some(serde_json::Value::Object(members)) = overlay else {
+            return Ok(self);
+        };
+        if members.is_empty() {
+            return Ok(self);
+        }
+
+        let mut merged = match serde_json::to_value(&self) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => return Ok(self),
+        };
+        for (name, value) in members {
+            // `format` and `version` say what the document is; an overlay does
+            // not get to change that.
+            if name == "format" || name == "version" {
+                continue;
+            }
+            merged.insert(name.clone(), value.clone());
+        }
+
+        let config: Config = serde_json::from_value(serde_json::Value::Object(merged))
+            .map_err(|e| Error::invalid(format!("the merged configuration will not read: {e}")))?;
+        config.validated()
     }
 
     /// The limits a test in this group, in this language, actually runs under.
@@ -314,6 +356,80 @@ extraCompilationFiles: []
             python.memory_kib, 524288,
             "and the override still fills the rest"
         );
+    }
+
+    /// The link in the chain the Runner used to throw away.
+    #[test]
+    fn what_the_server_merged_is_applied_on_top_of_the_package() {
+        let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
+        assert_eq!(config.limits.time_ms, 1000);
+
+        // The same problem, attached to an activity that gives it longer.
+        let overlay = serde_json::json!({ "limits": { "timeMs": 5000, "memoryKib": 262144 } });
+        let attached = config.overlaid(Some(&overlay)).unwrap();
+
+        assert_eq!(attached.limits.time_ms, 5000);
+        // Everything the overlay did not name is untouched.
+        assert_eq!(attached.max_score(), 100);
+        assert_eq!(
+            attached.effective(2, "cpp").time_ms,
+            2000,
+            "the group still states its own"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_empty_overlay_changes_nothing() {
+        let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
+
+        assert_eq!(config.clone().overlaid(None).unwrap().limits.time_ms, 1000);
+        let empty = serde_json::json!({});
+        assert_eq!(config.overlaid(Some(&empty)).unwrap().limits.time_ms, 1000);
+    }
+
+    /// A misspelled limit is a limit that silently did not apply, and an
+    /// overlay is written by hand in a manager's screen.
+    #[test]
+    fn an_overlay_naming_something_this_format_has_no_field_for_is_refused() {
+        let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
+        let overlay = serde_json::json!({ "limits": { "timeMS": 5000 } });
+
+        assert!(config.overlaid(Some(&overlay)).is_err());
+    }
+
+    /// An overlay cannot turn a `standard-io` package into something else.
+    #[test]
+    fn an_overlay_may_not_change_what_the_document_is() {
+        let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
+        let overlay = serde_json::json!({ "format": "interactive", "version": 9 });
+
+        let attached = config.overlaid(Some(&overlay)).unwrap();
+        assert_eq!(attached.format, "standard-io");
+        assert_eq!(attached.version, 1);
+    }
+
+    /// **Open question, and this is the one line.** The specification says only
+    /// that each layer beats the one before, never in which direction. Today an
+    /// overlay applies as given — it may raise a limit as well as tighten one.
+    /// If that is settled the other way, it is settled in `overlaid`.
+    #[test]
+    fn an_overlay_may_currently_raise_a_limit_as_well_as_lower_one() {
+        let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
+
+        let raised = config
+            .clone()
+            .overlaid(Some(&serde_json::json!({
+                "limits": { "timeMs": 9000, "memoryKib": 262144 }
+            })))
+            .unwrap();
+        assert_eq!(raised.limits.time_ms, 9000);
+
+        let lowered = config
+            .overlaid(Some(&serde_json::json!({
+                "limits": { "timeMs": 250, "memoryKib": 262144 }
+            })))
+            .unwrap();
+        assert_eq!(lowered.limits.time_ms, 250);
     }
 
     #[test]
