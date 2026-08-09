@@ -116,7 +116,69 @@ the v1 interface.
 Upstream `isolate` says the same. Swapped-out pages make a timing measurement a
 property of the machine's memory pressure rather than of the program.
 
-## 5. What v1 does and does not do
+## 5. What the number actually covers
+
+The limit and the reading are the **container's cgroup**, not the process. So
+the question "is this the program, or is there overhead?" has a measured answer,
+and it matters because calibration turns these numbers into limits somebody's
+submission has to meet.
+
+Measured with a static binary that allocates a stated amount and then reads its
+own `memory.peak`, under the full sandbox profile:
+
+| allocated | peak | over |
+|---|---|---|
+| 0 MiB | 5.43 MiB | 5.43 |
+| 16 MiB | 20.88 MiB | 4.88 |
+| 64 MiB | 66.11 MiB | 2.11 |
+| 128 MiB | 129.92 MiB | 1.92 |
+
+**The overhead shrinks as the program grows**, which is the signature of
+reclaimable page cache: about **2 MiB is irreducible** and the rest is cache the
+kernel drops under pressure rather than adding on top. It does not scale, so it
+never turns into a proportional error.
+
+Four things that cost **nothing** measurable:
+
+- **The shell.** The run command is `exec …`, so the shell is *replaced* rather
+  than kept — 5.34 MiB through `sh -c 'exec …'` against 5.43 MiB direct.
+- **Redirecting and reading input.** A 32 MiB input drained in full moved
+  nothing: 65.42 MiB against 66.69 MiB without it, which is inside the noise.
+- **Repeat runs.** Five identical runs spanned 65.44–66.31 MiB, so the
+  measurement is good to about **±0.5 MiB**.
+- **The language.** A trivial C++ solution peaks at 6.68 MiB and a trivial
+  Python one at 6.98 MiB against a 5.5 MiB container floor — the interpreter
+  costs about **0.3 MiB more** than a compiled binary at startup. Far too small
+  to be why a Python solution fails a memory limit.
+
+One thing that costs **exactly what it writes**:
+
+- **The scratch tmpfs.** Writing 8 / 32 / 64 MiB gave peaks of 14.92 / 34.79 /
+  67.08 MiB. tmpfs pages are charged to the cgroup and are **not reclaimable**,
+  so scratch space is memory. Going past the limit that way is an ordinary
+  memory kill, verified: `dd` returned **137** and the daemon reported
+  `OOMKilled=true`.
+
+And one that is much larger than the run it belongs to:
+
+- **Compilation.** `g++ -O2` on a single file that includes `<iostream>` peaks
+  at **45.26 MiB** — roughly seven times the floor, and far above anything the
+  compiled program then uses. The compile profile's own memory limit is what
+  that has to fit inside; it is not a property of the submission.
+
+### The rule this implies for calibration
+
+**Do not subtract the overhead.** A participant's submission runs in a container
+of the same shape as the model solution's, so the floor is present in both
+measurements and cancels. Correcting for it would make every limit about 2 MiB
+too tight, for the sake of a number nobody meets.
+
+`PACKAGE_FORMAT.md` defaults memory to `measured + 16 MiB` rather than a
+multiple. Against a 2 MiB floor, a ±0.5 MiB spread and a 0.3 MiB gap between
+languages, that headroom is comfortable — which is now a measurement rather than
+a guess.
+
+## 6. What v1 does and does not do
 
 Stated so the requirement is not read as stricter than it is.
 
