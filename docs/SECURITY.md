@@ -208,6 +208,26 @@ Stated so that absence is not read as a decision:
   unpacked package from the cache instead of unpacking per job, to save the copy.
   That would be a sensible-looking performance change and would open a
   contestant-to-contestant channel.
+
+  **Decided 2026-08-09: the property is pinned instead of the syscall.**
+  `run.rs::two_jobs_mount_nothing_in_common` asserts that every path a sandbox
+  mounts comes from the job's own scratch, and it was checked by breaking the
+  invariant on purpose and watching it fail.
+
+  Denying `flock` would close one road and leave POSIX record locks, `F_NOTIFY`
+  and anything else two processes can do to one inode. What protects us is that
+  there is no shared inode to hold, so that is what is guarded.
+
+  The other half of the trade is what a custom profile costs. Docker's
+  `--security-opt seccomp=` **replaces** the builtin rather than extending it, so
+  ours would have to carry everything measured above — `default.json` is a
+  generated artefact, ~830 lines, published under a moby tag and **absent from
+  master**. A vendored copy that falls behind does not leave us standing still:
+  Docker improves its builtin between releases and ours would not, so the sandbox
+  would get quietly weaker than doing nothing. That is defensible only with a CI
+  job that fails when the two diverge, and it is a cost worth paying for a
+  different reason than this one — a Runner accepting problem types from outside
+  our control, where the mount layout is no longer ours to promise.
 - **`isolate` as a deeper supervisor.** **Not adopted** — the spike ran on
   2026-08-09 and is in `docs/spikes/ISOLATE.md`. It works in a non-privileged
   container, needing `CAP_SYS_ADMIN` and `CAP_NET_ADMIN` over a self-delegated
