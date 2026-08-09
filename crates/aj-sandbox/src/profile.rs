@@ -208,15 +208,24 @@ pub struct Outcome {
     pub wall_time: Duration,
     pub stopped: Stopped,
 
-    /// **Absent for now, and deliberately not guessed.** The container runtime
-    /// reports peak memory inconsistently across cgroup versions, and a number
-    /// that is sometimes wrong is worse than no number: it would be shown to a
-    /// participant beside a verdict. Getting it right is one of the reasons
-    /// `isolate` is on the roadmap as a deeper supervisor.
+    /// Read from the run's own cgroup on a cgroup v2 host, and **absent rather
+    /// than guessed** where the Runner was given nowhere to measure from.
+    ///
+    /// A number that is sometimes wrong is worse than no number, because it is
+    /// shown to a participant beside a verdict — so absence is a real answer
+    /// here and `PACKAGE_FORMAT.md` treats it as one.
+    ///
+    /// The runtime API is not the source: it reports no peak on cgroup v2, and
+    /// a container's own cgroup does not outlive it. See `Docker::cgroup_root`
+    /// for how the measurement is actually taken.
     pub peak_memory_kib: Option<u64>,
 
-    /// Absent for the same reason. The verdict for a time limit comes from the
-    /// wall clock until something can measure CPU time honestly.
+    /// From `cpu.stat` in the same cgroup: user plus system, for the whole
+    /// subtree.
+    ///
+    /// **Not what decides a time limit.** That is still the wall clock, which
+    /// is what a participant experiences and what a limit is stated in. This is
+    /// for reporting and for calibration.
     pub cpu_time: Option<Duration>,
 
     /// A tar archive of whatever `Profile::collect` named, if anything did.

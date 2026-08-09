@@ -143,6 +143,57 @@ async fn a_fork_bomb_cannot_outgrow_its_process_limit() {
     assert_eq!(leftovers(&docker).await, 0);
 }
 
+// ── What the run cost ───────────────────────────────────────────────────────
+
+/// Peak memory is measured, and it is the program's own.
+///
+/// Not "a number arrived": asserted against a **known allocation**, because a
+/// measurement nobody checked the magnitude of is how a plausible-looking wrong
+/// number reaches a participant. A program that touches 64 MiB must report a
+/// peak at least that large and not wildly more — roughly 2 MiB of floor is
+/// expected and it does not scale, so a generous ceiling still catches an error
+/// of kind rather than of degree.
+///
+/// Skipped rather than failed where the Runner was given nowhere to measure
+/// from: `AJ_DOCKER_SOCKET=1` mounts the cgroup hierarchy, and without it the
+/// honest answer is `None` by design.
+#[tokio::test]
+#[ignore = "needs a container runtime and a writable cgroup mount"]
+async fn peak_memory_is_measured_and_is_the_programs_own() {
+    let docker = sandbox().await;
+
+    // `dd` into the scratch tmpfs: tmpfs pages are charged to the cgroup, so
+    // this allocates 64 MiB in a way that is exact rather than approximate.
+    let outcome = docker
+        .run(
+            &shell("dd if=/dev/zero of=/tmp/block bs=1M count=64 2>/dev/null")
+                .memory_kib(512 * 1024)
+                .tmpfs_kib(128 * 1024),
+        )
+        .await
+        .expect("the run");
+
+    let Some(peak_kib) = outcome.peak_memory_kib else {
+        eprintln!("peak memory was not measured: no writable cgroup root. Skipping.");
+        return;
+    };
+
+    assert!(
+        peak_kib >= 64 * 1024,
+        "64 MiB was written, so the peak cannot be below it: got {peak_kib} KiB",
+    );
+    assert!(
+        peak_kib < 128 * 1024,
+        "the floor is about 2 MiB, so twice the allocation means the wrong cgroup: got {peak_kib} KiB",
+    );
+
+    assert!(
+        outcome.cpu_time.is_some(),
+        "cpu.stat sits beside memory.peak in the same cgroup",
+    );
+    assert_eq!(leftovers(&docker).await, 0);
+}
+
 // ── A3 — it eats memory ─────────────────────────────────────────────────────
 
 /// A cgroup OOM, not a timeout. The two are different things to tell a

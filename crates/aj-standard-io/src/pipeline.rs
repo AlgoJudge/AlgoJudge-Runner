@@ -308,9 +308,15 @@ impl<S: Sandbox> Pipeline<S> {
                 status,
                 percentage,
                 time_ms,
-                // Absent until something can measure it honestly — cgroup v2,
-                // or `isolate` underneath.
-                memory_kib: None,
+                // From the run's own cgroup, and **absent when the host gave
+                // the Runner nowhere to measure from** — which is the answer
+                // `PACKAGE_FORMAT.md` asks for rather than a number that is
+                // sometimes wrong. It carries about 2 MiB of container floor
+                // that does not scale, and it is not corrected for: a
+                // participant's run has the same floor, so subtracting it would
+                // make every calibrated limit too tight for the sake of a
+                // number nobody meets.
+                memory_kib: run.peak_memory_kib,
                 note,
             });
         }

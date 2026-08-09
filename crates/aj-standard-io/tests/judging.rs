@@ -180,6 +180,36 @@ async fn a_correct_python_solution_is_accepted() {
     assert_eq!(judged.judgement.score, 100.0);
 }
 
+/// The memory a solution used reaches the result document.
+///
+/// The last thing calibration was waiting for: `PACKAGE_FORMAT.md` lets
+/// `memoryKib` be absent because the Runner could not measure it honestly, and
+/// on a cgroup v2 host with a writable cgroup mount it now can. Absent stays a
+/// legitimate answer, so this skips rather than fails where there is nowhere to
+/// measure from.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_judged_solution_reports_what_memory_it_used() {
+    let judged = verdict(judge("cpp-memory", "cpp", CORRECT_CPP).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+
+    // **Mebibytes here**, though the limits are stated in kibibytes and the
+    // measurement is taken in them — `details.rs` says so and this is the one
+    // place the difference is easy to get wrong.
+    let Some(memory) = document["tests"][0]["memoryMb"].as_u64() else {
+        eprintln!("memory was not measured: no writable cgroup root. Skipping.");
+        return;
+    };
+
+    // A container floor of roughly 2 MiB, plus whatever the program did. Bounds
+    // rather than a value, because the point is that it is a real measurement
+    // and not a plausible-looking constant.
+    assert!(
+        (1..256).contains(&memory),
+        "an adding program should use a few MiB, not zero and not hundreds: {memory} MiB",
+    );
+}
+
 // ── Every other outcome a participant can get ───────────────────────────────
 
 /// Wrong on one test of one group. The group rule then takes that group to

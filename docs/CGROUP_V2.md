@@ -166,6 +166,39 @@ And one that is much larger than the run it belongs to:
   compiled program then uses. The compile profile's own memory limit is what
   that has to fit inside; it is not a property of the submission.
 
+### How the number is actually taken, and what it costs to deploy
+
+Two facts make the obvious approaches impossible, both measured on 2026-08-09:
+
+- **The runtime API reports no peak on cgroup v2.** `memory_stats` carries
+  `limit`, `usage` and the contents of `memory.stat`, and none of those is a
+  maximum. CPU time *is* there and agrees with `cpu.stat`.
+- **A container's own cgroup is destroyed when it exits.** After `docker wait`
+  the directory is already gone, so there is no window to read it in.
+
+So the Runner **makes a cgroup of its own**, starts the sandbox under it with
+`--cgroup-parent`, and reads the parent once the child is gone. The parent
+survives because it belongs to the Runner; one container per test and a fresh
+parent per run mean the parent's peak is that program's peak.
+
+**What this asks of a deployment**: the Runner needs the cgroup hierarchy
+mounted **writable**, and — when the Runner is itself in a container —
+`--cgroupns=host`, so that the path it creates is the path the daemon resolves
+`--cgroup-parent` against. Without the host namespace the Runner sees its own
+cgroup as the root and would read an empty directory rather than fail.
+
+```
+--cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup
+AJ_Sandbox__CgroupRoot      # defaults to /sys/fs/cgroup
+```
+
+**It costs write permission, not a capability.** Creating a directory in a
+mounted cgroup2 needs neither `CAP_SYS_ADMIN` nor privilege — which is the whole
+reason D-13 could decline `isolate` and keep the numbers.
+
+Where the mount is absent the Runner says so once at start and reports **no**
+peak memory. That is a supported configuration, not a broken one.
+
 ### The rule this implies for calibration
 
 **Do not subtract the overhead.** A participant's submission runs in a container
