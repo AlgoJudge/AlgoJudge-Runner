@@ -62,6 +62,39 @@ Two more, from the pipeline rather than the sandbox:
   author rather than from the platform, and it runs with its own limits and no
   network, never in the Runner's process.
 
+### What one test is, stated as a contract (2026-08-09)
+
+Four rules. They are cheap to hold and expensive to notice the loss of, so each
+has a test rather than a paragraph.
+
+1. **One test, one container, never reused.** A fresh container is the only
+   answer that does not depend on cleanup having been written correctly.
+2. **The program is given its own test's input and nothing else.** One file:
+   `<name>.in`, mounted read-only, and the program is started as
+   `exec … < /in/<name>.in`. Until 2026-08-09 the whole `tests/` directory was
+   mounted, which put `<name>.out` — the answer — inside the submission's own
+   container. See `pipeline.rs::input_mount`.
+3. **Nothing a program writes reaches the next test.** Asserted in
+   `adversarial.rs::nothing_survives_from_one_run_to_the_next`, for the scratch
+   tmpfs **and** for `/dev/shm`.
+4. **The checker is contained on the same terms.** Same `Sandbox::run`, so the
+   same table above applies to it, with its own limits. A checker stopped by a
+   limit is reported as a **broken checker**, never as a wrong answer.
+
+Two things that follow, and are easy to get wrong in the opposite direction:
+
+- **`/dev/shm` is writable and the profile does not ask for it.** The runtime
+  mounts a 64 MiB tmpfs there in every container and a read-only root filesystem
+  does not cover it. It breaks none of the four — it is new with the container,
+  and tmpfs pages are charged to the memory limit, so a program spending it is
+  spending its own budget — but it is a surface nobody declared, which is why
+  rule 3's test names it explicitly.
+- **The input is a mounted file, not a pipe.** A pipe would be marginally
+  stricter and is deliberately not used: it is **not seekable**, so a solution
+  that reads its input twice would work on the author's machine and fail here.
+  The access surface is already one test either way, so the stricter option buys
+  nothing and costs a participant a verdict they cannot explain.
+
 ## 3. What this does **not** buy — read this part
 
 **The Runner holds the container runtime's socket, and anything that can reach
