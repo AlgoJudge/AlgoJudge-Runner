@@ -50,6 +50,27 @@ services:
     environment:
       DOTNET_ENVIRONMENT: Development
       AJ_ConnectionStrings__DbConnectionString: Host=postgres;Database=algojudge;Username=algojudge;Password=algojudge
+      # What `/admin/**` asks for on top of being called from inside the
+      # container: the maintenance switch and the endpoint that sets the
+      # administrator's password. **Empty closes the whole group.**
+      #
+      # An operator with a `.env` beside this file gets theirs; a developer with
+      # none gets a token named for exactly what it is, so a development stack
+      # can take itself off the air and CI needs no secret to test that it can.
+      # The Server says so at Warning on every start where this value is in
+      # force outside Development.
+      AJ_Admin__Token: ${AJ_ADMIN_TOKEN:-admin-token-development-only}
+      # How long maintenance may drain before it closes anyway. Production
+      # leaves this at 300.
+      #
+      # Short here because **the development seed deliberately holds two jobs in
+      # `Running`** — it is telling the story "these two submissions are being
+      # evaluated right now", which is what a screenshot needs. Nothing will ever
+      # finish them: they carry no lease, so no reaper can reclaim them either.
+      # A drain therefore always reaches the forced path on this stack, and
+      # waiting five minutes for it on every try teaches an operator that the
+      # switch is broken.
+      AJ_Maintenance__ForceAfterSeconds: "20"
 
   runner:
     build:

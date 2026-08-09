@@ -24,11 +24,30 @@ pub struct Server {
     token: RwLock<Option<String>>,
 }
 
+/// Long enough for a busy Server, short enough that a hung one is noticed.
+///
+/// Without a connect timeout, a proxy that accepts the socket and then says
+/// nothing holds the claim loop for as long as the kernel is willing to wait —
+/// which is minutes, and looks from outside like a Runner that has stopped
+/// working rather than one that is waiting.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// **Between bytes, not for the whole request.**
+///
+/// A total timeout would be wrong here: `download_to` streams a package that
+/// may be large over a link that may be slow, and cutting it off at a fixed
+/// duration would turn a big problem set into an infrastructure failure. What
+/// must not be tolerated is *silence* — a connection that was accepted and then
+/// abandoned — and that is what this bounds.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl Server {
     pub fn new(base_url: &str) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
                 .user_agent(concat!("AlgoJudge-Runner/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(READ_TIMEOUT)
                 .build()?,
             base: base_url.trim_end_matches('/').to_owned(),
             token: RwLock::new(None),
@@ -57,6 +76,22 @@ impl Server {
             .token
             .write()
             .expect("the token lock is never poisoned") = None;
+    }
+
+    // ── Whether the Server is serving ───────────────────────────────────────
+
+    /// Asks whether the Server is open, and if not, how far it has withdrawn.
+    ///
+    /// **Anonymous and never gated.** Both matter. A Runner whose token has
+    /// expired during a window cannot shake hands again — the handshake is
+    /// refused with everything else at the deepest level — so a call that needed
+    /// one would be the door locking behind it. And this is the only request
+    /// that answers `200` throughout, which is what makes waiting for the window
+    /// to end distinguishable from waiting for a Server that is never coming
+    /// back.
+    pub async fn health(&self) -> Result<Health> {
+        let response = accept(self.http.get(self.url("health")).send().await?).await?;
+        read(response).await
     }
 
     // ── Registration and the handshake ──────────────────────────────────────
@@ -382,13 +417,37 @@ async fn accept(response: reqwest::Response) -> Result<reqwest::Response> {
         return Ok(response);
     }
 
+    // Read before the body is consumed, and kept even when the body is not
+    // ours: during a window the answer may come from an edge proxy that has
+    // never heard of this product, and the header is then the only thing in it
+    // worth acting on.
+    let retry_after = retry_after(response.headers());
+
     // A body that will not parse is not a second failure: nginx answers a 413
     // in HTML, and the status is still the useful part.
     let refusal = response.json::<Refusal>().await.unwrap_or_default();
     Err(Error::Refused {
         status: status.as_u16(),
         refusal: Box::new(refusal),
+        retry_after,
     })
+}
+
+/// `Retry-After`, seconds form only.
+///
+/// RFC 9110 also allows an HTTP date. Parsing one would mean trusting two
+/// clocks to agree, and the difference between them is unbounded — so a date is
+/// treated as "the Server did not say", which falls back to this Runner's own
+/// backoff. That is the safe direction: the fallback waits, it does not spin.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
 }
 
 async fn read<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T> {
@@ -439,6 +498,58 @@ mod tests {
         assert!(json.get("score").is_none());
         assert!(json.get("maxScore").is_none());
         assert!(json.get("verdict").is_none());
+    }
+
+    fn header(value: &str) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn retry_after_is_read_in_seconds_and_ignored_in_any_other_form() {
+        assert_eq!(
+            retry_after(&header("300")),
+            Some(std::time::Duration::from_secs(300)),
+        );
+        assert_eq!(retry_after(&header(" 30 ")), Some(FIVE_SECONDS * 6));
+
+        // An HTTP date is legal and deliberately not read: acting on it means
+        // trusting two clocks to agree. Absent means "the Server did not say",
+        // and the caller's own backoff decides — which waits rather than spins.
+        assert_eq!(retry_after(&header("Wed, 09 Aug 2026 18:00:00 GMT")), None);
+        assert_eq!(retry_after(&header("")), None);
+        assert_eq!(retry_after(&reqwest::header::HeaderMap::new()), None);
+    }
+
+    const FIVE_SECONDS: std::time::Duration = std::time::Duration::from_secs(5);
+
+    #[test]
+    fn a_health_document_without_maintenance_is_an_open_server() {
+        let open: Health = serde_json::from_value(serde_json::json!({ "status": "ok" })).unwrap();
+        assert!(open.open());
+        assert_eq!(open.level(), "open");
+        assert_eq!(open.reason(), None);
+
+        let draining: Health = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "maintenance": { "level": "draining", "reason": "nightly backup" }
+        }))
+        .unwrap();
+        assert!(!draining.open(), "no new work while the Server drains");
+        assert_eq!(draining.reason(), Some("nightly backup"));
+
+        // A level this build has never heard of is **not open** and not an
+        // error. Refusing to parse it would turn a Server that added a level
+        // into a Runner that cannot read health at all — during a window, when
+        // health is the only thing it can read.
+        let later: Health = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "maintenance": { "level": "hibernating" }
+        }))
+        .unwrap();
+        assert!(!later.open());
+        assert_eq!(later.level(), "hibernating");
     }
 
     #[test]

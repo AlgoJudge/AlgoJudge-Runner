@@ -10,8 +10,23 @@
 //! docker build -t algojudge/lang-cpp:local    images/cpp
 //! docker build -t algojudge/lang-python:local images/python
 //! docker compose -f example-runner-development-docker-compose.yaml up -d --build --wait
-//! ./x test -p aj-runner --test end_to_end -- --include-ignored --test-threads=1
+//!
+//! AJ_TEST_SERVER=http://host.docker.internal:8080/api/v1 \
+//!   ./x test -p aj-runner --test end_to_end -- --include-ignored --test-threads=1
 //! ```
+//!
+//! **One of them needs a different network.** The maintenance case has to reach
+//! the Server's own loopback interface, because that is the whole of the
+//! switch's authorization, so it shares the container's network namespace
+//! instead of joining the stack's network:
+//!
+//! ```text
+//! AJ_DOCKER_NETWORK=container:algojudge-runner-dev-server-1 \
+//! AJ_TEST_SERVER=http://127.0.0.1:8080/api/v1 \
+//!   ./x test -p aj-runner --test end_to_end -- --include-ignored --test-threads=1
+//! ```
+//!
+//! Which is also why CI runs it as a step of its own.
 //!
 //! **Six outcomes, one run.** Five are verdicts and the sixth is not: an
 //! infrastructure failure means the submission was never judged, and it is the
@@ -573,10 +588,17 @@ async fn a_trial_is_measured_end_to_end_and_the_package_does_not_survive() {
 
     let file_id = admin.upload("sum.zip", "application/zip", package).await;
 
+    // `/trials`, not `/activities/{id}/trials`: the whole surface moved when a
+    // manager had to be able to measure a problem in the library, which belongs
+    // to no activity (D-16). The activity is named in the body instead.
     let created = admin
         .post(
-            "/activities/DEV-2026/trials",
-            serde_json::json!({ "problemType": "standard-io@1", "packageFileId": file_id }),
+            "/trials",
+            serde_json::json!({
+                "problemType": "standard-io@1",
+                "packageFileId": file_id,
+                "activityIdOrSlug": "DEV-2026",
+            }),
         )
         .await;
 
@@ -588,9 +610,7 @@ async fn a_trial_is_measured_end_to_end_and_the_package_does_not_survive() {
     // an idle Runner rather than on a queue position.
     let mut settled = serde_json::Value::Null;
     for _ in 0..240 {
-        let seen = admin
-            .get(&format!("/activities/DEV-2026/trials/{trial}"))
-            .await;
+        let seen = admin.get(&format!("/trials/{trial}")).await;
         match seen["state"].as_str().unwrap_or("") {
             "completed" | "failed" => {
                 settled = seen;
@@ -628,5 +648,195 @@ async fn a_trial_is_measured_end_to_end_and_the_package_does_not_survive() {
     assert!(
         !admin.reaches(&format!("/files/{file_id}")).await,
         "the package was still readable after the trial finished",
+    );
+}
+
+// ── Maintenance ─────────────────────────────────────────────────────────────
+
+/// The token `/admin/**` asks for, beside being called from inside the container.
+///
+/// Defaulted to the value the development compose file ships, so an ordinary run
+/// needs no configuration; an operator whose stack reads a real one from `.env`
+/// passes the same variable here.
+fn admin_token() -> String {
+    std::env::var("AJ_ADMIN_TOKEN").unwrap_or_else(|_| "admin-token-development-only".into())
+}
+
+/// Throws the maintenance switch.
+///
+/// **Two things are needed, and this test has to hold both.** The token above,
+/// and a request from the Server's own loopback interface — proving that each
+/// is required on its own is the Server's `AdminSurfaceTests`, not this. The way
+/// a test becomes a local caller without a shell inside the container is to
+/// share the container's network namespace:
+///
+/// ```text
+/// AJ_DOCKER_NETWORK=container:algojudge-runner-dev-server-1 \
+/// AJ_TEST_SERVER=http://127.0.0.1:8080/api/v1 \
+///   ./x test -p aj-runner --test end_to_end -- --include-ignored --test-threads=1
+/// ```
+///
+/// Run any other way this fails with a 404 and says so, which is the switch
+/// working rather than the test being wrong.
+async fn maintenance(http: &reqwest::Client, query: &str) -> Value {
+    let response = http
+        .post(format!("{}/admin/maintenance?{query}", api()))
+        .header("X-AlgoJudge-Admin-Token", admin_token())
+        .send()
+        .await
+        .expect("the switch — is the development stack up?");
+
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "the switch answered {status}: {text}\n\
+         a 404 means the token was refused, or this test is not on the Server's \
+         loopback interface — see the doc comment above",
+    );
+    serde_json::from_str(&text).unwrap_or(Value::Null)
+}
+
+/// What `/health` says, from the host — it is anonymous and always answers.
+async fn level(http: &reqwest::Client) -> String {
+    let health: Value = http
+        .get(format!("{}/health", api()))
+        .send()
+        .await
+        .expect("health always answers")
+        .json()
+        .await
+        .expect("a health document");
+
+    health["maintenance"]["level"]
+        .as_str()
+        .unwrap_or("open")
+        .to_owned()
+}
+
+/// **A backup must not cost somebody their submission.**
+///
+/// The case the whole feature exists for, driven end to end: a submission is in
+/// flight, an operator takes the installation off the air, and the participant
+/// still gets the verdict their solution earned. Before this, the Runner
+/// flattened a 503 during the package download into a `String` and reported it
+/// as an infrastructure failure against the attempt — so a backup started at the
+/// wrong second closed somebody's submission for them.
+///
+/// Four things are asserted and each one failed differently before:
+///
+/// 1. the submission ends **judged**, never `failed`;
+/// 2. a participant is refused **while the Runner is admitted** — the asymmetry
+///    that is the whole reason there are two levels rather than a flag;
+/// 3. the Server reaches `closed` on its own, which is what an operator waits
+///    for before touching the database;
+/// 4. the Runner is **still working afterwards** — it waited the window out
+///    rather than exiting into whatever restarts it.
+///
+/// **What it does not exercise**, said plainly rather than left to be assumed:
+/// the Runner never sees a `503` here, and that is the design working — at
+/// `draining` it is allowed to finish and report, which is exactly why (1)
+/// holds. The harsher path, a `closed` Server arriving mid-job, is covered by
+/// the unit tests over `Trouble`, where the classification that decides it
+/// lives.
+#[tokio::test]
+#[ignore = "needs the development stack and the language images"]
+async fn a_window_does_not_cost_a_participant_their_submission() {
+    let http = reqwest::Client::new();
+    let admin = Session::as_("admin", "admin-development-only").await;
+    approve_the_runner(&admin).await;
+
+    let activity = publish(&admin, fixture("sum.zip")).await;
+    let participant = Session::as_("student", "student-development-only").await;
+    participant
+        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .await;
+    wait_until_open(&participant, &activity).await;
+
+    // The same solution the six-outcome test calls accepted, so a failure here
+    // is about the window and never about the C++.
+    let correct = "#include <iostream>\nint main(){long long a,b;std::cin>>a>>b;std::cout<<a+b;}\n";
+    let submission = participant.submit(&activity, correct, "cpp").await;
+
+    // Thrown as close to the claim as this can honestly get: polled for the
+    // moment the Runner takes it, and thrown anyway if that moment is missed.
+    // The assertion below does not depend on winning the race — it is the same
+    // invariant whether the window caught the job or only the queue.
+    for _ in 0..100 {
+        let seen = participant
+            .get(&format!("/activities/{activity}/submissions/{submission}"))
+            .await;
+        if seen["state"] == "running" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let thrown = maintenance(&http, "on=true&reason=an+end-to-end+window").await;
+    // **Never straight to closed**: whatever is in flight is given its chance.
+    assert_eq!(thrown["level"], "draining");
+
+    // **The asymmetry, from the participant's side.** A Runner may still hand in
+    // what it holds; nobody may start anything new. One flag could not express
+    // both, which is why there are two levels.
+    let refused = participant
+        .http
+        .post(format!(
+            "{}/activities/{activity}/problems/A/submissions",
+            api()
+        ))
+        .multipart(
+            reqwest::multipart::Form::new()
+                .text("language", "cpp")
+                .text("code", correct.to_owned())
+                .text("sha256", hex::encode(Sha256::digest(correct.as_bytes()))),
+        )
+        .send()
+        .await
+        .expect("the Server answers, it just refuses");
+    assert_eq!(
+        refused.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "a participant was still able to submit during a window",
+    );
+    assert!(
+        refused.headers().contains_key("retry-after"),
+        "a refusal with no Retry-After leaves a caller guessing",
+    );
+
+    // It drains rather than closing on top of whatever is running, so this is
+    // the wait an operator actually has before a backup is safe to start.
+    let mut closed = false;
+    for _ in 0..120 {
+        if level(&http).await == "closed" {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(closed, "the Server never finished draining");
+
+    // Nothing has been marked in the meantime, because nothing was allowed to
+    // be — but nothing has been thrown away either.
+    maintenance(&http, "on=false").await;
+    assert_eq!(level(&http).await, "open");
+
+    let seen = settled(&participant, &activity, &submission).await;
+    assert_eq!(
+        seen["state"], "completed",
+        "the window turned a submission into a failure: {seen}",
+    );
+    assert_eq!(
+        seen["verdict"], "Accepted",
+        "a correct solution was not accepted after the window: {seen}",
+    );
+
+    // **And the Runner is still there.** A `503` used to be terminal, so this is
+    // the assertion that it waited rather than exiting into its restart policy:
+    // a second submission, judged by the same process, with nothing restarted.
+    let second = participant.submit(&activity, correct, "cpp").await;
+    let after = settled(&participant, &activity, &second).await;
+    assert_eq!(
+        after["state"], "completed",
+        "the Runner did not come back on its own after the window: {after}",
     );
 }

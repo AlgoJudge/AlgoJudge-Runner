@@ -102,6 +102,24 @@ jobs:
         run: >
           ./x test -p aj-runner --test end_to_end
           -- --include-ignored --test-threads=1
+          --skip a_window_does_not_cost_a_participant_their_submission
+
+      # Its own step because it needs a different network, not because it is a
+      # different kind of test.
+      #
+      # The maintenance switch answers only to a caller on the **Server's own
+      # loopback interface** — that is the whole of its authorization, and a
+      # test on the stack's network would get the 404 it is supposed to get.
+      # Sharing the container's network namespace is how a test becomes a local
+      # caller; `127.0.0.1:8080` then really is the Server's own.
+      - name: A maintenance window does not cost a participant their submission
+        env:
+          AJ_DOCKER_NETWORK: container:algojudge-runner-dev-server-1
+          AJ_TEST_SERVER: http://127.0.0.1:8080/api/v1
+        run: >
+          ./x test -p aj-runner --test end_to_end
+          -- --include-ignored --test-threads=1
+          --exact a_window_does_not_cost_a_participant_their_submission
 
       # M3's mechanical half. A test cannot honestly assert something about a
       # repository it is not in, so it is asserted here, against the checkout

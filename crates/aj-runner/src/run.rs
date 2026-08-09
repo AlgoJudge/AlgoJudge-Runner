@@ -27,6 +27,13 @@ pub async fn admitted(server: &Server, identity: &Identity, config: &Config) -> 
         machine: Some(machine()),
     };
 
+    // **Backed off and jittered, where this used to ask every five seconds for
+    // ever.** This loop is what a room of Runners runs on a cold start and after
+    // every token expiry, so an unjittered five seconds is the worst herd in the
+    // product — pointed at a Server that is, by the time it matters, deliberately
+    // trying to be down.
+    let mut backoff = Backoff::new(config.poll_min, config.poll_max);
+
     loop {
         match server.register(&register).await {
             Ok(registered) => {
@@ -55,24 +62,95 @@ pub async fn admitted(server: &Server, identity: &Identity, config: &Config) -> 
                 // decisions for a person, not a retry loop.
                 anyhow::bail!("this key has been revoked; register a new one: {e}");
             }
+            Err(e) if e.unavailable() => wait_out(server, &e, &mut backoff).await,
             Err(e) if e.retryable() => {
-                pause(&format!("the Server is not answering ({e})"), FIVE).await
+                pause(
+                    &format!("the Server is not answering ({e})"),
+                    how_long(&e, &mut backoff),
+                )
+                .await
             }
             Err(e) => anyhow::bail!("registration was refused: {e}"),
         }
     }
 
+    backoff.reset();
+
     loop {
         match server.authenticate(identity).await {
             Ok(()) => return Ok(()),
             Err(e) if e.not_approved() => {
-                pause("this Runner has not been approved yet", THIRTY).await;
+                // A person has to act, so this is measured in minutes rather
+                // than seconds — but it still backs off, because a room of
+                // Runners registered together would otherwise ask in one burst
+                // for however long it takes somebody to get to the panel.
+                pause(
+                    "this Runner has not been approved yet",
+                    how_long(&e, &mut backoff),
+                )
+                .await;
             }
             Err(e) if e.revoked() => anyhow::bail!("this key has been revoked: {e}"),
-            Err(e) if e.retryable() => pause(&format!("the handshake failed ({e})"), FIVE).await,
+            Err(e) if e.unavailable() => wait_out(server, &e, &mut backoff).await,
+            Err(e) if e.retryable() => {
+                pause(
+                    &format!("the handshake failed ({e})"),
+                    how_long(&e, &mut backoff),
+                )
+                .await
+            }
             Err(e) => anyhow::bail!("the handshake was refused: {e}"),
         }
     }
+}
+
+/// How long to wait after a refusal worth retrying.
+///
+/// **The Server's `Retry-After` wins only where it asked for longer.** This
+/// Runner's own jittered backoff is the floor, so an operator asking for five
+/// minutes is honoured, while a proxy answering `Retry-After: 0` cannot turn a
+/// retry into a spin against a Server that is trying to be down.
+fn how_long(e: &aj_protocol::Error, backoff: &mut Backoff) -> Duration {
+    let mine = backoff.next_delay();
+    e.retry_after()
+        .filter(|asked| *asked > mine)
+        .unwrap_or(mine)
+}
+
+/// Waits out a Server that is up and declining to serve, and says which it is.
+///
+/// Asks `/health` rather than guessing, because that is the one path a window
+/// leaves open and because the answer carries the operator's own words. Waiting
+/// in silence would be indistinguishable from a Runner that had stopped.
+///
+/// Returns as soon as the window has ended, without sleeping: the question is
+/// asked before the wait, so a window that closed in between costs nothing.
+async fn wait_out(server: &Server, e: &aj_protocol::Error, backoff: &mut Backoff) {
+    let delay = how_long(e, backoff);
+
+    match server.health().await {
+        Ok(health) if health.open() => {
+            tracing::info!("the Server is serving again");
+            backoff.reset();
+            return;
+        }
+        Ok(health) => tracing::info!(
+            level = health.level(),
+            reason = health.reason().unwrap_or("none given"),
+            ?delay,
+            "the Server is under maintenance; waiting",
+        ),
+        // Health is anonymous and answers at every level, so failing here means
+        // the Server is not merely withdrawn — it is unreachable. Same wait,
+        // different sentence, because they are fixed by different people.
+        Err(unreachable) => tracing::warn!(
+            %unreachable,
+            ?delay,
+            "the Server is not serving, and health could not be read either; waiting",
+        ),
+    }
+
+    tokio::time::sleep(delay).await;
 }
 
 /// Claim, evaluate, report. For ever.
@@ -109,8 +187,14 @@ pub async fn work(
                 }
 
                 if last_beat.elapsed() >= config.heartbeat {
-                    if let Err(e) = server.heartbeat().await {
-                        tracing::warn!(%e, "the heartbeat did not land");
+                    match server.heartbeat().await {
+                        Ok(()) => {}
+                        // Expected during a window rather than worth a warning:
+                        // the Server has withdrawn and already knows.
+                        Err(e) if e.unavailable() => {
+                            tracing::debug!(%e, "the Server is not taking heartbeats")
+                        }
+                        Err(e) => tracing::warn!(%e, "the heartbeat did not land"),
                     }
                     last_beat = tokio::time::Instant::now();
                 }
@@ -124,9 +208,13 @@ pub async fn work(
                 let identity = Identity::load_or_create(&config.key_path)?;
                 admitted(server, &identity, config).await?;
             }
+            // **Not a fault, and not a reason to exit.** At `draining` the
+            // Server answers an empty queue instead, so this is the deeper
+            // level — everything closed but health.
+            Err(e) if e.unavailable() => wait_out(server, &e, &mut backoff).await,
             Err(e) if e.retryable() => {
                 tracing::warn!(%e, "could not ask for work");
-                backoff.wait().await;
+                tokio::time::sleep(how_long(&e, &mut backoff)).await;
             }
             Err(e) => anyhow::bail!("claiming was refused: {e}"),
         }
@@ -158,7 +246,7 @@ async fn run_trial(
             measurement: Some(measured),
             failure_reason: None,
         },
-        Err(reason) => {
+        Err(Trouble::Machinery(reason)) => {
             tracing::error!(trial = %trial.trial_id, reason, "the trial failed");
             TrialReport {
                 lease_token: trial.lease_token.clone(),
@@ -166,18 +254,62 @@ async fn run_trial(
                 failure_reason: Some(reason),
             }
         }
+        // The same rule as a job, for the same reason: a trial that failed
+        // because the Server withdrew did not fail. Its lease brings it back,
+        // and the manager waiting on a measurement gets one instead of a
+        // failure they would have to work out was not theirs.
+        Err(Trouble::Away(e)) => {
+            tracing::warn!(
+                trial = %trial.trial_id,
+                %e,
+                maintenance = e.in_maintenance(),
+                "the Server went away mid-trial; leaving it to the lease",
+            );
+            return;
+        }
     };
 
     // Reported either way: the Server deletes the package when it hears, so a
     // trial nobody reports leaves bytes behind until the reaper gives up on it.
-    match server.report_trial(&trial.trial_id, &report).await {
-        Ok(accepted) => tracing::info!(
-            trial = %trial.trial_id,
-            state = %accepted.state,
-            duplicate = accepted.duplicate,
-            "trial reported",
-        ),
-        Err(e) => tracing::error!(trial = %trial.trial_id, %e, "the trial report did not land"),
+    // And held on to through a window, exactly as a verdict is — a measurement
+    // costs the same machine time to produce whoever asked for it.
+    let mut keep = KeepTrying::for_a_lease(config);
+
+    loop {
+        match server.report_trial(&trial.trial_id, &report).await {
+            Ok(accepted) => {
+                tracing::info!(
+                    trial = %trial.trial_id,
+                    state = %accepted.state,
+                    duplicate = accepted.duplicate,
+                    "trial reported",
+                );
+                return;
+            }
+            Err(e) if e.lease_lost() => {
+                tracing::warn!(trial = %trial.trial_id, %e, "the trial's lease was gone");
+                return;
+            }
+            Err(e) => match keep.or_give_up(&e) {
+                Some(delay) => {
+                    tracing::warn!(
+                        trial = %trial.trial_id,
+                        %e,
+                        ?delay,
+                        "the trial report did not land; holding on to it",
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                None => {
+                    tracing::error!(
+                        trial = %trial.trial_id,
+                        %e,
+                        "the trial report could not be delivered",
+                    );
+                    return;
+                }
+            },
+        }
     }
 }
 
@@ -188,13 +320,13 @@ async fn measure_trial(
     pipeline: &Pipeline<aj_sandbox::Docker>,
     config: &Config,
     trial: &ClaimedTrial,
-) -> Result<String, String> {
+) -> Result<String, Trouble> {
     let work = Scratch::new(&config.work_path, &config.work_host_path, &trial.trial_id)?;
 
     let archive = cache
         .fetch(server, &trial.package_file_id, &trial.package_sha256)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(Trouble::from)?;
 
     let package = unpacked_into(&work.places);
     aj_package::extract(
@@ -219,9 +351,9 @@ async fn measure_trial(
                 aj_standard_io::measure(pipeline, &package_config, &tests, &package, &work.places)
                     .await?;
 
-            serde_json::to_string(&measured).map_err(|e| e.to_string())
+            serde_json::to_string(&measured).map_err(|e| e.to_string().into())
         }
-        other => Err(format!("this Runner does not measure {other}")),
+        other => Err(format!("this Runner does not measure {other}").into()),
     }
 }
 
@@ -241,14 +373,31 @@ async fn handle(
         "claimed",
     );
 
-    let (report, attachments) = evaluate(server, cache, pipeline, config, &job).await;
+    let (report, attachments) = match evaluate(server, cache, pipeline, config, &job).await {
+        Finished::Say(report, attachments) => (*report, attachments),
+        Finished::Abandon => return,
+    };
 
     // Upload, attach, **then** report — the Server requires the job to be
     // `Running` to accept an attachment, and reporting ends that. Get the order
     // wrong and the log explaining a failure is the thing that goes missing.
     attach(server, &job, attachments).await;
 
-    report_with_retries(server, &job, &report).await;
+    report_with_retries(server, &job, &report, config).await;
+}
+
+/// What a finished attempt leaves the Runner holding.
+enum Finished {
+    /// An answer, whether a verdict or an honest infrastructure failure. It has
+    /// to reach the Server, and the report loop keeps trying until it does.
+    ///
+    /// Boxed only to keep the two variants a similar size, which `clippy`
+    /// insists on; there is one of these per job and the indirection costs
+    /// nothing that can be measured.
+    Say(Box<ReportResult>, Attachments),
+
+    /// Nothing that should be said. Left to the lease on purpose.
+    Abandon,
 }
 
 /// Unpack, judge, and say what it was worth.
@@ -257,27 +406,40 @@ async fn handle(
 /// open, a config that will not read, a sandbox that will not start — comes back
 /// as an infrastructure failure. Only what the submission itself did becomes a
 /// verdict.
+///
+/// And a Server that is away comes back as neither. See [`Trouble`].
 async fn evaluate(
     server: &Server,
     cache: &Arc<Cache>,
     pipeline: &Pipeline<aj_sandbox::Docker>,
     config: &Config,
     job: &ClaimedJob,
-) -> (ReportResult, Attachments) {
+) -> Finished {
     match judge(server, cache, pipeline, config, job).await {
-        Ok((report, attachments)) => (report, attachments),
-        Err(reason) => {
+        Ok((report, attachments)) => Finished::Say(Box::new(report), attachments),
+
+        Err(Trouble::Machinery(reason)) => {
             tracing::error!(job = %job.job_id, reason, "the evaluation failed");
-            (
-                ReportResult::failed(&job.lease_token, reason.clone()),
+            Finished::Say(
+                Box::new(ReportResult::failed(&job.lease_token, reason.clone())),
                 Attachments {
-                    log: format!(
-                        "{reason}
-"
-                    ),
+                    log: format!("{reason}\n"),
                     details: None,
                 },
             )
+        }
+
+        Err(Trouble::Away(e)) => {
+            // Warning rather than error, and worded for whoever reads the log
+            // afterwards: nothing was lost and nothing needs doing.
+            tracing::warn!(
+                job = %job.job_id,
+                submission = %job.submission_id,
+                %e,
+                maintenance = e.in_maintenance(),
+                "the Server went away mid-job; leaving it to the lease rather than failing it",
+            );
+            Finished::Abandon
         }
     }
 }
@@ -289,13 +451,64 @@ struct Attachments {
     details: Option<Vec<u8>>,
 }
 
+/// Why there is no verdict — and the distinction the whole feature rests on.
+///
+/// **These two must never be flattened together.** Before this existed, every
+/// failure inside `judge` became one `String` and every `String` became an
+/// infrastructure failure reported against the attempt. That is right for a
+/// package that will not open and wrong for a Server that went away mid-job:
+/// the second one closes somebody's attempt over an outage they had nothing to
+/// do with, and a backup starting at the wrong moment costs a participant their
+/// submission.
+enum Trouble {
+    /// Ours, and permanent as far as this attempt is concerned. The submission
+    /// cannot be judged, so the Server is told exactly that and the attempt is
+    /// closed honestly.
+    Machinery(String),
+
+    /// The Server's, and temporary. **Say nothing at all.** The lease is
+    /// already the mechanism for this: it expires, the reaper puts the job back
+    /// on the queue, and whichever Runner is up when the window ends judges it
+    /// properly. Reporting anything here would replace a working retry with a
+    /// permanent wrong answer.
+    Away(aj_protocol::Error),
+}
+
+impl From<aj_protocol::Error> for Trouble {
+    /// Classified once, here, so no call site has to remember to.
+    ///
+    /// `retryable()` is the right question: it is already what tells a rate
+    /// limit and an outage from a refusal the Server means. A checksum that does
+    /// not match is not retryable and so lands where it belongs — the bytes
+    /// arrived and were wrong, which is ours to report.
+    fn from(e: aj_protocol::Error) -> Self {
+        if e.retryable() {
+            Trouble::Away(e)
+        } else {
+            Trouble::Machinery(e.to_string())
+        }
+    }
+}
+
+impl From<String> for Trouble {
+    fn from(reason: String) -> Self {
+        Trouble::Machinery(reason)
+    }
+}
+
+impl From<&str> for Trouble {
+    fn from(reason: &str) -> Self {
+        Trouble::Machinery(reason.to_owned())
+    }
+}
+
 async fn judge(
     server: &Server,
     cache: &Arc<Cache>,
     pipeline: &Pipeline<aj_sandbox::Docker>,
     config: &Config,
     job: &ClaimedJob,
-) -> Result<(ReportResult, Attachments), String> {
+) -> Result<(ReportResult, Attachments), Trouble> {
     if !job.has_package() {
         // Empty strings, not absent — there is nothing to judge against.
         return Err("the problem version carries no package".into());
@@ -305,10 +518,14 @@ async fn judge(
     // upstream, because a Runner that leaks scratch fills its own disk.
     let work = Scratch::new(&config.work_path, &config.work_host_path, &job.job_id)?;
 
+    // **Not `to_string()`.** These two lines are where a maintenance window
+    // reaches a job that has already been claimed: the package and the
+    // submission are downloaded from the Server, and flattening the error to a
+    // string is exactly how an outage used to become somebody's zero.
     let archive = cache
         .fetch(server, &job.package_file_id, &job.package_sha256)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(Trouble::from)?;
 
     let package = unpacked_into(&work.places);
     aj_package::extract(
@@ -331,7 +548,7 @@ async fn judge(
     let source = cache
         .fetch(server, &submitted.file_id, &submitted.sha256)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(Trouble::from)?;
 
     // **The whole of what a second problem type costs.** Everything above and
     // below is shared; this is the dispatch, and adding a third type is another
@@ -354,7 +571,7 @@ async fn judge(
                     work: work.places.join("scratch"),
                 })
                 .await;
-            finish(evaluated, &job.lease_token)
+            finish(evaluated, &job.lease_token).map_err(Trouble::from)
         }
 
         "output-only@1" => {
@@ -377,7 +594,8 @@ async fn judge(
                     "this problem has {} tests, so the answers arrive as an archive,                      and {} is not one",
                     tests.len(),
                     submitted.file_name,
-                ));
+                )
+                .into());
             };
 
             let judgement = aj_output_only::mark(&package.here, &package_config, &tests, &answers);
@@ -397,7 +615,7 @@ async fn judge(
             ))
         }
 
-        other => Err(format!("this Runner does not evaluate {other}")),
+        other => Err(format!("this Runner does not evaluate {other}").into()),
     }
 }
 
@@ -518,11 +736,58 @@ async fn attach(server: &Server, job: &ClaimedJob, attachments: Attachments) {
     }
 }
 
+/// How long an answer already computed is worth carrying.
+///
+/// **Bounded by the lease, not by a count.** Five fixed attempts five seconds
+/// apart gave up after twenty-odd seconds, which is shorter than any restart and
+/// far shorter than a backup — so an evaluation that had already finished was
+/// thrown away and the submission waited out a ten-minute lease to be judged
+/// again from nothing.
+///
+/// The bound that means something is the lease this Runner asked for: once it
+/// has certainly elapsed, another Runner may hold the job, and this answer is no
+/// longer wanted. Sending past it is not dangerous — the Server refuses it as a
+/// stale lease — but holding a Runner off the queue for an answer nobody wants
+/// is.
+struct KeepTrying {
+    backoff: Backoff,
+    until: tokio::time::Instant,
+}
+
+impl KeepTrying {
+    fn for_a_lease(config: &Config) -> Self {
+        Self {
+            // From five seconds rather than from the poll floor: this is not
+            // polling an empty queue, it is a Server that just refused, and a
+            // one-second retry against one that is deliberately down is noise.
+            backoff: Backoff::new(FIVE, THIRTY),
+            until: tokio::time::Instant::now()
+                + Duration::from_secs(u64::from(config.lease_seconds)),
+        }
+    }
+
+    /// How long to wait before sending again, or `None` when it is time to stop.
+    fn or_give_up(&mut self, e: &aj_protocol::Error) -> Option<Duration> {
+        if !e.retryable() {
+            return None;
+        }
+        let delay = how_long(e, &mut self.backoff);
+        (tokio::time::Instant::now() + delay < self.until).then_some(delay)
+    }
+}
+
 /// Reporting is idempotent on the lease token, so resending after a dropped
 /// connection is safe — and it is the only way a Runner that computed an answer
 /// and then lost the network does not throw that work away.
-async fn report_with_retries(server: &Server, job: &ClaimedJob, report: &ReportResult) {
-    for attempt in 1..=REPORT_ATTEMPTS {
+async fn report_with_retries(
+    server: &Server,
+    job: &ClaimedJob,
+    report: &ReportResult,
+    config: &Config,
+) {
+    let mut keep = KeepTrying::for_a_lease(config);
+
+    loop {
         match server.report(&job.job_id, report).await {
             Ok(accepted) => {
                 tracing::info!(
@@ -540,14 +805,26 @@ async fn report_with_retries(server: &Server, job: &ClaimedJob, report: &ReportR
                 tracing::warn!(job = %job.job_id, %e, "the lease was gone; the work is dropped");
                 return;
             }
-            Err(e) if e.retryable() && attempt < REPORT_ATTEMPTS => {
-                tracing::warn!(%e, attempt, "the report did not land; sending it again");
-                tokio::time::sleep(FIVE).await;
-            }
-            Err(e) => {
-                tracing::error!(job = %job.job_id, %e, "the report was refused");
-                return;
-            }
+            Err(e) => match keep.or_give_up(&e) {
+                Some(delay) => {
+                    tracing::warn!(
+                        job = %job.job_id,
+                        %e,
+                        ?delay,
+                        maintenance = e.in_maintenance(),
+                        "the report did not land; holding on to it",
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                None => {
+                    tracing::error!(
+                        job = %job.job_id,
+                        %e,
+                        "the report could not be delivered; the lease will requeue the job",
+                    );
+                    return;
+                }
+            },
         }
     }
 }
@@ -587,11 +864,145 @@ fn total_memory_bytes() -> Option<u64> {
 
 const FIVE: Duration = Duration::from_secs(5);
 const THIRTY: Duration = Duration::from_secs(30);
-const REPORT_ATTEMPTS: u32 = 5;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use aj_protocol::error::Refusal;
+
+    fn refused(status: u16, code: &str, retry_after: Option<Duration>) -> aj_protocol::Error {
+        aj_protocol::Error::Refused {
+            status,
+            refusal: Box::new(Refusal {
+                code: Some(code.to_owned()),
+                ..Default::default()
+            }),
+            retry_after,
+        }
+    }
+
+    /// **The rule a participant would feel.**
+    ///
+    /// A package that could not be downloaded because an operator started a
+    /// backup is not a submission that failed. Before this split existed every
+    /// error inside `judge` became one string and every string became an
+    /// infrastructure failure written against the attempt — so the window closed
+    /// somebody's submission for them.
+    #[test]
+    fn a_server_that_went_away_is_not_something_to_report() {
+        assert!(matches!(
+            Trouble::from(refused(503, "server.maintenance", None)),
+            Trouble::Away(_),
+        ));
+        // A proxy in front of a Server that is simply gone reads the same way.
+        assert!(matches!(
+            Trouble::from(refused(504, "", None)),
+            Trouble::Away(_),
+        ));
+        // And so does a rate limit, which used to end the process.
+        assert!(matches!(
+            Trouble::from(refused(429, "", None)),
+            Trouble::Away(_),
+        ));
+
+        // What did arrive and was wrong stays ours to report. Waiting would not
+        // fix it, and staying silent would leave the attempt hanging until its
+        // lease ran out for no reason.
+        assert!(matches!(
+            Trouble::from(aj_protocol::Error::ChecksumMismatch {
+                what: "package.zip".into(),
+                expected: "aa".into(),
+                actual: "bb".into(),
+            }),
+            Trouble::Machinery(_),
+        ));
+        assert!(matches!(
+            Trouble::from(refused(409, "job.state", None)),
+            Trouble::Machinery(_),
+        ));
+    }
+
+    #[test]
+    fn the_servers_own_wait_is_honoured_only_where_it_asks_for_longer() {
+        let mut backoff = Backoff::new(FIVE, THIRTY);
+        assert_eq!(
+            how_long(
+                &refused(503, "", Some(Duration::from_secs(300))),
+                &mut backoff
+            ),
+            Duration::from_secs(300),
+            "an operator asking for five minutes is taken at their word",
+        );
+
+        // **A proxy answering `Retry-After: 0` must not turn a retry into a
+        // spin** against a Server that is deliberately trying to be down.
+        let mut backoff = Backoff::new(FIVE, THIRTY);
+        let floor = how_long(&refused(503, "", Some(Duration::ZERO)), &mut backoff);
+        assert!(
+            floor >= Duration::from_secs(4),
+            "{floor:?} is faster than this Runner's own floor",
+        );
+
+        // And with nothing asked for, the backoff decides on its own.
+        let mut backoff = Backoff::new(FIVE, THIRTY);
+        assert!(how_long(&refused(503, "", None), &mut backoff) >= Duration::from_secs(4));
+    }
+
+    /// Nothing computed is thrown away inside a window, and nothing is held
+    /// past the point where somebody else may already have the job.
+    #[test]
+    fn an_answer_is_carried_for_the_length_of_a_lease_and_no_longer() {
+        let config = lease_of(600);
+        let mut keep = KeepTrying::for_a_lease(&config);
+
+        // The first refusals are worth waiting through — this is the case that
+        // used to give up after five attempts, about twenty seconds, which is
+        // shorter than any restart.
+        for _ in 0..6 {
+            assert!(
+                keep.or_give_up(&refused(503, "server.maintenance", None))
+                    .is_some(),
+                "an answer already computed is worth holding on to",
+            );
+        }
+
+        // A refusal the Server means is not waited on at all.
+        assert!(keep
+            .or_give_up(&refused(403, "runner.revoked", None))
+            .is_none());
+
+        // And once the lease has certainly gone, so has the point.
+        let mut expired = KeepTrying::for_a_lease(&lease_of(0));
+        assert!(
+            expired
+                .or_give_up(&refused(503, "server.maintenance", None))
+                .is_none(),
+            "holding a Runner off the queue for an answer nobody wants",
+        );
+    }
+
+    fn lease_of(seconds: u32) -> Config {
+        Config {
+            base_url: "http://server/api/v1".into(),
+            name: "test".into(),
+            key_path: "/dev/null".into(),
+            problem_types: vec!["standard-io@1".into()],
+            poll_min: FIVE,
+            poll_max: THIRTY,
+            heartbeat: THIRTY,
+            lease_seconds: seconds,
+            cache_path: "/dev/null".into(),
+            cache_max_bytes: 0,
+            work_path: "/dev/null".into(),
+            work_host_path: "/dev/null".into(),
+            images: aj_standard_io::Images {
+                cpp: String::new(),
+                python: String::new(),
+            },
+            allow_cgroup_v1: false,
+        }
+    }
 
     /// **Two jobs share no mounted path.**
     ///
