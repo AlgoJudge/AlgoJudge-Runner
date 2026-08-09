@@ -3,7 +3,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aj_protocol::wire::{AttachToJob, ClaimedJob, Register, ReportResult};
+use aj_protocol::wire::{
+    AttachToJob, ClaimedJob, ClaimedTrial, Register, ReportResult, TrialReport,
+};
 use aj_protocol::{Backoff, Cache, Identity, Server};
 use aj_standard_io::{Evaluated, Pipeline, Places};
 
@@ -91,6 +93,21 @@ pub async fn work(
             }
             // An empty queue is the ordinary state of a Runner, not a fault.
             Ok(None) => {
+                // **Only when there is no marking to do.** A trial produces
+                // timings for somebody who asked; a job decides somebody's
+                // grade. Asking for trials first would let a busy trial queue
+                // delay a verdict, which is the one thing the separate table
+                // exists to prevent.
+                match server.claim_trial(Some(config.lease_seconds)).await {
+                    Ok(Some(trial)) => {
+                        backoff.reset();
+                        run_trial(server, cache, pipeline, config, trial).await;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(%e, "could not ask for a trial"),
+                }
+
                 if last_beat.elapsed() >= config.heartbeat {
                     if let Err(e) = server.heartbeat().await {
                         tracing::warn!(%e, "the heartbeat did not land");
@@ -113,6 +130,98 @@ pub async fn work(
             }
             Err(e) => anyhow::bail!("claiming was refused: {e}"),
         }
+    }
+}
+
+/// Measures a package's own model solutions and says what they cost.
+///
+/// **No verdict, no score, no attachments.** A trial answers "how long does
+/// this take" — reporting anything shaped like a result would invite a screen
+/// to render it as one.
+async fn run_trial(
+    server: &Arc<Server>,
+    cache: &Arc<Cache>,
+    pipeline: &Pipeline<aj_sandbox::Docker>,
+    config: &Config,
+    trial: ClaimedTrial,
+) {
+    tracing::info!(
+        trial = %trial.trial_id,
+        problem_type = %trial.problem_type,
+        lease_expires_at = %trial.lease_expires_at,
+        "claimed a trial",
+    );
+
+    let report = match measure_trial(server, cache, pipeline, config, &trial).await {
+        Ok(measured) => TrialReport {
+            lease_token: trial.lease_token.clone(),
+            measurement: Some(measured),
+            failure_reason: None,
+        },
+        Err(reason) => {
+            tracing::error!(trial = %trial.trial_id, reason, "the trial failed");
+            TrialReport {
+                lease_token: trial.lease_token.clone(),
+                measurement: None,
+                failure_reason: Some(reason),
+            }
+        }
+    };
+
+    // Reported either way: the Server deletes the package when it hears, so a
+    // trial nobody reports leaves bytes behind until the reaper gives up on it.
+    match server.report_trial(&trial.trial_id, &report).await {
+        Ok(accepted) => tracing::info!(
+            trial = %trial.trial_id,
+            state = %accepted.state,
+            duplicate = accepted.duplicate,
+            "trial reported",
+        ),
+        Err(e) => tracing::error!(trial = %trial.trial_id, %e, "the trial report did not land"),
+    }
+}
+
+/// Unpacks, measures, and hands back the document as the format states it.
+async fn measure_trial(
+    server: &Server,
+    cache: &Arc<Cache>,
+    pipeline: &Pipeline<aj_sandbox::Docker>,
+    config: &Config,
+    trial: &ClaimedTrial,
+) -> Result<String, String> {
+    let work = Scratch::new(&config.work_path, &config.work_host_path, &trial.trial_id)?;
+
+    let archive = cache
+        .fetch(server, &trial.package_file_id, &trial.package_sha256)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let package = work.places.join("package");
+    aj_package::extract(
+        archive.path(),
+        &package.here,
+        &aj_package::ArchiveLimits::default(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let declared = std::fs::read_to_string(package.here.join("config.yml"))
+        .map_err(|e| format!("config.yml could not be read: {e}"))?;
+
+    // The same dispatch as judging, on the same string. A type this Runner does
+    // not know is refused rather than guessed at.
+    match trial.problem_type.as_str() {
+        "standard-io@1" => {
+            let package_config = aj_package::Config::parse(&declared).map_err(|e| e.to_string())?;
+            let tests = aj_package::TestSet::read(&package.here, &package_config)
+                .map_err(|e| e.to_string())?;
+
+            let measured =
+                aj_standard_io::measure(pipeline, &package_config, &tests, &package, &work.places)
+                    .await?;
+
+            serde_json::to_string(&measured).map_err(|e| e.to_string())
+        }
+        other => Err(format!("this Runner does not measure {other}")),
     }
 }
 

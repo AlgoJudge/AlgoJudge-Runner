@@ -467,3 +467,69 @@ async fn the_committed_package_judges_a_correct_solution() {
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
     assert_eq!(document["tests"].as_array().unwrap().len(), 5);
 }
+
+/// Measuring the committed package's own model solutions.
+///
+/// The end of the calibration chain: two model solutions, two languages, and a
+/// row per group per language — which is what makes "one `.cpp` sets the limits
+/// for everybody" a *choice* rather than the only thing possible.
+///
+/// Uses `fixtures/sum`, the package that ships, so this fails if the format and
+/// the code ever part company.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_trial_measures_every_model_solution_per_group() {
+    let pipeline = pipeline().await;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/sum");
+    let on_host = match std::env::var("AJ_HOST_WORKDIR") {
+        Ok(host) => {
+            let separator = if host.contains('\\') { "\\" } else { "/" };
+            PathBuf::from(host).join(format!("fixtures{separator}sum"))
+        }
+        Err(_) => root.clone(),
+    };
+    let package = Places {
+        here: root.clone(),
+        on_host,
+    };
+
+    let declared = std::fs::read_to_string(root.join("config.yml")).unwrap();
+    let config = Config::parse(&declared).unwrap();
+    let tests = TestSet::read(&root, &config).unwrap();
+
+    let measured = aj_standard_io::measure(&pipeline, &config, &tests, &package, &work("trial"))
+        .await
+        .expect("the package's own model solutions should measure");
+
+    assert!(!measured.measured.is_empty(), "nothing was measured");
+
+    // Two models, so every row names its language: a row without one would be
+    // the package's own limit, which is not what two references produce.
+    assert!(
+        measured.measured.iter().all(|m| m.language.is_some()),
+        "with several models every row names a language: {:?}",
+        measured.measured,
+    );
+
+    let languages: std::collections::BTreeSet<_> = measured
+        .measured
+        .iter()
+        .filter_map(|m| m.language.clone())
+        .collect();
+    assert_eq!(
+        languages,
+        ["cpp".to_owned(), "python".to_owned()]
+            .into_iter()
+            .collect(),
+        "both declared model solutions should have been run",
+    );
+
+    // A measurement of nothing is not a measurement. Every group that has tests
+    // reports a time, and time is never zero for a program that actually ran.
+    assert!(
+        measured.measured.iter().all(|m| m.time_ms > 0),
+        "a measured group with no time did not run: {:?}",
+        measured.measured,
+    );
+}
