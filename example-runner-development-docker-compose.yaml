@@ -69,9 +69,21 @@ services:
       AJ_Poll__MinSeconds: "1"
       AJ_Poll__MaxSeconds: "5"
       RUST_LOG: info,aj_protocol=debug
+      # Scratch, as the **daemon** sees it. It has to match the host side of the
+      # bind mount below: the Runner starts sibling containers and hands them
+      # paths, and the daemon resolves those — a path only this container knows
+      # produces an empty directory rather than an error.
+      AJ_Work__Path: /var/lib/algojudge-runner/work
+      AJ_Work__HostPath: ${PWD}/.runner-work
     volumes:
       - algojudge_runner_dev_identity:/var/lib/algojudge-runner
       - algojudge_runner_dev_cache:/var/cache/algojudge-runner
+      - ${PWD}/.runner-work:/var/lib/algojudge-runner/work
+      # The Runner is trusted and holds the socket; **nothing it starts ever
+      # does**. Mounting it read-only would restrict nothing that matters — the
+      # flag applies to the socket file, not to the API spoken over it — so the
+      # boundary is the host, which is treated as compromised by assumption.
+      - /var/run/docker.sock:/var/run/docker.sock
     # No ports. The Runner opens every connection itself, which is what lets a
     # real one live behind NAT with no inbound access at all.
 

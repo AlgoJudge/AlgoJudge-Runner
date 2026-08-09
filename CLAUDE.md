@@ -106,6 +106,17 @@ Rust is **not installed on the development host**; `cargo` runs in a container.
 Use the wrapper rather than calling `cargo` directly, so everyone builds against
 the same pinned toolchain.
 
+Two environment variables exist because the Runner starts **sibling**
+containers, and both are easy to lose an afternoon to:
+
+- `AJ_DOCKER_SOCKET=1` lets `./x` hand the build container the runtime socket,
+  which the isolation and judging suites need. Off by default, because anything
+  that can reach that socket is root on the host.
+- `AJ_Work__HostPath` is the job scratch directory **as the daemon sees it**. A
+  bind mount is resolved by the daemon, so a path that is real to a
+  containerised Runner and meaningless to the daemon produces an **empty
+  directory** rather than an error — and tests then run against nothing.
+
 When this repository is checked out inside the AlgoJudge workspace,
 `../PROJECT_CONTEXT.md` is the primary architecture context and takes precedence
 over this file — **except where it still names Judge0 as the first backend**,

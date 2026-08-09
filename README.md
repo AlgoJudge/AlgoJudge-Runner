@@ -5,13 +5,13 @@ Isolated execution and evaluation of submitted solutions for
 
 ## Status
 
-**The protocol, and nothing else yet.** This Runner registers, is approved,
-authenticates, claims jobs, holds and renews a lease, downloads and verifies
-packages, and reports results idempotently. It does **not** compile or run
-anything — the verdict it reports is fabricated, on purpose, so that the
-protocol could be finished and proven before a sandbox existed.
+**It judges.** This Runner registers, is approved, authenticates, claims jobs,
+holds and renews a lease, downloads and verifies packages, unpacks them,
+compiles and runs a submission in isolated containers, scores it by groups, and
+reports the mark with the compiler's log and a per-test table attached.
 
-Evaluation is the next milestone.
+`standard-io@1`, in C++ and Python. What is not here yet: the forbidden-word
+dictionary, calibration from a model solution, and a second problem type.
 
 ## What it is for
 
@@ -57,6 +57,20 @@ container:
 ./x fmt
 ./x clippy
 ```
+
+## What proves it
+
+Nothing here is claimed without a test that runs it.
+
+| Suite | What it proves |
+|---|---|
+| `cargo test` | the pure parts — the checker contract, comparison, scoring, the archive defences |
+| `--test conformance` | the wire protocol, against a real Server, with this Runner as the client |
+| `--test adversarial` | the isolation, against real containers, one case per attack |
+| `--test judging` | a real submission compiled, run and marked — the only test that proves the whole thing |
+
+The last three need a container runtime and are `#[ignore]`d so an ordinary
+`./x test` stays fast. All of them run in CI.
 
 ## Isolation
 
