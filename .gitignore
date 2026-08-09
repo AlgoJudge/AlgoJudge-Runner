@@ -15,3 +15,8 @@
 
 # Job scratch for the development stack.
 /.runner-work/
+
+# Compose reads this for variable substitution beside the development stack,
+# and it holds the Server admin token. Never committed.
+/.env
+/.env.*

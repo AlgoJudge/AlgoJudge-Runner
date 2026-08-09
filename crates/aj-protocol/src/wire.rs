@@ -11,6 +11,67 @@
 
 use serde::{Deserialize, Serialize};
 
+// ── Whether the Server is serving ───────────────────────────────────────────
+
+/// What `/health` answers, at every level.
+///
+/// **It answers `200` even while the Server is refusing everything else**, which
+/// is what makes a window escapable: this is the one path a Runner can ask
+/// during one, and the answer says how far the Server has withdrawn and why.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Health {
+    pub status: String,
+    /// **Absent while the Server is open**, so a Runner built before maintenance
+    /// existed reads exactly the document it always read.
+    #[serde(default)]
+    pub maintenance: Option<Maintenance>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Maintenance {
+    /// `open` | `draining` | `closed`.
+    ///
+    /// A string rather than an enum, and matched rather than parsed: a level
+    /// this Runner has never heard of must not be a parse failure, because the
+    /// safe reading of an unknown level is "not open" and an error would be
+    /// "the Server is broken".
+    pub level: String,
+    /// When the operator asked, as the Server states it. Shown, never computed
+    /// with — the two clocks are not the same clock.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// What the operator typed. Repeated into the log verbatim.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl Health {
+    /// Whether there is any point asking for work.
+    ///
+    /// `draining` counts as closed here even though the Server would still take
+    /// a report: it hands out nothing new, so a Runner with empty hands has
+    /// nothing to do but wait.
+    pub fn open(&self) -> bool {
+        match &self.maintenance {
+            None => true,
+            Some(maintenance) => maintenance.level == "open",
+        }
+    }
+
+    pub fn level(&self) -> &str {
+        self.maintenance
+            .as_ref()
+            .map(|m| m.level.as_str())
+            .unwrap_or("open")
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        self.maintenance.as_ref()?.reason.as_deref()
+    }
+}
+
 // ── Registration ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]

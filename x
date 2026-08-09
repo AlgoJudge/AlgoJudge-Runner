@@ -54,8 +54,19 @@ docker build -q -t "$IMAGE" -f Dockerfile.toolchain . >/dev/null
 # Joining the stack's own network is how the conformance suite reaches a Server
 # that publishes no port to the outside — which is the case in CI, and is the
 # arrangement a real deployment has anyway.
+#
+# `container:<name>` is also accepted, and one test needs it: the maintenance
+# switch answers only to a caller on the **Server's own loopback interface**, so
+# sharing that container's network namespace is the only way a test can be one
+# without a shell inside it. `--add-host` is dropped in that mode because the
+# daemon refuses the two together, and it means nothing there anyway — the
+# namespace is somebody else's.
+HOST_ALIAS='--add-host=host.docker.internal:host-gateway'
 if [ -n "${AJ_DOCKER_NETWORK:-}" ]; then
     NETWORK="--network=$AJ_DOCKER_NETWORK"
+    case "$AJ_DOCKER_NETWORK" in
+        container:*) HOST_ALIAS='' ;;
+    esac
 else
     NETWORK=''
 fi
@@ -99,10 +110,11 @@ run() {
         -e CARGO_HOME=/cargo \
         -e CARGO_TERM_COLOR=always \
         -e AJ_TEST_SERVER \
+        -e AJ_ADMIN_TOKEN \
         -e AJ_SANDBOX_ALLOW_CGROUP_V1 \
         -e RUST_LOG \
         -e "AJ_HOST_WORKDIR=$HOST_DIR" \
-        --add-host=host.docker.internal:host-gateway \
+        $HOST_ALIAS \
         "$IMAGE" "$@"
 }
 
