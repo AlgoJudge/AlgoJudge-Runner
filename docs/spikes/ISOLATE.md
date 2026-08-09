@@ -2,154 +2,138 @@
 
 > D-6 accepted `isolate` 2.x **provisionally**, pending a spike on cgroup
 > delegation and the capabilities it requires inside a non-privileged container.
-> This is that spike's result so far. Run on 2026-08-09.
+> This is the result. Run 2026-08-09 on cgroup v2, kernel `6.18.33.2`.
 >
-> Harness: `spikes/isolate/`. Every line below came from running something; the
-> probe is committed so the numbers can be disputed by re-running them rather
-> than by argument.
+> Harness: `spikes/isolate/`. Every number below came from running something,
+> and the probe is committed so they can be disputed by re-running rather than
+> by argument.
 
-Legend: **VF** verified by running · **UP** upstream's own statement, cited ·
-**OQ** open · **AI** architectural tension.
+Legend: **VF** verified by running · **UP** upstream's own words, cited ·
+**R** recommendation.
 
 ---
 
-## 1. The short version
+## 1. The answer
 
-**Two of the three questions are answered, and the answer to the capability
-question is better than upstream leads you to expect.** `isolate` runs a program
-in a **non-privileged** container with exactly two added capabilities. It does
-not need `--privileged`.
+**`isolate` works, and it is no longer worth adopting for the reason it was
+accepted.**
 
-**The cgroup question is not answered**, because the development host cannot
-answer it: it runs cgroup v1 and `isolate` 2.x requires v2. That is a property
-of the host, not a finding about `isolate`, and it is stated here rather than
-guessed at.
+Both halves are verified. It runs in a **non-privileged** container and reports
+CPU time, wall time and cgroup peak memory. And **the container pipeline already
+reports the same things, at zero privilege cost** — which is what D-6 said
+`isolate` was for.
 
-## 2. What was verified by running
+## 2. `isolate` in a non-privileged container — it works
 
-| | Result |
+**VF** — with `--cap-add=SYS_ADMIN --cap-add=NET_ADMIN` and a self-delegated
+cgroup v2 subtree, on a program allocating 64 MiB and burning some CPU:
+
+```
+time:0.102   time-wall:0.121   cg-mem:66008   max-rss:66920   exitcode:0
+```
+
+`--privileged` was tried and changes nothing, so **UP** `isolate.1.txt:406` —
+*"you probably have to make them privileged"* — is not what we measured.
+
+**VF — the minimum capability set is `CAP_SYS_ADMIN` + `CAP_NET_ADMIN`**, found
+by walking the ladder and letting each rung name itself:
+
+| profile | what stopped it |
 |---|---|
-| **VF** `isolate --run`, container with `--cap-drop=ALL --security-opt=no-new-privileges --user 65534` | **`Must be started as root`** — `no-new-privileges` voids the setuid bit, so `isolate` cannot become root even though the binary is setuid |
-| **VF** default Docker capabilities (no `CAP_SYS_ADMIN`) | **`Cannot run proxy, clone failed: Operation not permitted`** — the namespace `clone()` is refused |
-| **VF** `--cap-add=SYS_ADMIN` | further, then **`SIOCSIFFLAGS on 'lo' failed`** — bringing up loopback in the new netns needs more |
-| **VF** `--cap-add=SYS_ADMIN --cap-add=NET_ADMIN` | **works**: `hello from the box OK (0.003 sec real, 0.003 sec wall)` |
-| **VF** `--privileged` | same result, no better. **Privilege buys nothing here** |
+| our sandbox profile (`cap-drop=ALL`, `no-new-privileges`, `user 65534`) | `Must be started as root` — `no-new-privileges` voids the setuid bit |
+| Docker defaults (no `CAP_SYS_ADMIN`) | `Cannot run proxy, clone failed: Operation not permitted` |
+| `+SYS_ADMIN` | `SIOCSIFFLAGS on 'lo' failed` — loopback in the new netns |
+| `+SYS_ADMIN +NET_ADMIN` | nothing; it runs |
 
-**VF — the minimum capability set for the non-cgroup path is `CAP_SYS_ADMIN` +
-`CAP_NET_ADMIN`.** Found by walking the ladder, each rung named by the error it
-produced rather than by reading a manual.
+`CAP_SYS_ADMIN` is also what the source asks for: `rules.c:367` —
+`cap_value_t cap_list[] = { CAP_SYS_ADMIN };`, commented at `rules.c:474` as
+*"needed for mount"*.
 
-That `CAP_SYS_ADMIN` is required is also what the source says:
-`rules.c:367` — `cap_value_t cap_list[] = { CAP_SYS_ADMIN };`, and the comment at
-`rules.c:474` gives the reason: *"needed for mount"*.
+### Delegation is two steps, and the second fails silently
 
-## 3. Why the cgroup question could not be answered here
+A mounted `cgroup2` is **not** a delegated one, and this is where the spike spent
+most of its time. What systemd's `Delegate=yes` does for the packaged install has
+to be done by hand:
 
-**VF** — the host is cgroup **v1**. `docker info` reports `CgroupVersion: 1`;
-kernel `5.15.133.1-microsoft-standard-WSL2`; Docker `24.0.7`.
+1. controllers are switched on for children by writing `cgroup.subtree_control`;
+2. **that write is refused while the cgroup still holds processes** — and it is
+   refused *silently*, leaving the file empty rather than returning an error.
 
-The kernel is not the obstacle in itself — `/proc/filesystems` lists `cgroup2`
-and mounting it succeeds. The obstacle is that **a controller lives in exactly
-one hierarchy at a time**, and all fourteen are on v1:
+So the container's own processes are moved into a sibling cgroup first, and only
+then does the subtree carry `memory.events`, `memory.max`, `memory.peak`,
+`cpu.stat` and `cpuset.cpus`. Without step 2 `isolate` gets as far as creating
+its box and fails on `Cannot open …/memory.events`, which reads like a missing
+controller rather than a delegation that never happened.
 
-```
-cpuset hierarchy=1   cpu hierarchy=2   memory hierarchy=5   pids hierarchy=12  …
-```
+One more trap, cheap to hit: **a cgroup pseudo-file reports `st_size` zero
+however much it holds**, so `[ -s cgroup.controllers ]` calls every host v1. Test
+the content.
 
-So a `cgroup2` mount here is real and **empty**: `cgroup.controllers` is
-**0 bytes**. `isolate` then gets as far as creating its group and fails where the
-first controller file is read:
+## 3. Why it is not worth adopting for measurement
 
-```
-isolate --cg --init   rc=0
-isolate --cg --run    rc=2  hello from the box
-                            Cannot open /cg2/isolate/box-0/memory.events: No such file or directory
-```
-
-The program *ran* — the failure is measurement, not containment.
-
-**One trap worth naming.** The same run reports `max-rss:1572`, and it would be
-easy to read that as peak memory working. It is not: `max-rss` comes from
-`getrusage()`, not from a controller — it is one process's resident set, not the
-peak of everything the submission started. The number D-6 was accepted for is the
-cgroup one, and that one is **absent**.
-
-## 4. What upstream says, cited
-
-- **UP** `NEWS:123` — *"This version runs only on systems supporting CGroup v2 …
-  If you need to stick with CGroup v1, please use Isolate 1.10.1."*
-- **UP** `isolate.1.txt` — *"Reporting memory usage requires Linux kernel 5.19 or
-  newer."* This host runs **5.15**, so even on a v2 host this kernel would not
-  give the number.
-- **UP** `isolate.1.txt:406` — *"Running Isolate in containers is not
-  recommended, since container managers usually do not delegate control groups
-  properly. Besides, you do not want to share the machine with other workloads,
-  which would influence measurement of execution time. If you still want to use
-  containers, you are on your own and you probably have to make them
-  privileged."*
-
-That last sentence is **contradicted by §2 for the non-cgroup path**: two
-capabilities were enough and privilege changed nothing. Whether it holds for the
-cgroup path is exactly what is still open.
-
-- **UP** `isolate-check-environment` on this host wants swap off, SMT off, ASLR
-  off and transparent hugepages off, and warns that **without swap accounting
-  `isolate` cannot enforce memory limits**. These are not container settings.
-  They describe a **dedicated, tuned evaluation host** — which is the same
-  conclusion `docs/SECURITY.md` §1 reaches from the other direction.
-
-## 5. The tension this creates with D-5
-
-**AI** — D-5 rejects privileged containers because *the privilege the
-infrastructure needs is the privilege an escapee inherits*. `CAP_SYS_ADMIN` is
-not `--privileged`, but it is the capability that allows mounting, and a
-container that has it is widely treated as one escape away from the host.
-
-So the honest shape of the trade is: **`isolate` would be an inner boundary
-bought by weakening the outer one.** Whether that is worth it depends on a
-number this spike has not yet produced — how much better the measurement
-actually is — which is why the remaining work is worth doing before deciding.
-
-Two deployments avoid the trade entirely and should be compared against it:
-`isolate` on the **host** with the Runner as a host process, which is how
-upstream ships it (a systemd unit delegating `isolate.scope`); or the current
-container-only pipeline, which measures wall clock honestly and peak memory not
-at all.
-
-## 6. What is still open
-
-**OQ 1 — does `isolate --cg` work in a non-privileged container on a cgroup v2
-host?** Needs `--cgroupns=private` and a writable delegated subtree. The
-capability set in §2 may grow; that is the point of running it.
-
-**OQ 2 — are the numbers better?** Peak memory and CPU time from `isolate`
-against what the container pipeline reports today, on the same programs. D-6 was
-accepted for this and it has never been measured.
-
-**OQ 3 — does `CAP_SYS_ADMIN` survive review** against D-5, given the answer to
-OQ 2.
-
-## 7. How to finish it
-
-The probe is the deliverable, not a description of one:
+**VF** — the same workload, in a container under **our full production sandbox
+profile** — `--cap-drop=ALL --security-opt=no-new-privileges --user 65534:65534`,
+**no added capability at all**:
 
 ```
-docker build -t aj-isolate-spike spikes/isolate
-docker run --rm --cap-add=SYS_ADMIN --cap-add=NET_ADMIN aj-isolate-spike
+memory.peak = 69492736 B  (67 864 KiB)
+cpu.stat: usage_usec 124786   user_usec 65859   system_usec 58926
 ```
 
-It prints the host's cgroup version first, so a run on the wrong host is obvious
-rather than misleading. On a v2 host it takes the delegated-subtree path by
-itself and reports the three numbers that matter — time, wall time and peak
-memory — or says which is absent.
+That is the honest peak memory and the honest CPU time, read from the container's
+own cgroup, with nothing granted. D-6's rationale was that `isolate` *"yields
+correct CPU-time and peak-memory numbers instead of reimplementing accounting"*.
+On a cgroup v2 host, so does the cgroup, and we are already on one.
 
-**Before re-running, the host needs**: cgroup v2 (`docker info` must report `2`)
-and kernel **≥ 5.19** for the memory number. On this workstation that means
-updating WSL and Docker Desktop; `wsl --update` moves the kernel, and it is
-Docker Desktop's own distribution — not the user's Ubuntu — that decides how the
-cgroup hierarchies are mounted.
+The two measurements are of the same order and not identical — `isolate` measures
+its box, the container figure includes the shell that started the program — so
+they are comparable in kind, not to the millisecond.
 
-**Fallback, per the plan.** If delegation turns out to need privileges the
-container must not have, the container path stays and this document says why.
-That is a result, not a failure — and §2 has already narrowed what "privileges"
-would mean.
+### One wrinkle that decides how the Runner reads it
+
+**VF — Docker's stats API does not expose peak memory on cgroup v2.**
+`memory_stats` carries only `limit` and `usage`, and `usage` sampled after the
+program finished read 1.7 MB against a real peak of 67.9 MiB. CPU time *is*
+there: `cpu_usage.total_usage` 125 481 000 ns, agreeing with `cpu.stat`.
+
+So peak memory has to come from the cgroup file, not the API. Two ways, and the
+choice is a real one:
+
+- **The container reads its own** `/sys/fs/cgroup/memory.peak` after the program
+  exits — verified above, no race, no mount, but the reader sits beside untrusted
+  code and its output has to be treated accordingly.
+- **The Runner reads the sibling's cgroup from the host**, which needs a
+  read-only mount of `/sys/fs/cgroup` into the Runner — far weaker than
+  `CAP_SYS_ADMIN`, but it must happen before the container's cgroup is destroyed.
+
+## 4. What upstream wants regardless
+
+**UP** — `isolate-check-environment` on this host still asks for swap off, SMT
+off, ASLR off and transparent hugepages off, and warns that **without swap
+accounting memory limits are not enforced**. **UP** `isolate.1.txt` also warns
+against sharing the machine with other workloads.
+
+None of that is a container setting. It describes a dedicated, tuned evaluation
+host — the same conclusion `docs/SECURITY.md` §1 reaches from the security side,
+and it applies to the container pipeline just as much.
+
+## 5. Recommendation
+
+**R — close D-6 as "not adopted for the stated reason".** The measurement
+argument is spent: the numbers are available without granting anything, and
+`CAP_SYS_ADMIN` in a container that runs untrusted code is the capability that
+permits mounting. Buying an inner boundary by weakening the outer one is a poor
+trade when the thing it was bought for is free.
+
+**R — take the number, not the tool.** Read `memory.peak` and `cpu.stat` from the
+sandbox container's cgroup and report them. This unblocks memory calibration,
+which `PACKAGE_FORMAT.md` records as waiting on exactly this measurement, and it
+costs no capability.
+
+**R — reopen `isolate` only under a different argument.** Defence in depth and
+its syscall filtering are real, and neither has been measured here. That would be
+a new decision with its own evidence, not this one continued.
+
+**R — keep the preflight.** cgroup v2 stays required. Everything in §3 is a v2
+interface, so the check that refuses to start on v1 is now load-bearing for
+measurement, not only for `isolate`.

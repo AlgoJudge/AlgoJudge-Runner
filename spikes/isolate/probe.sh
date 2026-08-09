@@ -47,28 +47,39 @@ fi
 say ""
 
 say "== control-group mode =="
-# The question the spike exists for. Without a delegated subtree carrying the
-# controllers, isolate can create its group and still not measure anything.
+# The question the spike exists for.
+#
+# A mounted cgroup2 is not a delegated one. Two things have to happen that
+# systemd's `Delegate=yes` does for the packaged install, and neither is
+# obvious from a failure: the controllers must be switched on for children via
+# `cgroup.subtree_control`, and that write is **refused while the cgroup still
+# holds processes** — silently, leaving the file empty rather than erroring. So
+# the container's own processes move into a sibling first.
 CG_ROOT=""
-if [ -f /sys/fs/cgroup/cgroup.controllers ] && [ -s /sys/fs/cgroup/cgroup.controllers ]; then
-    # A delegated subtree of the container's own cgroup. `--cgroupns=private`
-    # plus a writable /sys/fs/cgroup is what makes this the container's to give.
-    if mkdir -p /sys/fs/cgroup/isolate 2>/dev/null; then
-        CG_ROOT=/sys/fs/cgroup/isolate
-    fi
-fi
+mkdir -p /cg2
+if mount -t cgroup2 none /cg2 2>/dev/null; then
+    kv "mounted cgroup2 at /cg2" "controllers=[$(cat /cg2/cgroup.controllers)]"
 
-if [ -z "$CG_ROOT" ]; then
-    # Falls back to mounting one, which is what shows *why* it does not work on
-    # a v1 host: the mount succeeds and is empty, because a controller lives in
-    # exactly one hierarchy and v1 already holds all of them.
-    mkdir -p /cg2
-    if mount -t cgroup2 none /cg2 2>/dev/null; then
-        kv "mounted cgroup2 at /cg2" "controllers=[$(cat /cg2/cgroup.controllers)]"
-        mkdir -p /cg2/isolate && CG_ROOT=/cg2/isolate
-    else
-        kv "mount -t cgroup2" "refused: $(mount -t cgroup2 none /cg2 2>&1 | head -1)"
+    # Empty here means a v1 host: the mount is real, and every controller lives
+    # in exactly one hierarchy, which v1 already holds.
+    #
+    # Tested by content, not by `[ -s ]`: a cgroup pseudo-file reports st_size
+    # zero however much it holds, so the size test calls every host v1.
+    if [ -n "$(cat /cg2/cgroup.controllers)" ]; then
+        mkdir -p /cg2/init
+        while read -r pid; do echo "$pid" > /cg2/init/cgroup.procs 2>/dev/null || true; done < /cg2/cgroup.procs
+        kv "processes left in the root" "$(wc -l < /cg2/cgroup.procs)  (must be 0 to delegate)"
+
+        echo "+cpuset +cpu +memory +pids" > /cg2/cgroup.subtree_control 2>/dev/null || true
+        kv "root subtree_control" "[$(cat /cg2/cgroup.subtree_control)]"
+
+        mkdir -p /cg2/isolate
+        echo "+cpuset +cpu +memory +pids" > /cg2/isolate/cgroup.subtree_control 2>/dev/null || true
+        kv "delegated to isolate/" "[$(cat /cg2/isolate/cgroup.controllers)]"
+        CG_ROOT=/cg2/isolate
     fi
+else
+    kv "mount -t cgroup2" "refused"
 fi
 
 if [ -n "$CG_ROOT" ]; then
