@@ -1,22 +1,22 @@
 //! The Runner.
 //!
-//! **It does not evaluate anything yet, and that is on purpose.** The verdict
-//! reported here is fabricated. Finishing the protocol first — registration,
-//! approval, the handshake, leasing, the cache, idempotent reporting — meant it
-//! could be proven against the accepted specification's conformance suite while
-//! the answer to "is this program correct" was still a constant. The evaluation
-//! pipeline replaces one function; everything around it is already right.
-
-mod config;
-mod run;
+//! Registration, approval, the handshake, leasing, the cache, idempotent
+//! reporting — and, through `aj-standard-io`, the evaluation itself.
+//!
+//! **The protocol was finished before anything was evaluated, and that order is
+//! worth knowing.** For a while the verdict reported here was a constant, which
+//! let every part of the contract be proven against the specification's
+//! conformance suite while "is this program correct" was still nobody's
+//! problem. The pipeline then replaced one function, and nothing around it
+//! moved.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use aj_protocol::{Cache, Identity, Server};
 use aj_sandbox::Sandbox as _;
 
-use crate::config::Config;
+use aj_runner::config::Config;
+use aj_runner::run;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -73,10 +73,4 @@ async fn main() -> anyhow::Result<()> {
     run::admitted(&server, &identity, &config).await?;
 
     run::work(&server, &cache, &pipeline, &config).await
-}
-
-/// Waits between attempts at something that may simply not be ready.
-pub(crate) async fn pause(what: &str, delay: Duration) {
-    tracing::info!(?delay, "waiting: {what}");
-    tokio::time::sleep(delay).await;
 }

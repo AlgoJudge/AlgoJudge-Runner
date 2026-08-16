@@ -25,8 +25,18 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# The lease test builds a real `Config` and speaks the protocol directly. Both
+# are ordinary dependencies of this crate already — an integration test can only
+# see what is declared here, so they are named twice rather than compiled twice.
+aj-protocol = { path = "../aj-protocol" }
+aj-standard-io = { path = "../aj-standard-io" }
 # Driving the Server as a manager and as a participant, which is a session and
 # a cookie rather than a Runner token.
 reqwest = { workspace = true, features = ["cookies", "multipart"] }
 hex.workspace = true
 sha2.workspace = true
+# The clock, stopped. Renewal is a timer against a ten-minute lease, and a test
+# that proved anything about it by waiting would take ten minutes to run.
+# `test-util` is not part of `full`, and it is wanted only here — a release build
+# must not carry the ability to pause time.
+tokio = { workspace = true, features = ["test-util"] }

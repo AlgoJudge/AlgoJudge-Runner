@@ -71,6 +71,19 @@ services:
       # waiting five minutes for it on every try teaches an operator that the
       # switch is broken.
       AJ_Maintenance__ForceAfterSeconds: "20"
+      # **Without this the Server refuses to start**, and has since 2026-08-13:
+      # where the files of a product go is not a thing to inherit from a default
+      # nobody read, so an installation that says nothing is told to say
+      # something. This file predates that and went on saying nothing, which is
+      # why the integration job could not bring a stack up at all.
+      #
+      # `postgres` because it needs no second service — the bytes go in the
+      # database this stack already runs, which is the right trade for a
+      # development stack and the wrong one for a deployment. `objects` is the
+      # default store id, so naming it that means no `Storage__Default` is
+      # needed. A real deployment configures `s3` or `filesystem`; see
+      # `docs/specs/FILE_STORAGE.md`.
+      AJ_Storage__Stores__objects__Kind: postgres
 
   runner:
     build:

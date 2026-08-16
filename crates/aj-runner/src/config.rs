@@ -105,7 +105,37 @@ impl Config {
             },
         })
     }
+
+    /// The lease the Server will actually grant, which is not always the one
+    /// asked for.
+    ///
+    /// **The clamp is the contract's, not a guess.** §5 of the accepted
+    /// Server–Runner API states `[60, 3600]`, and `wire::ClaimedJob` repeats it
+    /// where the answer is read. Anything counting locally on `lease_seconds`
+    /// is counting on a deadline the Server never agreed to: configure two
+    /// hours, be granted one, and a local bound of two hours outlives the lease
+    /// it was meant to track. That was true of the report loop until 2026-08-16.
+    ///
+    /// **`leaseExpiresAt` in the Server's answer is the authoritative value, and
+    /// it is deliberately not used here.** It is an absolute instant from the
+    /// Server's clock; comparing it against this host's would make every local
+    /// deadline a function of how well two machines agree about the time, and a
+    /// Runner is explicitly allowed to be a machine nobody administers closely.
+    /// A duration is immune to skew, an instant is not.
+    ///
+    /// Renewal needs neither: it runs on a timer and does no deadline
+    /// arithmetic at all, so the Server's answer stays the only deadline in
+    /// existence. This is for **local waiting**, which has to end somewhere.
+    pub fn lease_granted(&self) -> Duration {
+        Duration::from_secs(u64::from(
+            self.lease_seconds.clamp(LEASE_FLOOR, LEASE_CEILING),
+        ))
+    }
 }
+
+/// The Server's clamp on `leaseSeconds`, from §5 of the contract.
+const LEASE_FLOOR: u32 = 60;
+const LEASE_CEILING: u32 = 3600;
 
 fn var(key: &str) -> Option<String> {
     std::env::var(format!("AJ_{key}"))

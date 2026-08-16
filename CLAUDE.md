@@ -36,13 +36,15 @@ A Runner:
 
 ## The contract is accepted, and it is not here
 
-`AlgoJudge-Design/specifications/server-runner/SERVER_RUNNER_API.md`, v1.0,
-**`Accepted` 2026-08-08**. It is the contract; where this repository and that
-document disagree, **the document wins and the difference is reported** rather
-than worked around.
+`AlgoJudge-Design/specifications/server-runner/SERVER_RUNNER_API.md`, **v1.1**,
+**`Accepted` 2026-08-08, amended 2026-08-09** with §9 and unavailability. It is
+the contract; where this repository and that document disagree, **the document
+wins and the difference is reported** rather than worked around.
 
 Its conformance suite is `AlgoJudge.Server.Tests/RunnerConformanceTests.cs` in
-AlgoJudge-Server — nine cases a second implementation must also pass.
+AlgoJudge-Server — **ten cases** a second implementation must also pass. The
+tenth arrived on 2026-08-16, when a second implementation found the defect it
+was written for: a Runner marking out of one was read as a hundredth.
 
 Three things it **deliberately does not specify**, so nobody adds them back by
 accident:
