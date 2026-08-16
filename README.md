@@ -20,8 +20,8 @@ deliberately interchangeable: the Server must never depend on any particular
 Runner implementation, and several may coexist.
 
 The contract is
-`AlgoJudge-Design/specifications/server-runner/SERVER_RUNNER_API.md`, v1.0,
-**`Accepted` 2026-08-08**, with nine conformance cases in
+`AlgoJudge-Design/specifications/server-runner/SERVER_RUNNER_API.md`, **v1.1**,
+**`Accepted` 2026-08-08, amended 2026-08-09**, with ten conformance cases in
 `AlgoJudge.Server.Tests/RunnerConformanceTests.cs`.
 
 Three properties of it shape everything here:

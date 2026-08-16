@@ -1,11 +1,14 @@
 //! The Runner.
 //!
-//! **It does not evaluate anything yet, and that is on purpose.** The verdict
-//! reported here is fabricated. Finishing the protocol first — registration,
-//! approval, the handshake, leasing, the cache, idempotent reporting — meant it
-//! could be proven against the accepted specification's conformance suite while
-//! the answer to "is this program correct" was still a constant. The evaluation
-//! pipeline replaces one function; everything around it is already right.
+//! Registration, approval, the handshake, leasing, the cache, idempotent
+//! reporting — and, through `aj-standard-io`, the evaluation itself.
+//!
+//! **The protocol was finished before anything was evaluated, and that order is
+//! worth knowing.** For a while the verdict reported here was a constant, which
+//! let every part of the contract be proven against the specification's
+//! conformance suite while "is this program correct" was still nobody's
+//! problem. The pipeline then replaced one function, and nothing around it
+//! moved.
 
 mod config;
 mod keeper;
