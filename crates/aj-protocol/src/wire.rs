@@ -87,6 +87,21 @@ pub struct Register {
     /// Matched by string equality and never parsed, which is what keeps
     /// "adding a problem type is not a Server change" true.
     pub problem_types: Vec<String>,
+
+    /// Whether this Runner sends submissions **outside the installation**.
+    ///
+    /// **The Server pairs work with workers on this and the problem's own
+    /// flag, by equality**: external problems go to Runners that forward, local
+    /// problems to Runners that do not. A Runner that forwards and does not say
+    /// so is handed nothing and looks, from a log, exactly like one with an
+    /// empty queue — which is how an end-to-end run on 2026-08-16 spent ten
+    /// minutes before anybody noticed the field was missing here.
+    ///
+    /// Defaults to `false`, so a Runner that runs code where it stands says
+    /// nothing and means it.
+    #[serde(default)]
+    pub external: bool,
+
     /// Host facts, stored opaquely and only ever shown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine: Option<serde_json::Value>,

@@ -25,6 +25,8 @@ pub async fn admitted(server: &Server, identity: &Identity, config: &Config) -> 
         version: env!("CARGO_PKG_VERSION").into(),
         public_key: identity.public_key(),
         problem_types: config.problem_types.clone(),
+        // This one runs code where it stands. Nothing leaves.
+        external: false,
         machine: Some(machine()),
     };
 
