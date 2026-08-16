@@ -53,6 +53,7 @@ fn registration(identity: &Identity, name: &str) -> Register {
         product: "AlgoJudge-Runner-Conformance".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         public_key: identity.public_key(),
+        external: false,
         problem_types: vec!["standard-io@1".into()],
         machine: None,
     }
@@ -143,6 +144,7 @@ async fn a_key_that_is_not_thirty_two_bytes_is_refused() {
                 product: "AlgoJudge-Runner-Conformance".into(),
                 version: "0.0.1".into(),
                 public_key: public_key.into(),
+                external: false,
                 problem_types: vec!["standard-io@1".into()],
                 machine: None,
             })
