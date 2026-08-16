@@ -32,10 +32,17 @@
 //! infrastructure failure means the submission was never judged, and it is the
 //! one that must never be scored as a wrong answer.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+use aj_protocol::wire::ReportResult;
+use aj_protocol::{Identity, Server};
+use aj_runner::config::Config;
+use aj_runner::keeper::Keeper;
+use aj_runner::run;
 
 fn api() -> String {
     std::env::var("AJ_TEST_SERVER").unwrap_or_else(|_| "http://localhost:8080/api/v1".into())
@@ -839,4 +846,133 @@ async fn a_window_does_not_cost_a_participant_their_submission() {
         after["state"], "completed",
         "the Runner did not come back on its own after the window: {after}",
     );
+}
+
+/// **A lease outliving its own deadline, watched from outside.**
+///
+/// The one thing about renewal that unit tests cannot reach. `keeper`'s own
+/// tests drive a stopped clock and a stand-in for the Server; the conformance
+/// suite proves the endpoint. Neither proves the two wired together, and a lease
+/// being renewed looks exactly like one that has not expired yet — there is no
+/// output to read, so the only honest proof is to hold a job past the point
+/// where the Server would have taken it back, and then ask whose it is.
+///
+/// The shape:
+///
+/// - a problem of a type **no Runner in the stack handles**, so the job stays
+///   queued for this test rather than being judged out from under it;
+/// - a lease of sixty seconds, the shortest the Server grants, which the keeper
+///   renews every fifteen;
+/// - ninety-five seconds of waiting — past the deadline, and past the
+///   thirty-second sweep that would have reclaimed it;
+/// - `progress`, which the Server refuses with `runner.lease.stale` if this
+///   Runner is no longer the holder.
+///
+/// **Sabotaged by dropping the keeper** immediately after it is made: the wait
+/// then ends with `runner.lease.stale` and this fails, which is the whole point.
+#[tokio::test]
+#[ignore = "needs the development stack; deliberately spends about two minutes waiting"]
+async fn a_renewed_lease_outlives_the_deadline_it_was_granted() {
+    let admin = Session::as_("admin", "admin-development-only").await;
+
+    let activity = publish_of_type(&admin, fixture("squares.zip"), "lease-probe@1").await;
+
+    let participant = Session::as_("student", "student-development-only").await;
+    participant
+        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .await;
+    wait_until_open(&participant, &activity).await;
+    participant
+        .submit_file(&activity, "answers.zip", fixture("squares-answers.zip"))
+        .await;
+
+    let config = probe_config();
+    let server = Arc::new(Server::new(&config.base_url).expect("a Server"));
+    let identity = Identity::load_or_create(&config.key_path).expect("an identity");
+
+    // `admitted` registers and then waits to be approved, so approving has to
+    // happen while it waits. Repeated rather than timed once: this races the
+    // registration, and losing that race would hang the test rather than fail
+    // it.
+    let approving = tokio::spawn(async move {
+        let admin = Session::as_("admin", "admin-development-only").await;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            approve_the_runner(&admin).await;
+        }
+    });
+    run::admitted(&server, &identity, &config)
+        .await
+        .expect("this Runner was never admitted");
+    approving.abort();
+
+    let job = claim_the_probe(&server, &config).await;
+
+    let keeper = Keeper::hold_job(
+        Arc::clone(&server),
+        job.job_id.clone(),
+        job.lease_token.clone(),
+        &config,
+    );
+
+    tokio::time::sleep(Duration::from_secs(95)).await;
+
+    server
+        .progress(&job.job_id, &job.lease_token)
+        .await
+        .expect("the job was reclaimed while this Runner was still holding it");
+
+    drop(keeper);
+
+    // Left tidy rather than abandoned: an unreported job sits `Running` until
+    // its lease lapses and is then delivered four more times before the Server
+    // gives up on it. Saying plainly that nothing judged it costs one call.
+    server
+        .report(
+            &job.job_id,
+            &ReportResult::failed(&job.lease_token, "lease probe, never evaluated".to_owned()),
+        )
+        .await
+        .expect("reporting the probe");
+}
+
+/// A Runner that handles one type nothing else does, on the shortest lease the
+/// Server will grant.
+fn probe_config() -> Config {
+    let scratch = std::env::temp_dir().join(unique("lease-probe"));
+    Config {
+        base_url: api(),
+        name: unique("lease-probe"),
+        key_path: scratch.join("identity.key"),
+        problem_types: vec!["lease-probe@1".into()],
+        poll_min: Duration::from_secs(1),
+        poll_max: Duration::from_secs(5),
+        heartbeat: Duration::from_secs(60),
+        // Sixty is the Server's floor, so this is the fastest a lease can be
+        // made to matter — and it makes the keeper's interval fifteen seconds.
+        lease_seconds: 60,
+        cache_path: scratch.join("cache"),
+        cache_max_bytes: 0,
+        work_path: scratch.join("work"),
+        work_host_path: scratch.join("work"),
+        // Never used: nothing here evaluates anything.
+        images: aj_standard_io::Images {
+            cpp: String::new(),
+            python: String::new(),
+        },
+        allow_cgroup_v1: false,
+    }
+}
+
+/// The queue is not instant — the round opens on a scheduler's scan rather than
+/// on the request that created the submission.
+async fn claim_the_probe(server: &Server, config: &Config) -> aj_protocol::wire::ClaimedJob {
+    for _ in 0..60 {
+        match server.claim(Some(config.lease_seconds)).await {
+            Ok(Some(job)) => return job,
+            Ok(None) => tokio::time::sleep(Duration::from_secs(1)).await,
+            Err(e) => panic!("claiming the probe was refused: {e}"),
+        }
+    }
+    panic!("no lease-probe@1 job was queued within a minute");
 }

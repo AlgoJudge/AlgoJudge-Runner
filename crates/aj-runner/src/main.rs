@@ -10,17 +10,13 @@
 //! problem. The pipeline then replaced one function, and nothing around it
 //! moved.
 
-mod config;
-mod keeper;
-mod run;
-
 use std::sync::Arc;
-use std::time::Duration;
 
 use aj_protocol::{Cache, Identity, Server};
 use aj_sandbox::Sandbox as _;
 
-use crate::config::Config;
+use aj_runner::config::Config;
+use aj_runner::run;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -77,10 +73,4 @@ async fn main() -> anyhow::Result<()> {
     run::admitted(&server, &identity, &config).await?;
 
     run::work(&server, &cache, &pipeline, &config).await
-}
-
-/// Waits between attempts at something that may simply not be ready.
-pub(crate) async fn pause(what: &str, delay: Duration) {
-    tracing::info!(?delay, "waiting: {what}");
-    tokio::time::sleep(delay).await;
 }
