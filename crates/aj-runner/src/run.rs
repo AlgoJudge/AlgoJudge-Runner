@@ -10,6 +10,7 @@ use aj_protocol::{Backoff, Cache, Identity, Server};
 use aj_standard_io::{Evaluated, Pipeline, Places};
 
 use crate::config::Config;
+use crate::keeper::Keeper;
 use crate::pause;
 
 /// Registers, waits to be approved, and comes back holding a token.
@@ -240,6 +241,16 @@ async fn run_trial(
         "claimed a trial",
     );
 
+    // A trial runs every model solution against every test, so it is the work
+    // most likely to outlast a lease — and a reclaimed trial is measured twice
+    // on a machine that had better things to do.
+    let _keeper = Keeper::hold_trial(
+        Arc::clone(server),
+        trial.trial_id.clone(),
+        trial.lease_token.clone(),
+        config,
+    );
+
     let report = match measure_trial(server, cache, pipeline, config, &trial).await {
         Ok(measured) => TrialReport {
             lease_token: trial.lease_token.clone(),
@@ -373,6 +384,23 @@ async fn handle(
         "claimed",
     );
 
+    // **Held from here until the answer has landed**, which includes the report
+    // loop: a Server that took ten minutes to come back would otherwise have
+    // reclaimed the job by the time it accepted the result for it.
+    //
+    // The one moment this is imperfect is between a report being accepted and
+    // this being dropped a few microseconds later: the job has stopped being
+    // `Running`, so a renewal firing in that window is refused with `job.state`
+    // and logged as a lease that is gone. It is one line, once every few
+    // hundred thousand jobs, and the alternative — stopping the renewal before
+    // the report rather than after — is the failure this exists to prevent.
+    let keeper = Keeper::hold_job(
+        Arc::clone(server),
+        job.job_id.clone(),
+        job.lease_token.clone(),
+        config,
+    );
+
     let (report, attachments) = match evaluate(server, cache, pipeline, config, &job).await {
         Finished::Say(report, attachments) => (*report, attachments),
         Finished::Abandon => return,
@@ -384,6 +412,8 @@ async fn handle(
     attach(server, &job, attachments).await;
 
     report_with_retries(server, &job, &report, config).await;
+
+    drop(keeper);
 }
 
 /// What a finished attempt leaves the Runner holding.
@@ -744,11 +774,17 @@ async fn attach(server: &Server, job: &ClaimedJob, attachments: Attachments) {
 /// thrown away and the submission waited out a ten-minute lease to be judged
 /// again from nothing.
 ///
-/// The bound that means something is the lease this Runner asked for: once it
-/// has certainly elapsed, another Runner may hold the job, and this answer is no
-/// longer wanted. Sending past it is not dangerous — the Server refuses it as a
-/// stale lease — but holding a Runner off the queue for an answer nobody wants
-/// is.
+/// The bound that means something is the lease this Runner was **granted**:
+/// once it has certainly elapsed, another Runner may hold the job, and this
+/// answer is no longer wanted. Sending past it is not dangerous — the Server
+/// refuses it as a stale lease — but holding a Runner off the queue for an
+/// answer nobody wants is.
+///
+/// **Granted, not asked for.** This used to count from `lease_seconds`, which
+/// the contract warns against in as many words: the Server clamps the request to
+/// `[60, 3600]`, so a Runner configured for two hours would have retried for two
+/// against a lease that ended after one — the exact thing the sentence above
+/// says not to do.
 struct KeepTrying {
     backoff: Backoff,
     until: tokio::time::Instant,
@@ -761,8 +797,7 @@ impl KeepTrying {
             // polling an empty queue, it is a Server that just refused, and a
             // one-second retry against one that is deliberately down is noise.
             backoff: Backoff::new(FIVE, THIRTY),
-            until: tokio::time::Instant::now()
-                + Duration::from_secs(u64::from(config.lease_seconds)),
+            until: tokio::time::Instant::now() + config.lease_granted(),
         }
     }
 
@@ -951,8 +986,8 @@ mod tests {
 
     /// Nothing computed is thrown away inside a window, and nothing is held
     /// past the point where somebody else may already have the job.
-    #[test]
-    fn an_answer_is_carried_for_the_length_of_a_lease_and_no_longer() {
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_is_carried_for_the_length_of_a_lease_and_no_longer() {
         let config = lease_of(600);
         let mut keep = KeepTrying::for_a_lease(&config);
 
@@ -973,13 +1008,50 @@ mod tests {
             .is_none());
 
         // And once the lease has certainly gone, so has the point.
-        let mut expired = KeepTrying::for_a_lease(&lease_of(0));
+        let mut expired = KeepTrying::for_a_lease(&lease_of(600));
+        tokio::time::advance(Duration::from_secs(601)).await;
         assert!(
             expired
                 .or_give_up(&refused(503, "server.maintenance", None))
                 .is_none(),
             "holding a Runner off the queue for an answer nobody wants",
         );
+    }
+
+    /// **The lease the Server granted, not the one this Runner asked for.**
+    ///
+    /// `leaseSeconds` is clamped to `[60, 3600]`, so an installation configured
+    /// for two hours holds its job for one. Counting from the request meant
+    /// retrying for an hour after the job had already gone back on the queue and
+    /// possibly been judged by somebody else — with this Runner off the queue
+    /// throughout, waiting to deliver an answer nobody would accept.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_is_not_carried_past_the_lease_the_server_would_grant() {
+        let mut keep = KeepTrying::for_a_lease(&lease_of(7200));
+
+        // Just inside the hour the Server would have granted.
+        tokio::time::advance(Duration::from_secs(3500)).await;
+        assert!(
+            keep.or_give_up(&refused(503, "server.maintenance", None))
+                .is_some(),
+            "an answer was given up on while the lease was still held",
+        );
+
+        // And just past it, whatever the configuration asked for.
+        tokio::time::advance(Duration::from_secs(200)).await;
+        assert!(
+            keep.or_give_up(&refused(503, "server.maintenance", None))
+                .is_none(),
+            "retrying against a lease the Server never granted",
+        );
+    }
+
+    /// The clamp itself, at both ends and in the middle.
+    #[test]
+    fn a_configured_lease_is_read_as_the_server_would_read_it() {
+        assert_eq!(lease_of(7200).lease_granted(), Duration::from_secs(3600));
+        assert_eq!(lease_of(600).lease_granted(), Duration::from_secs(600));
+        assert_eq!(lease_of(1).lease_granted(), Duration::from_secs(60));
     }
 
     fn lease_of(seconds: u32) -> Config {

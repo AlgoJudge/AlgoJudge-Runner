@@ -30,3 +30,8 @@ tracing-subscriber.workspace = true
 reqwest = { workspace = true, features = ["cookies", "multipart"] }
 hex.workspace = true
 sha2.workspace = true
+# The clock, stopped. Renewal is a timer against a ten-minute lease, and a test
+# that proved anything about it by waiting would take ten minutes to run.
+# `test-util` is not part of `full`, and it is wanted only here — a release build
+# must not carry the ability to pause time.
+tokio = { workspace = true, features = ["test-util"] }

@@ -8,6 +8,7 @@
 //! pipeline replaces one function; everything around it is already right.
 
 mod config;
+mod keeper;
 mod run;
 
 use std::sync::Arc;
