@@ -567,12 +567,26 @@ fn compilation_failed(job: &Job<'_>, log: &str) -> Evaluated {
     }))
 }
 
-/// The problem's stated limits, for the document a participant reads. Kibibytes
-/// in the package, mebibytes here — see `details`.
+/// The limits this submission was actually held to, for the document a
+/// participant reads.
+///
+/// **This used to report the package's global pair**, so a Python submission
+/// judged under `overrideLimits.python` was shown a `timeMs` it was never held
+/// to — the document contradicting the run it describes. The language override
+/// holds for the whole submission, because a submission has one language, so it
+/// belongs in the one pair of numbers this document carries.
+///
+/// A group's own limits still are not in here, and cannot be: they vary across
+/// the tests of one submission and there is one slot. The per-group table
+/// belongs on the problem's own page, from the configuration, rather than in a
+/// result document that has no shape for it.
+/// The conversion is between two types of the same name — the package's and the
+/// document's — which is why this cannot simply hand the one back.
 fn limits_of(job: &Job<'_>) -> Limits {
+    let held_to = job.config.for_language(job.language);
     Limits {
-        time_ms: job.config.limits.time_ms,
-        memory_bytes: job.config.limits.memory_bytes,
+        time_ms: held_to.time_ms,
+        memory_bytes: held_to.memory_bytes,
     }
 }
 

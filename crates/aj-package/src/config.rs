@@ -272,6 +272,21 @@ impl Config {
         config.validated()
     }
 
+    /// The limits before any group narrows them: the package's own, with this
+    /// language's override applied.
+    ///
+    /// Separate from <see cref="effective"/> because it is the part that holds
+    /// for a **whole submission** — a submission has one language and many
+    /// groups — and that is what the result document can honestly state in the
+    /// single pair of numbers it carries.
+    pub fn for_language(&self, language: &str) -> Limits {
+        let mut limits = self.limits;
+        if let Some(over) = self.override_limits.get(language) {
+            apply(&mut limits, over);
+        }
+        limits
+    }
+
     /// The limits a test in this group, in this language, actually runs under.
     ///
     /// **Open question — the specification does not settle this.** It gives two
@@ -288,11 +303,8 @@ impl Config {
     ///
     /// Whichever way it is settled, it is this function and nothing else.
     pub fn effective(&self, group: u32, language: &str) -> Limits {
-        let mut limits = self.limits;
+        let mut limits = self.for_language(language);
 
-        if let Some(over) = self.override_limits.get(language) {
-            apply(&mut limits, over);
-        }
         if let Some(over) = self
             .groups
             .iter()

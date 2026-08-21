@@ -566,3 +566,71 @@ int main() { long long a, b; std::cin >> a >> b; volatile int *p = nullptr; *p =
     let fine_doc: serde_json::Value = serde_json::from_slice(&fine.details.to_bytes()).unwrap();
     assert!(fine_doc["tests"][0].get("reason").is_none());
 }
+
+/// The document states the limits the submission was actually held to.
+///
+/// **It used to state the package's global pair**, whatever the run had been
+/// judged under. A package that gives Python longer — which is the whole reason
+/// `overrideLimits` exists — produced a result document telling the participant
+/// a `timeMs` no test of theirs was ever measured against. The document
+/// contradicted the run it describes, on the same screen.
+///
+/// Judged in Python, because that is the language the override below names.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn the_document_reports_the_limit_the_run_was_held_to() {
+    const OVERRIDDEN: &str = r#"
+format: standard-io
+version: 1
+limits:
+  timeMs: 2000
+  memoryBytes: 268435456
+overrideLimits:
+  python:
+    timeMs: 9000
+groups:
+  - group: 0
+    points: 0
+    examples: true
+  - group: 1
+    points: 40
+  - group: 2
+    points: 60
+"#;
+
+    let pipeline = pipeline().await;
+    let (here, on_host) = fixture("limits-reported");
+    std::fs::create_dir_all(here.join("tests")).unwrap();
+    std::fs::write(here.join("config.yml"), OVERRIDDEN).unwrap();
+    for (test, input, expected) in [
+        ("0a", "1 2\n", "3\n"),
+        ("1a", "10 20\n", "30\n"),
+        ("2a", "1000000 2000000\n", "3000000\n"),
+    ] {
+        std::fs::write(here.join(format!("tests/{test}.in")), input).unwrap();
+        std::fs::write(here.join(format!("tests/{test}.out")), expected).unwrap();
+    }
+
+    let config = Config::parse(OVERRIDDEN).unwrap();
+    let tests = TestSet::read(&here, &config).unwrap();
+
+    let judged = verdict(
+        pipeline
+            .evaluate(&Job {
+                config: &config,
+                tests: &tests,
+                language: "python",
+                source: b"a, b = map(int, input().split())\nprint(a + b)\n",
+                package: Places { here, on_host },
+                work: work("limits-reported"),
+            })
+            .await,
+    );
+
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    assert_eq!(
+        document["limits"]["timeMs"], 9000,
+        "the document should carry Python's own limit, not the package's global one: {}",
+        document["limits"],
+    );
+}

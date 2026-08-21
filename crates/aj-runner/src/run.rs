@@ -587,7 +587,22 @@ async fn judge(
     // arm plus a crate. Nothing about it reaches the Server.
     match job.problem_type.as_str() {
         "standard-io@1" => {
-            let package_config = aj_package::Config::parse(&declared).map_err(|e| e.to_string())?;
+            // **The overlay was written, documented, tested — and called from
+            // the other arm only.** `output-only@1` below has applied it since
+            // it was added; this one parsed the package and stopped, so for the
+            // product's principal problem type `ProblemVersion.Config` and
+            // `SeriesProblem.Config` were computed by the Server, sent with
+            // every job, and thrown away on arrival. One library problem
+            // attached to two activities with different limits was judged under
+            // the package's limits in both, and every sentence the format writes
+            // about the configuration chain was untrue here.
+            //
+            // The trial path above deliberately does not do this: a `ClaimedTrial`
+            // carries no config, because a trial calibrates the package itself
+            // rather than one activity's use of it.
+            let package_config = aj_package::Config::parse(&declared)
+                .and_then(|c| c.overlaid(job.config.as_ref()))
+                .map_err(|e| e.to_string())?;
             let tests = aj_package::TestSet::read(&package.here, &package_config)
                 .map_err(|e| e.to_string())?;
             let bytes = std::fs::read(source.path()).map_err(|e| e.to_string())?;
