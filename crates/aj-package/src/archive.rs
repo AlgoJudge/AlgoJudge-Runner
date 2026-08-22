@@ -240,7 +240,7 @@ mod tests {
         let archive = archive_of(
             &root,
             &[
-                ("config.yml", b"format: standard-io\n"),
+                ("config.yml", b"type: \"standard-io@1\"\n"),
                 ("tests/1a.in", b"1 2\n"),
                 ("tests/1a.out", b"3\n"),
                 ("checker/checker.cpp", b"int main(){}\n"),

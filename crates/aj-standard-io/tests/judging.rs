@@ -25,8 +25,7 @@ use aj_sandbox::{Docker, Sandbox};
 use aj_standard_io::{catalogue, for_id, Evaluated, Family, Images, Job, Pipeline, Places};
 
 const CONFIG: &str = r#"
-format: standard-io
-version: 1
+type: "standard-io@1"
 limits:
   timeMs: 2000
   memoryBytes: 268435456
@@ -204,8 +203,7 @@ fn verdict(evaluated: Evaluated) -> aj_standard_io::Verdict {
 #[ignore = "needs a container runtime and the language images"]
 async fn a_language_the_assignment_excluded_is_a_policy_violation() {
     const PYTHON_ONLY: &str = r#"
-format: standard-io
-version: 1
+type: "standard-io@1"
 limits:
   timeMs: 2000
   memoryBytes: 268435456
@@ -826,8 +824,7 @@ int main() { long long a, b; std::cin >> a >> b; volatile int *p = nullptr; *p =
 #[ignore = "needs a container runtime and the language images"]
 async fn the_document_reports_the_limit_the_run_was_held_to() {
     const OVERRIDDEN: &str = r#"
-format: standard-io
-version: 1
+type: "standard-io@1"
 limits:
   timeMs: 2000
   memoryBytes: 268435456
@@ -899,8 +896,7 @@ groups:
 #[ignore = "needs a container runtime and the language images"]
 async fn overrunning_the_limit_inside_the_grace_is_still_a_time_limit() {
     const TIGHT: &str = r#"
-format: standard-io
-version: 1
+type: "standard-io@1"
 limits:
   timeMs: 500
   memoryBytes: 268435456

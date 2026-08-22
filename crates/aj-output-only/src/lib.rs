@@ -171,6 +171,6 @@ pub fn details(judged: &Judgement, config: &Config) -> Details {
             log: "nothing was compiled: this is an output-only problem".into(),
         },
     );
-    document.kind = "output-only";
+    document.kind = "output-only@1";
     document
 }

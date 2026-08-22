@@ -21,9 +21,17 @@ use crate::score::{Judgement, Reason, Status};
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Details {
-    /// `standard-io`, `output-only` — what a Client's renderer keys on.
+    /// The problem type, as **one string** — `standard-io@1`.
+    ///
+    /// **It was `kind` plus `version` until 2026-08-22.** The type envelope was
+    /// decided as one string on 2026-08-02 and the product had written it four
+    /// different ways since: `Activity.Type` as `name@version`, `format` plus
+    /// `version` in `config.yml`, `kind` plus `version` here, and a bare
+    /// `version` in `content.md`. A convention with four spellings is not a
+    /// convention, and no reader checked any of them — this one's two fields
+    /// were parsed by the Client's renderer and both ignored.
+    #[serde(rename = "type")]
     pub kind: &'static str,
-    pub version: u32,
     pub limits: Limits,
     pub score: f64,
     pub max_score: f64,
@@ -83,8 +91,7 @@ pub struct TestReport {
 impl Details {
     pub fn of(judged: &Judgement, limits: Limits, compilation: Compilation) -> Self {
         Self {
-            kind: "standard-io",
-            version: 1,
+            kind: "standard-io@1",
             limits,
             score: judged.score,
             max_score: judged.max_score,
@@ -186,8 +193,9 @@ mod tests {
 
         let json: serde_json::Value = serde_json::from_slice(&details.to_bytes()).unwrap();
 
-        assert_eq!(json["kind"], "standard-io");
-        assert_eq!(json["version"], 1);
+        assert_eq!(json["type"], "standard-io@1");
+        assert!(json["kind"].is_null(), "one string, not two fields");
+        assert!(json["version"].is_null());
         assert_eq!(json["limits"]["timeMs"], 1000);
         assert_eq!(json["limits"]["memoryBytes"], 268435456);
         assert_eq!(json["score"], 70.0);

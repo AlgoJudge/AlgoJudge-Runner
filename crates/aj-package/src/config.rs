@@ -14,11 +14,35 @@ use crate::error::{Error, Result};
 pub const FORMAT: &str = "standard-io";
 pub const VERSION: u32 = 1;
 
+/// The type this package is for, as **one string** — `standard-io@1`.
+///
+/// The envelope was decided as one string on 2026-08-02 and this file wrote it
+/// as two fields until 2026-08-22. Four spellings of one idea existed in the
+/// product; a convention with four spellings is not a convention.
+pub fn envelope(format: &str) -> String {
+    format!("{format}@{VERSION}")
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
-    pub format: String,
-    pub version: u32,
+    /// `standard-io@1`. **One string**, as every type discriminator in the
+    /// product is (decided 2026-08-02, applied here 2026-08-22).
+    ///
+    /// Written by everything that builds a package. Absent only in a package
+    /// built before that date, which still reads: see `format` and `version`
+    /// below, which are the old spelling and are accepted rather than
+    /// demanded — a package the Runner cannot parse is an infrastructure
+    /// failure on every submission to it, not a message anybody can act on.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+
+    /// **The old spelling, read and never written.** A package carrying these
+    /// and no `type` is one built before 2026-08-22.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
 
     pub limits: Limits,
 
@@ -204,16 +228,37 @@ impl Config {
     /// second type required, and it is a change inside one crate rather than a
     /// second parser.
     pub fn parse_as(yaml: &str, format: &str) -> Result<Self> {
-        let config: Config = serde_yaml_ng::from_str(yaml)?;
+        let mut config: Config = serde_yaml_ng::from_str(yaml)?;
+
+        // **One string, or the two fields that used to say the same thing.**
+        // A package built before 2026-08-22 carries `format` and `version`;
+        // reading both spellings is what keeps such a package judgeable, and
+        // only one of them is ever written.
+        let declared = match (&config.kind, &config.format, config.version) {
+            (Some(kind), _, _) => kind.clone(),
+            (None, Some(old), Some(version)) => format!("{old}@{version}"),
+            _ => {
+                return Err(Error::invalid(
+                    "the package does not say what it is; `type: \"name@version\"` is required",
+                ));
+            }
+        };
 
         // A Runner that does not know the version refuses the package rather
         // than guessing at what changed in it.
-        if config.format != format || config.version != VERSION {
+        if declared != envelope(format) {
             return Err(Error::UnknownFormat {
-                format: config.format,
-                version: config.version,
+                format: declared,
+                version: VERSION,
             });
         }
+
+        // Normalised on the way in, so nothing downstream has to know which
+        // spelling arrived — and so a merged or re-serialised document carries
+        // the new one.
+        config.kind = Some(declared);
+        config.format = None;
+        config.version = None;
 
         config.validated()
     }
@@ -297,9 +342,11 @@ impl Config {
             _ => return Ok(self),
         };
         for (name, value) in members {
-            // `format` and `version` say what the document is; an overlay does
-            // not get to change that.
-            if name == "format" || name == "version" {
+            // These say what the document *is*; an overlay does not get to
+            // change that. `format` and `version` are the spelling used before
+            // 2026-08-22 and are skipped too, so an overlay cannot reach round
+            // the front door by using the old name.
+            if name == "type" || name == "format" || name == "version" {
                 continue;
             }
             let combined = match merged.get(name) {
@@ -498,8 +545,7 @@ mod tests {
     /// The specification's own example, so this test fails if the document and
     /// the reader ever part company.
     const FROM_THE_SPECIFICATION: &str = r#"
-format: standard-io
-version: 1
+type: "standard-io@1"
 
 limits:
   timeMs: 1000
@@ -676,11 +722,51 @@ extraCompilationFiles: []
     #[test]
     fn an_overlay_may_not_change_what_the_document_is() {
         let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
-        let overlay = serde_json::json!({ "format": "interactive", "version": 9 });
+        let overlay = serde_json::json!({
+            "type": "interactive@9", "format": "interactive", "version": 9,
+        });
 
         let attached = config.overlaid(Some(&overlay)).unwrap();
-        assert_eq!(attached.format, "standard-io");
-        assert_eq!(attached.version, 1);
+        assert_eq!(attached.kind.as_deref(), Some("standard-io@1"));
+    }
+
+    /// **A package built before 2026-08-22 still judges.**
+    ///
+    /// It carries `format` and `version` rather than `type`, and refusing it
+    /// would be an infrastructure failure on every submission to it — not a
+    /// message anybody could act on. Read, normalised, and never written back
+    /// in that spelling.
+    #[test]
+    fn the_two_fields_that_used_to_say_this_are_still_read() {
+        let old = FROM_THE_SPECIFICATION.replace(
+            "type: \"standard-io@1\"",
+            "format: standard-io
+version: 1",
+        );
+        let config = Config::parse(&old).unwrap();
+
+        assert_eq!(config.kind.as_deref(), Some("standard-io@1"));
+        assert!(config.format.is_none(), "and is not carried forward");
+        assert!(config.version.is_none());
+
+        let written = serde_yaml_ng::to_string(&config).unwrap();
+        assert!(written.contains("type: standard-io@1"), "{written}");
+        assert!(
+            !written.contains("format:"),
+            "one spelling out, not two: {written}"
+        );
+    }
+
+    /// A document that says nothing about what it is.
+    #[test]
+    fn a_package_that_does_not_say_what_it_is_is_refused() {
+        let anonymous = FROM_THE_SPECIFICATION.replace(
+            "type: \"standard-io@1\"
+",
+            "",
+        );
+        let refused = Config::parse(&anonymous).unwrap_err().to_string();
+        assert!(refused.contains("does not say what it is"), "{refused}");
     }
 
     /// **Open question, and this is the one line.** The specification says only
@@ -818,8 +904,7 @@ extraCompilationFiles: []
     }
 
     const SEVERAL_MODELS: &str = r#"
-format: standard-io
-version: 1
+type: "standard-io@1"
 limits:
   timeMs: 1000
   memoryBytes: 268435456
@@ -870,14 +955,14 @@ calibration:
 
     #[test]
     fn a_format_this_runner_does_not_know_is_refused() {
-        let yaml = FROM_THE_SPECIFICATION.replace("version: 1", "version: 2");
+        let yaml = FROM_THE_SPECIFICATION.replace("standard-io@1", "standard-io@2");
         let error = Config::parse(&yaml).unwrap_err();
         assert!(
-            matches!(error, Error::UnknownFormat { version: 2, .. }),
+            matches!(&error, Error::UnknownFormat { format, .. } if format == "standard-io@2"),
             "got {error}"
         );
 
-        let yaml = FROM_THE_SPECIFICATION.replace("format: standard-io", "format: interactive");
+        let yaml = FROM_THE_SPECIFICATION.replace("standard-io@1", "interactive@1");
         assert!(matches!(
             Config::parse(&yaml).unwrap_err(),
             Error::UnknownFormat { .. }
