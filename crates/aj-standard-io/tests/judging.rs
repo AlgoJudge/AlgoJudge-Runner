@@ -634,3 +634,81 @@ groups:
         document["limits"],
     );
 }
+
+/// Overrunning the limit is a time limit, even when nothing had to kill it.
+///
+/// **Until 2026-08-22 it was not.** A test container is given the limit *plus a
+/// second of grace*, because a program wedged in an uninterruptible syscall has
+/// to be reaped from outside — and nothing then compared the measurement against
+/// the limit itself, although the comment beside the deadline said the verdict
+/// came from exactly that. So a solution that overran by anything less than the
+/// grace stopped on its own, was never reaped, and was marked correct: at a
+/// one-second limit, a program taking 1.9 s was `Accepted`.
+///
+/// This one is given half a second and takes about eight tenths: comfortably
+/// over the limit, comfortably inside the grace, which is the window that used
+/// to be free.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn overrunning_the_limit_inside_the_grace_is_still_a_time_limit() {
+    const TIGHT: &str = r#"
+format: standard-io
+version: 1
+limits:
+  timeMs: 500
+  memoryBytes: 268435456
+groups:
+  - group: 0
+    points: 0
+    examples: true
+  - group: 1
+    points: 40
+  - group: 2
+    points: 60
+"#;
+
+    let pipeline = pipeline().await;
+    let (here, on_host) = fixture("overrun");
+    std::fs::create_dir_all(here.join("tests")).unwrap();
+    std::fs::write(here.join("config.yml"), TIGHT).unwrap();
+    for (test, input, expected) in [
+        ("0a", "1 2\n", "3\n"),
+        ("1a", "10 20\n", "30\n"),
+        ("2a", "1000000 2000000\n", "3000000\n"),
+    ] {
+        std::fs::write(here.join(format!("tests/{test}.in")), input).unwrap();
+        std::fs::write(here.join(format!("tests/{test}.out")), expected).unwrap();
+    }
+
+    let config = Config::parse(TIGHT).unwrap();
+    let tests = TestSet::read(&here, &config).unwrap();
+
+    let slow = "#include <iostream>\n#include <chrono>\nint main(){long long a,b;std::cin>>a>>b;auto t=std::chrono::steady_clock::now();while(std::chrono::steady_clock::now()-t<std::chrono::milliseconds(800)){}std::cout<<a+b<<std::endl;}\n";
+
+    let judged = verdict(
+        pipeline
+            .evaluate(&Job {
+                config: &config,
+                tests: &tests,
+                language: "cpp",
+                source: slow.as_bytes(),
+                package: Places { here, on_host },
+                work: work("overrun"),
+            })
+            .await,
+    );
+
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    assert_ne!(
+        judged.judgement.verdict, "Accepted",
+        "a solution that took longer than its limit was accepted: {document}",
+    );
+    assert!(
+        document["tests"][0]["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Time limit exceeded"),
+        "and it should say so by name: {}",
+        document["tests"][0],
+    );
+}

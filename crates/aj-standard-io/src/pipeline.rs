@@ -256,6 +256,27 @@ impl<S: Sandbox> Pipeline<S> {
                 Stopped::WallClock => Some(("Time limit exceeded", Reason::TimeLimit)),
                 Stopped::Memory => Some(("Memory limit exceeded", Reason::MemoryLimit)),
                 Stopped::Output => Some(("Output limit exceeded", Reason::OutputLimit)),
+
+                // **The limit is decided here, on the measurement, and until
+                // 2026-08-22 it was decided nowhere.** The deadline above is the
+                // limit plus a second of grace, because a program wedged in an
+                // uninterruptible syscall has to be reaped from outside — and
+                // the comment beside it has always said the verdict comes from
+                // the measurement rather than from that deadline. No such
+                // comparison existed. A solution that overran its limit by
+                // anything less than the grace finished on its own, was never
+                // reaped, and was marked correct: at a one-second limit, a
+                // program taking 1.9 s was `Accepted`.
+                //
+                // The wall clock is what decides it, deliberately —
+                // `Outcome::cpu_time` says so where it is declared, because a
+                // limit is stated in what a participant waits through. It
+                // includes the container's start, and so do the numbers a trial
+                // measures, which is what keeps a calibrated limit honest
+                // against the thing it is compared with.
+                Stopped::OnItsOwn if time_ms > limits.time_ms => {
+                    Some(("Time limit exceeded", Reason::TimeLimit))
+                }
                 Stopped::OnItsOwn => None,
             };
             if let Some((note, reason)) = stopped {
