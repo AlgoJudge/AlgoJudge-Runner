@@ -31,6 +31,19 @@ pub struct Config {
     #[serde(default)]
     pub override_limits: BTreeMap<String, PartialLimits>,
 
+    /// Which toolchains may be submitted. **Empty means the package does not
+    /// say**, and an assignment that says nothing allows everything this Runner
+    /// can build.
+    ///
+    /// Ids as `language.rs` names them, so `cpp17-gcc` rather than `cpp17` —
+    /// and the family shorthands `cpp` and `python` resolve too, because that is
+    /// what every package written before the catalogue uses.
+    ///
+    /// A limit on *what may be sent* rather than on how it runs, which is why it
+    /// is a list here rather than an entry in `overrideLimits`.
+    #[serde(default)]
+    pub languages: Vec<String>,
+
     pub groups: Vec<Group>,
 
     /// Absent means the `.out` files decide.

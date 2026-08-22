@@ -162,6 +162,40 @@ impl<S: Sandbox> Pipeline<S> {
         let language = language::for_id(job.language, &self.images)
             .ok_or_else(|| format!("this Runner does not evaluate {}", job.language))?;
 
+        // ── the languages this assignment allows ────────────────────────────
+        //
+        // **The Server used to refuse this and cannot any more**: the language
+        // is one member of a document it does not read. The set travels with the
+        // job instead, in the assignment's `config`, and the refusal happens
+        // here — where a language id means something.
+        //
+        // A **verdict**, and `PolicyViolation` rather than a compilation error:
+        // nothing was offered to a compiler, the code may be perfect, and what
+        // was broken is a rule of the activity. That is exactly what this verdict
+        // is for, and it leaves the submission rejudgeable if a manager widens
+        // the set afterwards.
+        //
+        // An empty list means the assignment said nothing, which allows anything
+        // this Runner can build. It is not a way of allowing none: an assignment
+        // that meant none would have nothing to submit to.
+        if !job.config.languages.is_empty()
+            && !job
+                .config
+                .languages
+                .iter()
+                .any(|allowed| allowed == language.id || allowed == language.family.as_str())
+        {
+            return Ok(policy_violation(
+                job,
+                &language,
+                &[format!(
+                    "This problem does not accept {}. It accepts: {}.",
+                    language.label,
+                    job.config.languages.join(", "),
+                )],
+            ));
+        }
+
         // **A verdict, not an infrastructure failure.** Choosing C++ and
         // uploading `main.py` is the participant's own doing, the compiler
         // would have said so thirty seconds later, and this says it in words
@@ -200,7 +234,8 @@ impl<S: Sandbox> Pipeline<S> {
         let broken = crate::policy::Dictionary::built_in()
             .check(&language, &String::from_utf8_lossy(job.source));
         if !broken.is_empty() {
-            return Ok(policy_violation(job, &language, &broken));
+            let listed: Vec<String> = broken.iter().map(|v| v.note()).collect();
+            return Ok(policy_violation(job, &language, &listed));
         }
 
         // ── build ───────────────────────────────────────────────────────────
@@ -574,13 +609,7 @@ fn failed(test: &aj_package::Test, time_ms: u64, note: &str, reason: Reason) -> 
 /// are three different things to tell a participant: their code is wrong, their
 /// code does not build, or the system failed. This one is none of the three —
 /// their code may be perfect and still not allowed.
-fn policy_violation(
-    job: &Job<'_>,
-    language: &language::Language,
-    broken: &[crate::policy::Violation],
-) -> Evaluated {
-    let listed: Vec<String> = broken.iter().map(|v| v.note()).collect();
-
+fn policy_violation(job: &Job<'_>, language: &language::Language, listed: &[String]) -> Evaluated {
     let outcomes: Vec<TestOutcome> = job
         .tests
         .iter()
@@ -595,10 +624,7 @@ fn policy_violation(
             // Not an error: nothing failed to compile, because nothing was
             // offered to a compiler.
             status: Status::Warning,
-            log: listed.join(
-                "
-",
-            ),
+            log: listed.join("\n"),
         },
     );
 
@@ -608,10 +634,7 @@ fn policy_violation(
             ..judgement.clone()
         },
         details,
-        log: listed.join(
-            "
-",
-        ),
+        log: listed.join("\n"),
     }))
 }
 

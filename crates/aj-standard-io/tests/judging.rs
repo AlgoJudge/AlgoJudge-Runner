@@ -190,6 +190,95 @@ fn verdict(evaluated: Evaluated) -> aj_standard_io::Verdict {
     }
 }
 
+/// **A language the assignment excluded is refused here, and nowhere else.**
+///
+/// The Server used to refuse it, against a list on the activity. It cannot: the
+/// language is one member of a document it does not read, so the allowed set
+/// travels in the assignment's `config` and the refusal happens where a language
+/// id means something.
+///
+/// `PolicyViolation`, not a compilation error: nothing was offered to a
+/// compiler, the code may be perfect, and what was broken is a rule of the
+/// activity. It leaves the submission rejudgeable if a manager widens the set.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_language_the_assignment_excluded_is_a_policy_violation() {
+    const PYTHON_ONLY: &str = r#"
+format: standard-io
+version: 1
+limits:
+  timeMs: 2000
+  memoryBytes: 268435456
+languages: [python3]
+groups:
+  - group: 0
+    points: 0
+    examples: true
+  - group: 1
+    points: 100
+"#;
+
+    let pipeline = pipeline().await;
+    let (here, on_host) = fixture("excluded-language");
+    std::fs::create_dir_all(here.join("tests")).unwrap();
+    std::fs::write(here.join("config.yml"), PYTHON_ONLY).unwrap();
+    for (test, input, expected) in [
+        (
+            "0a", "1 2
+", "3
+",
+        ),
+        (
+            "1a", "10 20
+", "30
+",
+        ),
+    ] {
+        std::fs::write(here.join(format!("tests/{test}.in")), input).unwrap();
+        std::fs::write(here.join(format!("tests/{test}.out")), expected).unwrap();
+    }
+
+    let config = Config::parse(PYTHON_ONLY).unwrap();
+    let tests = TestSet::read(&here, &config).unwrap();
+
+    let judged = verdict(
+        pipeline
+            .evaluate(&Job {
+                config: &config,
+                tests: &tests,
+                language: "cpp20-gcc",
+                file_name: "main.cpp",
+                source: CORRECT_CPP.as_bytes(),
+                package: Places { here, on_host },
+                work: work("excluded-language"),
+            })
+            .await,
+    );
+
+    assert_eq!(judged.judgement.verdict, "PolicyViolation");
+    assert_eq!(judged.judgement.score, 0.0);
+
+    let said = &judged.details.compilation.log;
+    assert!(
+        said.contains("C++20 (GCC)"),
+        "the language is named as a person reads it: {said}"
+    );
+    assert!(
+        said.contains("python3"),
+        "and what is accepted is listed: {said}"
+    );
+}
+
+/// The other half of the same rule: an assignment that names no languages allows
+/// everything this Runner can build. Empty is "the assignment did not say", not
+/// "the assignment allows none".
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn an_assignment_that_names_no_languages_allows_them_all() {
+    let judged = verdict(judge("no-language-list", "cpp20-gcc", CORRECT_CPP).await);
+    assert_eq!(judged.judgement.verdict, "Accepted");
+}
+
 // ── The whole catalogue ─────────────────────────────────────────────────────
 
 /// **Every row of the table, built and run for real.**

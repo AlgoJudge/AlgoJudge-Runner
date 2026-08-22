@@ -564,7 +564,11 @@ mod tests {
         .unwrap();
 
         assert!(!job.has_package());
-        assert!(job.language.is_none(), "absent is not an error");
+        // Absent parses; it is not an error **here**. Whether a job may arrive
+        // without one is `standard-io@1`'s question, and its answer is no — an
+        // infrastructure failure rather than a guess. This layer only has to
+        // read what came.
+        assert!(job.props.is_none(), "absent is not an error");
         assert!(job.config.is_none());
     }
 }

@@ -233,10 +233,22 @@ pub struct ClaimedJob {
     pub package_file_id: String,
     pub package_sha256: String,
     pub files: Vec<SubmissionFile>,
+    /// What the participant declared beside the bytes — **the language among
+    /// it**, under whatever member this problem type calls it.
+    ///
+    /// It was a `language` field the Server read, and the Server refused a
+    /// language the activity did not list. It cannot: this is one member of a
+    /// document whose shape belongs to the problem type, and a Server that
+    /// reached into it would need a release every time a Runner learned a new
+    /// toolchain. Reading it, and refusing what an assignment excluded, is this
+    /// Runner's job now.
     #[serde(default)]
-    pub language: Option<String>,
-    /// The merged chain — package, then problem version, then assignment. The
-    /// Server merged documents it never read.
+    pub props: Option<serde_json::Value>,
+    /// The assignment's own configuration, to be laid over the package's.
+    ///
+    /// **One layer, not a merged chain.** `ProblemVersion.Config` was dropped on
+    /// 2026-08-22 and the Server merges nothing any more; the only merge left is
+    /// `Config::overlaid`, here.
     #[serde(default)]
     pub config: Option<serde_json::Value>,
 }

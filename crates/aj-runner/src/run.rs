@@ -615,9 +615,11 @@ async fn judge(
             // sent an incomplete job — an infrastructure failure, which leaves
             // the submission rejudgeable once that is fixed, rather than a
             // verdict against somebody's work.
-            let language = job
-                .language
-                .as_deref()
+            // **`props.language` is where it lives**, and `standard-io@1` is
+            // what decides that: the Server carries the document without
+            // reading a member of it, so the member's name is this crate's to
+            // know. A second problem type may call it something else.
+            let language = language_of(job.props.as_ref())
                 .ok_or("the submission names no language, and this Runner will not guess one")?;
 
             let evaluated = pipeline
@@ -930,8 +932,52 @@ fn total_memory_bytes() -> Option<u64> {
 const FIVE: Duration = Duration::from_secs(5);
 const THIRTY: Duration = Duration::from_secs(30);
 
+/// Which member of a submission's `props` names the language.
+///
+/// **`standard-io@1` decides this, and nothing above it does.** The Server
+/// carries the document without reading a member, so the member's name belongs
+/// to the problem type — a second type may call it something else, or have no
+/// language at all.
+///
+/// A named function rather than a chain at the call site, because it is the one
+/// piece of the language's journey that no other test reaches: everything below
+/// it is exercised by the judging suite against a pipeline, and everything above
+/// it by the Server's.
+fn language_of(props: Option<&serde_json::Value>) -> Option<&str> {
+    props?.get("language")?.as_str()
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_language_is_read_out_of_the_submissions_own_document() {
+        let props = serde_json::json!({ "type": "standard-io@1", "language": "cpp17-gcc" });
+        assert_eq!(language_of(Some(&props)), Some("cpp17-gcc"));
+    }
+
+    /// Every one of these is a job that arrived incomplete or wrong, and each
+    /// makes the caller report an infrastructure failure rather than guess. It
+    /// guessed `cpp` until 2026-08-22, which with eighteen toolchains means
+    /// compiling somebody's Python as C++20 and calling the result their
+    /// compilation error.
+    #[test]
+    fn anything_that_does_not_name_a_language_names_none() {
+        assert_eq!(language_of(None), None);
+        assert_eq!(language_of(Some(&serde_json::json!({}))), None);
+        assert_eq!(
+            language_of(Some(&serde_json::json!({ "lang": "cpp17-gcc" }))),
+            None
+        );
+        assert_eq!(
+            language_of(Some(&serde_json::json!({ "language": 17 }))),
+            None
+        );
+        assert_eq!(
+            language_of(Some(&serde_json::json!({ "language": null }))),
+            None
+        );
+    }
     use super::*;
 
     use aj_protocol::error::Refusal;
