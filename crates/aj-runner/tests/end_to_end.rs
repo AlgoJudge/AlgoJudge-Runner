@@ -201,6 +201,18 @@ impl Session {
     }
 
     async fn submit(&self, activity: &str, source: &str, language: &str) -> String {
+        /// A name the toolchain accepts. The Runner refuses a file whose
+        /// extension its toolchain does not, so this is not decoration.
+        fn file_named(language: &str) -> &'static str {
+            if language.starts_with("py") || language.starts_with("python") {
+                "main.py"
+            } else if language.starts_with("cpp") || language == "c++" {
+                "main.cpp"
+            } else {
+                "main.c"
+            }
+        }
+
         let checksum = hex::encode(Sha256::digest(source.as_bytes()));
 
         let response = self
@@ -210,9 +222,18 @@ impl Session {
                 api()
             ))
             .multipart(
+                // **One opaque document, and a file name.** The language was a
+                // field the Server read; it is a member of `props` now, and the
+                // Server named pasted source from a table of seven extensions
+                // it no longer has — so the sender names it or the submission
+                // is refused.
                 reqwest::multipart::Form::new()
-                    .text("language", language.to_owned())
+                    .text(
+                        "props",
+                        format!(r#"{{"type":"standard-io@1","language":"{language}"}}"#),
+                    )
                     .text("code", source.to_owned())
+                    .text("fileName", file_named(language).to_owned())
                     .text("sha256", checksum),
             )
             .send()
@@ -293,7 +314,6 @@ async fn publish_with_config(
                 "rankingType": "icpc",
                 "timeZone": "Europe/Warsaw",
                 "joinPolicy": "open",
-                "languages": ["cpp", "python"],
                 "attachmentVisibility": [
                     { "name": "source", "visibility": "participant" },
                     { "name": "log", "visibility": "participant" },

@@ -405,7 +405,7 @@ async fn a_correct_cpp_solution_is_accepted_with_full_marks() {
     assert_eq!(judged.judgement.max_score, 100.0);
 
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
-    assert_eq!(document["kind"], "standard-io");
+    assert_eq!(document["type"], "standard-io@1");
     assert_eq!(document["compilation"]["status"], "OK");
     assert_eq!(document["tests"].as_array().unwrap().len(), 3);
     assert!(
