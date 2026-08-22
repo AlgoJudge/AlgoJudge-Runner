@@ -19,7 +19,7 @@ pub use calibrate::{measure, Measured};
 pub use checker::{checker_said, Checked};
 pub use compare::{compare, Comparison};
 pub use details::{Details, GroupReport, TestReport};
-pub use language::{Images, Language};
+pub use language::{catalogue, for_id, Family, Images, Language};
 pub use pipeline::{Evaluated, Job, Pipeline, Places, Verdict};
 pub use policy::{Dictionary, Violation};
 pub use score::{judge, Judgement, Reason, Status, TestOutcome};

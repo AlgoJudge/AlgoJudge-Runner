@@ -7,8 +7,10 @@
 //! is what the participant would read.
 //!
 //! ```text
-//! docker build -t algojudge/lang-cpp:local    images/cpp
+//! docker build -t algojudge/lang-gcc:local    images/gcc
+//! docker build -t algojudge/lang-clang:local  images/clang
 //! docker build -t algojudge/lang-python:local images/python
+//! docker build -t algojudge/lang-pypy:local   images/pypy
 //! docker compose -f example-runner-development-docker-compose.yaml up -d --build --wait
 //!
 //! AJ_TEST_SERVER=http://host.docker.internal:8080/api/v1 \
@@ -972,10 +974,7 @@ fn probe_config() -> Config {
         work_path: scratch.join("work"),
         work_host_path: scratch.join("work"),
         // Never used: nothing here evaluates anything.
-        images: aj_standard_io::Images {
-            cpp: String::new(),
-            python: String::new(),
-        },
+        images: aj_standard_io::Images::default(),
         allow_cgroup_v1: false,
     }
 }

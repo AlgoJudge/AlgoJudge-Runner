@@ -64,6 +64,11 @@ pub async fn measure<S: Sandbox>(
                 config,
                 tests,
                 language: &model.language,
+                // The path the package declares, which carries the extension.
+                // A model solution whose name disagrees with its declared
+                // language now fails the trial by saying so, rather than as a
+                // compiler error in a language nobody meant to write.
+                file_name: &model.source,
                 source: &bytes,
                 package: package.clone(),
                 work: mine,

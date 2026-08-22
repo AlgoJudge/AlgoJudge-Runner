@@ -22,8 +22,12 @@ pub struct Config {
 
     pub limits: Limits,
 
-    /// Per language, keyed by the product's language id. Python is slower; this
-    /// is where that is said.
+    /// Per language, keyed by a **family** (`c`, `cpp`, `python`) or by one
+    /// toolchain (`pypy3`). Python is slower; this is where that is said.
+    ///
+    /// A family covers every toolchain in it, which is what an author almost
+    /// always means — writing sixteen entries to say "C++ gets the same" is not
+    /// a format anybody would use. See `for_language`.
     #[serde(default)]
     pub override_limits: BTreeMap<String, PartialLimits>,
 
@@ -297,17 +301,33 @@ impl Config {
         config.validated()
     }
 
-    /// The limits before any group narrows them: the package's own, with this
-    /// language's override applied.
+    /// The limits before any group narrows them: the package's own, with every
+    /// override that names this submission's language applied.
     ///
     /// Separate from <see cref="effective"/> because it is the part that holds
     /// for a **whole submission** — a submission has one language and many
     /// groups — and that is what the result document can honestly state in the
     /// single pair of numbers it carries.
-    pub fn for_language(&self, language: &str) -> Limits {
+    ///
+    /// **Keys, plural, least specific first.** A language id used to be one
+    /// word (`python`) and is now two levels (`python3`, `pypy3` — see the
+    /// Runner's `language.rs`), so an override written the way this format
+    /// documents it would have stopped matching anything the day the catalogue
+    /// grew, and stopped **silently**: every Python submission held to the C++
+    /// limit, no error anywhere. The caller passes the family and then the
+    /// toolchain, and both are applied in that order, so `overrideLimits`
+    /// under `python` covers PyPy too and an entry under `pypy3` beats it
+    /// field by field.
+    ///
+    /// This crate deliberately does not know what a family is. It is handed
+    /// the keys rather than deriving them, because the catalogue that decides
+    /// them belongs to the problem type and not to the package format.
+    pub fn for_language(&self, keys: &[&str]) -> Limits {
         let mut limits = self.limits;
-        if let Some(over) = self.override_limits.get(language) {
-            apply(&mut limits, over);
+        for key in keys {
+            if let Some(over) = self.override_limits.get(*key) {
+                apply(&mut limits, over);
+            }
         }
         limits
     }
@@ -327,8 +347,8 @@ impl Config {
     /// it would be a format change rather than a different resolution here.
     ///
     /// Whichever way it is settled, it is this function and nothing else.
-    pub fn effective(&self, group: u32, language: &str) -> Limits {
-        let mut limits = self.for_language(language);
+    pub fn effective(&self, group: u32, keys: &[&str]) -> Limits {
+        let mut limits = self.for_language(keys);
 
         if let Some(over) = self
             .groups
@@ -527,11 +547,11 @@ extraCompilationFiles: []
         let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
 
         // Group 2 states time and not memory, so memory stays global.
-        let group2 = config.effective(2, "cpp");
+        let group2 = config.effective(2, &["cpp"]);
         assert_eq!(group2.time_ms, 2000);
         assert_eq!(group2.memory_bytes, 268435456);
 
-        let group1 = config.effective(1, "cpp");
+        let group1 = config.effective(1, &["cpp"]);
         assert_eq!(group1.time_ms, 1000);
     }
 
@@ -539,9 +559,51 @@ extraCompilationFiles: []
     fn a_language_override_applies_where_a_group_says_nothing() {
         let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
 
-        let python = config.effective(1, "python");
+        let python = config.effective(1, &["python"]);
         assert_eq!(python.time_ms, 3000);
         assert_eq!(python.memory_bytes, 536870912);
+    }
+
+    /// **The trap the second key exists to close.** A language id used to be one
+    /// word, and every `overrideLimits` on disk is written under it. When ids
+    /// became two levels, an override under `python` stopped matching `pypy3` —
+    /// silently, because a missing override is not an error, it is the package's
+    /// own limits. Every PyPy submission would have been held to the C++ limit
+    /// and nothing anywhere would have said so.
+    #[test]
+    fn an_override_written_for_a_family_reaches_its_toolchains() {
+        let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
+
+        // What a package author wrote, and what the Runner now asks with.
+        let pypy = config.for_language(&["python", "pypy3"]);
+        assert_eq!(pypy.time_ms, 3000, "PyPy is Python");
+        assert_eq!(pypy.memory_bytes, 536870912);
+
+        // And a toolchain that has no entry of its own is unaffected by
+        // another family's.
+        let cpp = config.for_language(&["cpp", "cpp17-gcc"]);
+        assert_eq!(cpp.time_ms, 1000);
+    }
+
+    /// The other half of the rule: **least specific first**, so a package that
+    /// wants PyPy alone to differ can say so without restating the family.
+    #[test]
+    fn a_toolchains_own_override_beats_its_familys_field_by_field() {
+        let both = FROM_THE_SPECIFICATION.replace(
+            "overrideLimits:\n  python:\n",
+            "overrideLimits:\n  pypy3:\n    timeMs: 1500\n  python:\n",
+        );
+        let config = Config::parse(&both).unwrap();
+
+        let pypy = config.for_language(&["python", "pypy3"]);
+        assert_eq!(pypy.time_ms, 1500, "PyPy is faster, and says so itself");
+        assert_eq!(
+            pypy.memory_bytes, 536870912,
+            "and the family's entry still fills what PyPy did not name"
+        );
+
+        // CPython keeps the family's, untouched by PyPy's.
+        assert_eq!(config.for_language(&["python", "python3"]).time_ms, 3000);
     }
 
     /// Pins the reading documented on `effective`: most specific first. If this
@@ -550,7 +612,7 @@ extraCompilationFiles: []
     fn a_group_limit_beats_a_language_override() {
         let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
 
-        let python = config.effective(2, "python");
+        let python = config.effective(2, &["python"]);
         assert_eq!(python.time_ms, 2000, "the group's own limit wins");
         assert_eq!(
             python.memory_bytes, 536870912,
@@ -572,7 +634,7 @@ extraCompilationFiles: []
         // Everything the overlay did not name is untouched.
         assert_eq!(attached.max_score(), 100);
         assert_eq!(
-            attached.effective(2, "cpp").time_ms,
+            attached.effective(2, &["cpp"]).time_ms,
             2000,
             "the group still states its own"
         );

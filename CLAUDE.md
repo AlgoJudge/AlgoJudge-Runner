@@ -98,6 +98,38 @@ the package. Two rules are easy to get wrong and matter to a participant:
   failed, not that the answer was wrong. Conflating them turns a bug in a
   checker into a rejected submission.
 
+### The language catalogue (2026-08-22)
+
+**Eighteen toolchains in three families**, as a table in
+`crates/aj-standard-io/src/language.rs`. Adding a row is a data change; the
+build command is a template string handed to the container as opaque argv.
+
+Ids have **two levels** — `cpp17-gcc`, not `cpp17` — because a standard is not a
+toolchain and `g++` and `clang++` do not always agree. A header shows the
+standard; a submit form offers the toolchain. `cpp` and `python` still resolve,
+to `cpp20-gcc` and `python3`, because every package on disk names them.
+
+**Two things are keyed by *family*, not by toolchain, and both fail silently
+when that is got wrong**: the forbidden-identifier dictionary and a package's
+`overrideLimits`. A lookup that misses returns *no violations* and *no
+override* — indistinguishable from a clean submission judged under the package's
+own limits. Both now try the id and then the family, and `policy.rs` matches the
+family as an enum so a fourth one will not compile until somebody decides what
+its rules are.
+
+**Language is required.** It used to default to `cpp`; an absent one is now an
+**infrastructure failure**, because it means the job arrived incomplete and the
+submission stays rejudgeable. A file whose extension the chosen toolchain does
+not accept is the opposite — a **verdict**, `Compilation error`, because the
+participant chose both and the compiler would have said so anyway.
+
+Four images carry the eighteen: `images/gcc`, `images/clang`, `images/python`,
+`images/pypy`. **Debian, not Alpine** — PyPy has no musl build and Clang plus
+static linking is less certain there; trixie rather than bookworm because
+`-std=c23` and `-std=c++23` are what the catalogue asks for and GCC 12 spells
+them differently. Nothing builds them for you, and every judging case fails
+without them.
+
 ### What language a message is in (2026-08-09)
 
 **Anything the Runner writes itself is English.** Verdicts, `note`, the

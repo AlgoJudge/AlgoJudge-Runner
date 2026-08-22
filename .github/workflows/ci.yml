@@ -92,8 +92,10 @@ jobs:
       # the Runner in the stack doing the judging and nobody helping it.
       - name: Build the language images
         run: |
-          docker build -t algojudge/lang-cpp:local    images/cpp
+          docker build -t algojudge/lang-gcc:local    images/gcc
+          docker build -t algojudge/lang-clang:local  images/clang
           docker build -t algojudge/lang-python:local images/python
+          docker build -t algojudge/lang-pypy:local   images/pypy
 
       - name: Judge every outcome, end to end
         env:
@@ -168,8 +170,10 @@ jobs:
 
       - name: Build the language images
         run: |
-          docker build -t algojudge/lang-cpp:local    images/cpp
+          docker build -t algojudge/lang-gcc:local    images/gcc
+          docker build -t algojudge/lang-clang:local  images/clang
           docker build -t algojudge/lang-python:local images/python
+          docker build -t algojudge/lang-pypy:local   images/pypy
 
       # The one that proves the whole thing: a submission goes in, a mark comes
       # out, and it is the right mark.

@@ -606,13 +606,26 @@ async fn judge(
             let tests = aj_package::TestSet::read(&package.here, &package_config)
                 .map_err(|e| e.to_string())?;
             let bytes = std::fs::read(source.path()).map_err(|e| e.to_string())?;
-            let language = job.language.as_deref().unwrap_or("cpp");
+
+            // **Required, and not guessed at.** It defaulted to `cpp`, which
+            // was harmless while C++ was one of two languages and is not now:
+            // a submission arriving without one would be compiled as C++20 by
+            // GCC and reported as a compilation error in a language nobody
+            // chose. An absent language is the Server or the Client having
+            // sent an incomplete job — an infrastructure failure, which leaves
+            // the submission rejudgeable once that is fixed, rather than a
+            // verdict against somebody's work.
+            let language = job
+                .language
+                .as_deref()
+                .ok_or("the submission names no language, and this Runner will not guess one")?;
 
             let evaluated = pipeline
                 .evaluate(&aj_standard_io::Job {
                     config: &package_config,
                     tests: &tests,
                     language,
+                    file_name: &submitted.file_name,
                     source: &bytes,
                     package,
                     work: work.places.join("scratch"),
@@ -1085,10 +1098,7 @@ mod tests {
             cache_max_bytes: 0,
             work_path: "/dev/null".into(),
             work_host_path: "/dev/null".into(),
-            images: aj_standard_io::Images {
-                cpp: String::new(),
-                python: String::new(),
-            },
+            images: aj_standard_io::Images::default(),
             allow_cgroup_v1: false,
         }
     }

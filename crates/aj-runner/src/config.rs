@@ -97,12 +97,31 @@ impl Config {
 
             allow_cgroup_v1: var("Sandbox__AllowCgroupV1").is_some(),
 
-            images: aj_standard_io::Images {
-                cpp: var("Sandbox__Image__Cpp")
-                    .unwrap_or_else(|| "algojudge/lang-cpp:local".into()),
-                python: var("Sandbox__Image__Python")
-                    .unwrap_or_else(|| "algojudge/lang-python:local".into()),
-            },
+            // **Four images, eighteen toolchains.** Named one at a time, and
+            // anything not named keeps the compiled-in default — so an
+            // operator republishing the GCC image alone says so in one
+            // variable instead of restating the other three.
+            //
+            // `Sandbox__Image__Cpp` was the old name for the GCC image and is
+            // still read, because it is what every deployment and every
+            // compose file in this repository sets today. It is the old name
+            // for one of the four, not a fifth image.
+            images: [
+                // The old name first, so the new one wins when both are set.
+                (aj_standard_io::language::GCC, "Sandbox__Image__Cpp"),
+                (aj_standard_io::language::GCC, "Sandbox__Image__Gcc"),
+                (aj_standard_io::language::CLANG, "Sandbox__Image__Clang"),
+                (aj_standard_io::language::CPYTHON, "Sandbox__Image__Python"),
+                (aj_standard_io::language::PYPY, "Sandbox__Image__Pypy"),
+            ]
+            .into_iter()
+            .fold(
+                aj_standard_io::Images::default(),
+                |images, (key, name)| match var(name) {
+                    Some(image) => images.with(key, image),
+                    None => images,
+                },
+            ),
         })
     }
 
