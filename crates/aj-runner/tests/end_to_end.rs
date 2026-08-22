@@ -831,8 +831,9 @@ async fn a_window_does_not_cost_a_participant_their_submission() {
         ))
         .multipart(
             reqwest::multipart::Form::new()
-                .text("language", "cpp")
+                .text("props", r#"{"type":"standard-io@1","language":"cpp"}"#)
                 .text("code", correct.to_owned())
+                .text("fileName", "main.cpp")
                 .text("sha256", hex::encode(Sha256::digest(correct.as_bytes()))),
         )
         .send()
