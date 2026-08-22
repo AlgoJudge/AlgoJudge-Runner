@@ -244,11 +244,23 @@ pub struct ClaimedJob {
     /// Runner's job now.
     #[serde(default)]
     pub props: Option<serde_json::Value>,
+    /// What the problem type needs to know about the pinned **version** —
+    /// `uva@1`'s archive problem number, for instance.
+    ///
+    /// **Identity, not settings.** It is not a layer of the configuration chain,
+    /// which is the package and then the assignment; it says *which problem this
+    /// is*, and no assignment should have to restate that.
+    ///
+    /// Absent where the type needs none. A Runner that needs it and finds none
+    /// reports an infrastructure failure naming what is missing — the Server
+    /// cannot check, because it does not read this and must not branch on a
+    /// problem type.
+    #[serde(default)]
+    pub problem_version_props: Option<serde_json::Value>,
     /// The assignment's own configuration, to be laid over the package's.
     ///
-    /// **One layer, not a merged chain.** `ProblemVersion.Config` was dropped on
-    /// 2026-08-22 and the Server merges nothing any more; the only merge left is
-    /// `Config::overlaid`, here.
+    /// **One layer, not a merged chain.** The Server merges nothing any more;
+    /// the only merge left is `Config::overlaid`, here.
     #[serde(default)]
     pub config: Option<serde_json::Value>,
 }
