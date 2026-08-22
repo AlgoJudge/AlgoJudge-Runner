@@ -240,9 +240,30 @@ impl Config {
     /// judged under the package's limits in both. The format describes the chain
     /// as working and the Server computes it; the Runner was throwing it away.
     ///
-    /// Merged the same way the Server merges: **top-level members replace**. A
-    /// deeper merge would require knowing what the members mean, which is
-    /// exactly what neither side is allowed to know.
+    /// **Merged in depth, since 2026-08-22.** It used to replace whole top-level
+    /// members, on the stated grounds that anything deeper "would require
+    /// knowing what the members mean". That is not so — merging two JSON objects
+    /// is structural, and the rule cost real work: narrowing a time limit meant
+    /// restating the memory limit beside it, and an author who forgot got
+    /// `missing field memoryBytes` rather than the limit they asked for.
+    ///
+    /// So an overlay may now name one option:
+    ///
+    /// ```yaml
+    /// limits: { timeMs: 500 }     # memoryBytes stays whatever the package said
+    /// ```
+    ///
+    /// **Arrays replace, with one exception**: an array whose elements all carry
+    /// a distinct numeric `group` merges by it, so an assignment can narrow one
+    /// group without restating the rest. Uniqueness is the condition rather than
+    /// the field name — `groups` has it and the format enforces it, while
+    /// `calibration.measured` repeats a group once per language, and merging
+    /// that by group would silently collapse the languages into one row.
+    ///
+    /// **Nothing can be removed.** A deep merge adds and replaces; it has no way
+    /// to say "unset". Everything an overlay could have unset by omission is a
+    /// required field, so unsetting it only ever produced a validation error —
+    /// an overlay is for narrowing, not for cutting.
     ///
     /// An overlay naming something this format has no field for is **refused**,
     /// not ignored — a misspelled limit is a limit that silently did not apply.
@@ -264,7 +285,11 @@ impl Config {
             if name == "format" || name == "version" {
                 continue;
             }
-            merged.insert(name.clone(), value.clone());
+            let combined = match merged.get(name) {
+                Some(existing) => merge(existing, value),
+                None => value.clone(),
+            };
+            merged.insert(name.clone(), combined);
         }
 
         let config: Config = serde_json::from_value(serde_json::Value::Object(merged))
@@ -340,6 +365,67 @@ impl Config {
     pub fn max_score(&self) -> u32 {
         self.groups.iter().map(|g| g.points).sum()
     }
+}
+
+/// One value laid over another, in depth.
+///
+/// Objects merge member by member, recursively; everything else is replaced.
+/// Arrays are the one interesting case — see [`keyed_by_group`].
+fn merge(base: &serde_json::Value, over: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+
+    match (base, over) {
+        (Value::Object(below), Value::Object(above)) => {
+            let mut out = below.clone();
+            for (name, value) in above {
+                let combined = match below.get(name) {
+                    Some(existing) => merge(existing, value),
+                    None => value.clone(),
+                };
+                out.insert(name.clone(), combined);
+            }
+            Value::Object(out)
+        }
+
+        (Value::Array(below), Value::Array(above))
+            if keyed_by_group(below) && keyed_by_group(above) =>
+        {
+            let mut out = below.clone();
+            for element in above {
+                let group = group_of(element);
+                match out.iter_mut().find(|existing| group_of(existing) == group) {
+                    Some(existing) => *existing = merge(existing, element),
+                    // A group the package does not have is an addition rather
+                    // than an override. The format decides whether it is legal;
+                    // this only decides where it goes.
+                    None => out.push(element.clone()),
+                }
+            }
+            Value::Array(out)
+        }
+
+        _ => over.clone(),
+    }
+}
+
+/// Whether an array is a set of things identified by `group`.
+///
+/// **Uniqueness is the test, not the field name.** `groups` carries one entry
+/// per group and the format refuses a duplicate, so the number identifies the
+/// entry and merging by it is meaningful. `calibration.measured` carries the
+/// same group once per language, so there the number identifies nothing — and
+/// merging by it would fold several languages' measurements into one.
+fn keyed_by_group(elements: &[serde_json::Value]) -> bool {
+    let groups: Vec<Option<u64>> = elements.iter().map(group_of).collect();
+    if groups.iter().any(Option::is_none) {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::new();
+    groups.iter().all(|g| seen.insert(*g))
+}
+
+fn group_of(element: &serde_json::Value) -> Option<u64> {
+    element.get("group").and_then(serde_json::Value::as_u64)
 }
 
 fn apply(limits: &mut Limits, over: &PartialLimits) {
@@ -526,6 +612,80 @@ extraCompilationFiles: []
     /// that each layer beats the one before, never in which direction. Today an
     /// overlay applies as given — it may raise a limit as well as tighten one.
     /// If that is settled the other way, it is settled in `overlaid`.
+    /// One option, without restating the ones beside it.
+    ///
+    /// This is what the deep merge was for. Under the old rule `limits` was
+    /// replaced whole, so narrowing the time meant repeating the memory — and an
+    /// author who forgot got `missing field memoryBytes` instead of a limit.
+    #[test]
+    fn an_overlay_may_name_one_option_and_leave_the_rest() {
+        let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
+        let before = config.limits.memory_bytes;
+
+        let narrowed = config
+            .overlaid(Some(&serde_json::json!({ "limits": { "timeMs": 250 } })))
+            .unwrap();
+
+        assert_eq!(narrowed.limits.time_ms, 250);
+        assert_eq!(
+            narrowed.limits.memory_bytes, before,
+            "the memory limit should have been inherited, not dropped",
+        );
+    }
+
+    /// One group narrowed, the others left as the package wrote them.
+    #[test]
+    fn an_overlay_may_narrow_one_group_without_restating_the_others() {
+        let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
+        let groups_before = config.groups.len();
+        let points_before: u32 = config.groups.iter().map(|g| g.points).sum();
+
+        let narrowed = config
+            .overlaid(Some(&serde_json::json!({
+                "groups": [{ "group": 1, "limits": { "timeMs": 250 } }]
+            })))
+            .unwrap();
+
+        assert_eq!(
+            narrowed.groups.len(),
+            groups_before,
+            "the other groups should have survived: {:?}",
+            narrowed.groups,
+        );
+        assert_eq!(
+            narrowed.groups.iter().map(|g| g.points).sum::<u32>(),
+            points_before,
+            "and kept their points, which the overlay never mentioned",
+        );
+        let one = narrowed.groups.iter().find(|g| g.group == 1).unwrap();
+        assert_eq!(one.limits.and_then(|l| l.time_ms), Some(250));
+    }
+
+    /// An array whose `group` is not an identity replaces instead of merging.
+    ///
+    /// `calibration.measured` carries one row per group **per language**, so the
+    /// number identifies nothing there. Merging by it would fold two languages'
+    /// measurements into one row, quietly, and the calibration that came out
+    /// would be a number nobody measured.
+    #[test]
+    fn an_array_that_repeats_a_group_is_replaced_rather_than_merged() {
+        let two_languages = serde_json::json!([
+            { "group": 1, "language": "cpp",    "timeMs": 100 },
+            { "group": 1, "language": "python", "timeMs": 900 },
+        ]);
+        let one_language = serde_json::json!([
+            { "group": 1, "language": "cpp", "timeMs": 120 },
+        ]);
+
+        let merged = merge(&two_languages, &one_language);
+
+        assert_eq!(
+            merged.as_array().map(Vec::len),
+            Some(1),
+            "a repeated group is not a key, so the array is replaced: {merged}",
+        );
+    }
+
     #[test]
     fn an_overlay_may_currently_raise_a_limit_as_well_as_lower_one() {
         let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
