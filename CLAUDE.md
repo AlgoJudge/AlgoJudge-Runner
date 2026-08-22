@@ -130,6 +130,26 @@ static linking is less certain there; trixie rather than bookworm because
 them differently. Nothing builds them for you, and every judging case fails
 without them.
 
+### Where a job's parts come from (2026-08-22)
+
+A claimed job carries **three opaque documents** and the Server reads none of
+them. Which member of each means what is this crate's business:
+
+- **`props`** — what the participant declared. `standard-io@1` reads `language`
+  out of it. Absent is an **infrastructure failure**: the job arrived incomplete
+  and the submission stays rejudgeable.
+- **`problemVersionProps`** — which problem this is. `uva@1` reads its archive
+  number out of it; `standard-io@1` needs none. Identity, not settings: it is not
+  a layer of the configuration chain.
+- **`config`** — the assignment's own, laid over the package's by
+  `Config::overlaid`. **One layer**: the Server merges nothing, because
+  `ProblemVersion.Config` is gone and there is nothing left to merge.
+
+A language the assignment's `config.languages` excludes is refused **here**, as
+the verdict `PolicyViolation` — nothing was offered to a compiler, the code may
+be perfect, and what was broken is a rule of the activity. An empty list means
+the assignment said nothing, which allows everything this Runner can build.
+
 ### What language a message is in (2026-08-09)
 
 **Anything the Runner writes itself is English.** Verdicts, `note`, the
