@@ -4,21 +4,28 @@
 //! thing that matters: that a submission goes in and a correct mark comes out.
 //! This does, and it is the only test here that can.
 //!
+//! **Nothing builds the four language images for you**, and every case here
+//! fails at its first line without them:
+//!
 //! ```text
-//! docker build -t algojudge/lang-cpp:local    images/cpp
+//! docker build -t algojudge/lang-gcc:local    images/gcc
+//! docker build -t algojudge/lang-clang:local  images/clang
 //! docker build -t algojudge/lang-python:local images/python
+//! docker build -t algojudge/lang-pypy:local   images/pypy
 //! AJ_DOCKER_SOCKET=1 ./x test -p aj-standard-io --test judging -- --include-ignored --test-threads=1
 //! ```
+//!
+//! `--test-threads=1` is not a preference: run in parallel these fight over the
+//! container runtime and all of them fail.
 
 use std::path::{Path, PathBuf};
 
 use aj_package::{Config, TestSet};
 use aj_sandbox::{Docker, Sandbox};
-use aj_standard_io::{Evaluated, Images, Job, Pipeline, Places};
+use aj_standard_io::{catalogue, for_id, Evaluated, Family, Images, Job, Pipeline, Places};
 
 const CONFIG: &str = r#"
-format: standard-io
-version: 1
+type: "standard-io@1"
 limits:
   timeMs: 2000
   memoryBytes: 268435456
@@ -40,6 +47,22 @@ int main() { long long a, b; std::cin >> a >> b; std::cout << a + b << "\n"; }
 
 const CORRECT_PYTHON: &str = "a, b = input().split()\nprint(int(a) + int(b))\n";
 
+/// The same program in C, written to the **oldest** standard the catalogue
+/// offers so that one source serves all eight C rows.
+///
+/// `long` rather than `long long`, declarations before statements, no `//`
+/// comment: `-std=c89 -pedantic-errors` rejects each of those, and the largest
+/// sum this package asks for is three million, which fits a 32-bit `long`.
+const CORRECT_C: &str = r#"
+#include <stdio.h>
+int main(void) {
+    long a, b;
+    if (scanf("%ld %ld", &a, &b) != 2) return 1;
+    printf("%ld\n", a + b);
+    return 0;
+}
+"#;
+
 async fn pipeline() -> Pipeline<Docker> {
     let docker = Docker::connect().expect("a container runtime");
     if let Err(e) = docker.preflight().await {
@@ -49,9 +72,9 @@ async fn pipeline() -> Pipeline<Docker> {
         );
     }
     let images = Images::default();
-    for image in [&images.cpp, &images.python] {
+    for image in images.all() {
         docker
-            .ensure_image(image)
+            .ensure_image(&image)
             .await
             .unwrap_or_else(|e| panic!("{image} is not built: {e}\nbuild it from images/"));
     }
@@ -118,6 +141,21 @@ fn fixture(name: &str) -> (PathBuf, PathBuf) {
     (here, on_the_host)
 }
 
+/// A file name the toolchain accepts, from the catalogue rather than guessed.
+///
+/// This suite is about judging and not about the extension check, so every job
+/// in it carries a name that matches what it says it is.
+fn file_named(language: &str) -> &'static str {
+    let resolved = for_id(language, &Images::default())
+        .unwrap_or_else(|| panic!("{language} is not a toolchain"));
+
+    match resolved.family {
+        Family::C => "main.c",
+        Family::Cpp => "main.cpp",
+        Family::Python => "main.py",
+    }
+}
+
 async fn judge(name: &str, language: &str, source: &str) -> Evaluated {
     let pipeline = pipeline().await;
     let (package, config, tests) = package(name);
@@ -127,6 +165,7 @@ async fn judge(name: &str, language: &str, source: &str) -> Evaluated {
             config: &config,
             tests: &tests,
             language,
+            file_name: file_named(language),
             source: source.as_bytes(),
             package,
             work: work(name),
@@ -150,6 +189,210 @@ fn verdict(evaluated: Evaluated) -> aj_standard_io::Verdict {
     }
 }
 
+/// **A language the assignment excluded is refused here, and nowhere else.**
+///
+/// The Server used to refuse it, against a list on the activity. It cannot: the
+/// language is one member of a document it does not read, so the allowed set
+/// travels in the assignment's `config` and the refusal happens where a language
+/// id means something.
+///
+/// `PolicyViolation`, not a compilation error: nothing was offered to a
+/// compiler, the code may be perfect, and what was broken is a rule of the
+/// activity. It leaves the submission rejudgeable if a manager widens the set.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_language_the_assignment_excluded_is_a_policy_violation() {
+    const PYTHON_ONLY: &str = r#"
+type: "standard-io@1"
+limits:
+  timeMs: 2000
+  memoryBytes: 268435456
+languages: [python3]
+groups:
+  - group: 0
+    points: 0
+    examples: true
+  - group: 1
+    points: 100
+"#;
+
+    let pipeline = pipeline().await;
+    let (here, on_host) = fixture("excluded-language");
+    std::fs::create_dir_all(here.join("tests")).unwrap();
+    std::fs::write(here.join("config.yml"), PYTHON_ONLY).unwrap();
+    for (test, input, expected) in [
+        (
+            "0a", "1 2
+", "3
+",
+        ),
+        (
+            "1a", "10 20
+", "30
+",
+        ),
+    ] {
+        std::fs::write(here.join(format!("tests/{test}.in")), input).unwrap();
+        std::fs::write(here.join(format!("tests/{test}.out")), expected).unwrap();
+    }
+
+    let config = Config::parse(PYTHON_ONLY).unwrap();
+    let tests = TestSet::read(&here, &config).unwrap();
+
+    let judged = verdict(
+        pipeline
+            .evaluate(&Job {
+                config: &config,
+                tests: &tests,
+                language: "cpp20-gcc",
+                file_name: "main.cpp",
+                source: CORRECT_CPP.as_bytes(),
+                package: Places { here, on_host },
+                work: work("excluded-language"),
+            })
+            .await,
+    );
+
+    assert_eq!(judged.judgement.verdict, "PolicyViolation");
+    assert_eq!(judged.judgement.score, 0.0);
+
+    let said = &judged.details.compilation.log;
+    assert!(
+        said.contains("C++20 (GCC)"),
+        "the language is named as a person reads it: {said}"
+    );
+    assert!(
+        said.contains("python3"),
+        "and what is accepted is listed: {said}"
+    );
+}
+
+/// The other half of the same rule: an assignment that names no languages allows
+/// everything this Runner can build. Empty is "the assignment did not say", not
+/// "the assignment allows none".
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn an_assignment_that_names_no_languages_allows_them_all() {
+    let judged = verdict(judge("no-language-list", "cpp20-gcc", CORRECT_CPP).await);
+    assert_eq!(judged.judgement.verdict, "Accepted");
+}
+
+// ── The whole catalogue ─────────────────────────────────────────────────────
+
+/// **Every row of the table, built and run for real.**
+///
+/// The catalogue is data, and data is exactly the kind of change that looks
+/// right and is not: `-std=c23` is a flag GCC 12 rejects and GCC 14 accepts,
+/// `-static` needs a static libstdc++ that a Clang image does not get by
+/// installing Clang, and `pypy3` is a binary that either is on the path or is
+/// not. None of that is visible in a unit test over the strings — the strings
+/// are fine in all four failing cases.
+///
+/// So this judges a correct solution through each of the eighteen and expects
+/// full marks. It is the slowest test in the repository and it is the only
+/// evidence that the toolchains exist.
+///
+/// **Every failure is collected rather than the first one panicking.** A broken
+/// image usually breaks its whole half of the table, and being told about
+/// `c89-gcc` alone would cost eight runs of a two-minute test to learn what one
+/// run already knew.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn every_toolchain_in_the_catalogue_builds_and_runs() {
+    let mut broken: Vec<String> = Vec::new();
+
+    for language in catalogue(&Images::default()) {
+        let source = match language.family {
+            Family::C => CORRECT_C,
+            Family::Cpp => CORRECT_CPP,
+            Family::Python => CORRECT_PYTHON,
+        };
+
+        match judge(language.id, language.id, source).await {
+            Evaluated::Judged(judged) => {
+                if judged.judgement.verdict != "Accepted" {
+                    broken.push(format!(
+                        "{} ({}): {} — {}",
+                        language.id,
+                        language.image,
+                        judged.judgement.verdict,
+                        judged.details.compilation.log.trim(),
+                    ));
+                }
+            }
+            Evaluated::Failed(reason) => {
+                broken.push(format!("{} ({}): {reason}", language.id, language.image));
+            }
+        }
+    }
+
+    assert!(
+        broken.is_empty(),
+        "{} of 18 toolchains did not judge a correct solution:
+{}",
+        broken.len(),
+        broken.join(
+            "
+"
+        ),
+    );
+}
+
+/// The two ids every package on disk was written with still judge, and judge
+/// as the toolchains they now name.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn the_ids_packages_were_written_with_still_judge() {
+    for (alias, source) in [("cpp", CORRECT_CPP), ("python", CORRECT_PYTHON)] {
+        let judged = verdict(judge(&format!("alias-{alias}"), alias, source).await);
+        assert_eq!(judged.judgement.verdict, "Accepted", "{alias}");
+        assert_eq!(judged.judgement.score, 100.0, "{alias}");
+    }
+}
+
+/// A participant who picked the wrong language from the form is told so, and is
+/// told it as a **verdict** — the submission was judged, badly, by them.
+///
+/// The alternative was an infrastructure failure, which would leave the
+/// submission in a state that says the platform broke. It did not; the compiler
+/// would have refused this thirty seconds later with a worse message.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_file_the_chosen_toolchain_does_not_accept_is_a_compilation_error() {
+    let pipeline = pipeline().await;
+    let (package, config, tests) = package("wrong-extension");
+
+    let judged = verdict(
+        pipeline
+            .evaluate(&Job {
+                config: &config,
+                tests: &tests,
+                language: "cpp17-gcc",
+                // Python, submitted as C++. The Client offers a select and a
+                // file field, and nothing stops the two disagreeing.
+                file_name: "solution.py",
+                source: CORRECT_PYTHON.as_bytes(),
+                package,
+                work: work("wrong-extension"),
+            })
+            .await,
+    );
+
+    assert_eq!(judged.judgement.verdict, "Compilation error");
+    assert_eq!(judged.judgement.score, 0.0);
+
+    let said = &judged.details.compilation.log;
+    assert!(said.contains("solution.py"), "{said}");
+    assert!(
+        said.contains(".cpp"),
+        "the accepted extensions are named: {said}"
+    );
+    assert!(
+        said.contains("C++17 (GCC)"),
+        "the language is named as a person reads it: {said}"
+    );
+}
+
 // ── The one that matters ────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -162,7 +405,7 @@ async fn a_correct_cpp_solution_is_accepted_with_full_marks() {
     assert_eq!(judged.judgement.max_score, 100.0);
 
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
-    assert_eq!(document["kind"], "standard-io");
+    assert_eq!(document["type"], "standard-io@1");
     assert_eq!(document["compilation"]["status"], "OK");
     assert_eq!(document["tests"].as_array().unwrap().len(), 3);
     assert!(
@@ -449,6 +692,7 @@ async fn the_committed_package_judges_a_correct_solution() {
             config: &config,
             tests: &tests,
             language: "cpp",
+            file_name: "main.cpp",
             source: CORRECT_CPP.as_bytes(),
             package: Places {
                 here: unpacked,
@@ -565,4 +809,150 @@ int main() { long long a, b; std::cin >> a >> b; volatile int *p = nullptr; *p =
     let fine = verdict(judge("cpp-reason-ok", "cpp", CORRECT_CPP).await);
     let fine_doc: serde_json::Value = serde_json::from_slice(&fine.details.to_bytes()).unwrap();
     assert!(fine_doc["tests"][0].get("reason").is_none());
+}
+
+/// The document states the limits the submission was actually held to.
+///
+/// **It used to state the package's global pair**, whatever the run had been
+/// judged under. A package that gives Python longer — which is the whole reason
+/// `overrideLimits` exists — produced a result document telling the participant
+/// a `timeMs` no test of theirs was ever measured against. The document
+/// contradicted the run it describes, on the same screen.
+///
+/// Judged in Python, because that is the language the override below names.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn the_document_reports_the_limit_the_run_was_held_to() {
+    const OVERRIDDEN: &str = r#"
+type: "standard-io@1"
+limits:
+  timeMs: 2000
+  memoryBytes: 268435456
+overrideLimits:
+  python:
+    timeMs: 9000
+groups:
+  - group: 0
+    points: 0
+    examples: true
+  - group: 1
+    points: 40
+  - group: 2
+    points: 60
+"#;
+
+    let pipeline = pipeline().await;
+    let (here, on_host) = fixture("limits-reported");
+    std::fs::create_dir_all(here.join("tests")).unwrap();
+    std::fs::write(here.join("config.yml"), OVERRIDDEN).unwrap();
+    for (test, input, expected) in [
+        ("0a", "1 2\n", "3\n"),
+        ("1a", "10 20\n", "30\n"),
+        ("2a", "1000000 2000000\n", "3000000\n"),
+    ] {
+        std::fs::write(here.join(format!("tests/{test}.in")), input).unwrap();
+        std::fs::write(here.join(format!("tests/{test}.out")), expected).unwrap();
+    }
+
+    let config = Config::parse(OVERRIDDEN).unwrap();
+    let tests = TestSet::read(&here, &config).unwrap();
+
+    let judged = verdict(
+        pipeline
+            .evaluate(&Job {
+                config: &config,
+                tests: &tests,
+                language: "python",
+                file_name: "main.py",
+                source: b"a, b = map(int, input().split())\nprint(a + b)\n",
+                package: Places { here, on_host },
+                work: work("limits-reported"),
+            })
+            .await,
+    );
+
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    assert_eq!(
+        document["limits"]["timeMs"], 9000,
+        "the document should carry Python's own limit, not the package's global one: {}",
+        document["limits"],
+    );
+}
+
+/// Overrunning the limit is a time limit, even when nothing had to kill it.
+///
+/// **Until 2026-08-22 it was not.** A test container is given the limit *plus a
+/// second of grace*, because a program wedged in an uninterruptible syscall has
+/// to be reaped from outside — and nothing then compared the measurement against
+/// the limit itself, although the comment beside the deadline said the verdict
+/// came from exactly that. So a solution that overran by anything less than the
+/// grace stopped on its own, was never reaped, and was marked correct: at a
+/// one-second limit, a program taking 1.9 s was `Accepted`.
+///
+/// This one is given half a second and takes about eight tenths: comfortably
+/// over the limit, comfortably inside the grace, which is the window that used
+/// to be free.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn overrunning_the_limit_inside_the_grace_is_still_a_time_limit() {
+    const TIGHT: &str = r#"
+type: "standard-io@1"
+limits:
+  timeMs: 500
+  memoryBytes: 268435456
+groups:
+  - group: 0
+    points: 0
+    examples: true
+  - group: 1
+    points: 40
+  - group: 2
+    points: 60
+"#;
+
+    let pipeline = pipeline().await;
+    let (here, on_host) = fixture("overrun");
+    std::fs::create_dir_all(here.join("tests")).unwrap();
+    std::fs::write(here.join("config.yml"), TIGHT).unwrap();
+    for (test, input, expected) in [
+        ("0a", "1 2\n", "3\n"),
+        ("1a", "10 20\n", "30\n"),
+        ("2a", "1000000 2000000\n", "3000000\n"),
+    ] {
+        std::fs::write(here.join(format!("tests/{test}.in")), input).unwrap();
+        std::fs::write(here.join(format!("tests/{test}.out")), expected).unwrap();
+    }
+
+    let config = Config::parse(TIGHT).unwrap();
+    let tests = TestSet::read(&here, &config).unwrap();
+
+    let slow = "#include <iostream>\n#include <chrono>\nint main(){long long a,b;std::cin>>a>>b;auto t=std::chrono::steady_clock::now();while(std::chrono::steady_clock::now()-t<std::chrono::milliseconds(800)){}std::cout<<a+b<<std::endl;}\n";
+
+    let judged = verdict(
+        pipeline
+            .evaluate(&Job {
+                config: &config,
+                tests: &tests,
+                language: "cpp",
+                file_name: "main.cpp",
+                source: slow.as_bytes(),
+                package: Places { here, on_host },
+                work: work("overrun"),
+            })
+            .await,
+    );
+
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    assert_ne!(
+        judged.judgement.verdict, "Accepted",
+        "a solution that took longer than its limit was accepted: {document}",
+    );
+    assert!(
+        document["tests"][0]["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Time limit exceeded"),
+        "and it should say so by name: {}",
+        document["tests"][0],
+    );
 }

@@ -193,8 +193,7 @@ mod tests {
     use super::*;
 
     const CONFIG: &str = r#"
-format: standard-io
-version: 1
+type: "standard-io@1"
 limits:
   timeMs: 1000
   memoryBytes: 262144

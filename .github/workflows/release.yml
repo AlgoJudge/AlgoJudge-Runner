@@ -95,8 +95,10 @@ jobs:
           )
 
           docker build "${labels[@]}" -t algojudge-runner:release .
-          docker build "${labels[@]}" -t lang-cpp:release    images/cpp
+          docker build "${labels[@]}" -t lang-gcc:release    images/gcc
+          docker build "${labels[@]}" -t lang-clang:release  images/clang
           docker build "${labels[@]}" -t lang-python:release images/python
+          docker build "${labels[@]}" -t lang-pypy:release   images/pypy
 
       # **The Runner's image has no shell**, so there is exactly one thing that
       # can be run in it: the Runner. Started with no configuration it refuses
@@ -116,20 +118,23 @@ jobs:
       # with an infrastructure failure, one per test, and look like the Runner.
       - name: The toolchains are in the language images
         run: |
-          docker run --rm lang-cpp:release    g++ --version
+          docker run --rm lang-gcc:release    g++ --version
+          docker run --rm lang-gcc:release    gcc --version
+          docker run --rm lang-clang:release  clang --version
           docker run --rm lang-python:release python3 --version
+          docker run --rm lang-pypy:release   pypy3 --version
 
       - name: Log in to ghcr.io
         run: |
           printf '%s' '${{ github.token }}' \
             | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
 
-      # Pushed last and together, after all three have been built and checked,
+      # Pushed last and together, after all five have been built and checked,
       # so a broken language image cannot leave a published Runner pointing at
       # a version of it that does not exist.
       - name: Push
         run: |
-          for image in algojudge-runner lang-cpp lang-python; do
+          for image in algojudge-runner lang-gcc lang-clang lang-python lang-pypy; do
             for tag in ${{ steps.v.outputs.tags }}; do
               docker tag "$image:release" "${{ steps.v.outputs.registry }}/$image:$tag"
               docker push "${{ steps.v.outputs.registry }}/$image:$tag"

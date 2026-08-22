@@ -7,8 +7,10 @@
 //! is what the participant would read.
 //!
 //! ```text
-//! docker build -t algojudge/lang-cpp:local    images/cpp
+//! docker build -t algojudge/lang-gcc:local    images/gcc
+//! docker build -t algojudge/lang-clang:local  images/clang
 //! docker build -t algojudge/lang-python:local images/python
+//! docker build -t algojudge/lang-pypy:local   images/pypy
 //! docker compose -f example-runner-development-docker-compose.yaml up -d --build --wait
 //!
 //! AJ_TEST_SERVER=http://host.docker.internal:8080/api/v1 \
@@ -199,6 +201,18 @@ impl Session {
     }
 
     async fn submit(&self, activity: &str, source: &str, language: &str) -> String {
+        /// A name the toolchain accepts. The Runner refuses a file whose
+        /// extension its toolchain does not, so this is not decoration.
+        fn file_named(language: &str) -> &'static str {
+            if language.starts_with("py") || language.starts_with("python") {
+                "main.py"
+            } else if language.starts_with("cpp") || language == "c++" {
+                "main.cpp"
+            } else {
+                "main.c"
+            }
+        }
+
         let checksum = hex::encode(Sha256::digest(source.as_bytes()));
 
         let response = self
@@ -208,9 +222,18 @@ impl Session {
                 api()
             ))
             .multipart(
+                // **One opaque document, and a file name.** The language was a
+                // field the Server read; it is a member of `props` now, and the
+                // Server named pasted source from a table of seven extensions
+                // it no longer has — so the sender names it or the submission
+                // is refused.
                 reqwest::multipart::Form::new()
-                    .text("language", language.to_owned())
+                    .text(
+                        "props",
+                        format!(r#"{{"type":"standard-io@1","language":"{language}"}}"#),
+                    )
                     .text("code", source.to_owned())
+                    .text("fileName", file_named(language).to_owned())
                     .text("sha256", checksum),
             )
             .send()
@@ -267,6 +290,18 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 async fn publish_of_type(admin: &Session, package: Vec<u8>, problem_type: &str) -> String {
+    publish_with_config(admin, package, problem_type, None).await
+}
+
+/// The same, with a configuration on the **assignment** — the last link of the
+/// chain, which is the one an activity uses to say what a shared problem costs
+/// in its own round.
+async fn publish_with_config(
+    admin: &Session,
+    package: Vec<u8>,
+    problem_type: &str,
+    assignment_config: Option<serde_json::Value>,
+) -> String {
     let slug = unique("E2E");
 
     let activity = admin
@@ -279,7 +314,6 @@ async fn publish_of_type(admin: &Session, package: Vec<u8>, problem_type: &str) 
                 "rankingType": "icpc",
                 "timeZone": "Europe/Warsaw",
                 "joinPolicy": "open",
-                "languages": ["cpp", "python"],
                 "attachmentVisibility": [
                     { "name": "source", "visibility": "participant" },
                     { "name": "log", "visibility": "participant" },
@@ -329,10 +363,14 @@ async fn publish_of_type(admin: &Session, package: Vec<u8>, problem_type: &str) 
         )
         .await;
 
+    let mut assignment = json!({ "problemId": problem["id"], "slug": "A" });
+    if let Some(config) = assignment_config {
+        assignment["config"] = config;
+    }
     admin
         .post(
             &format!("/series/{}/problems", series["id"].as_str().unwrap()),
-            json!({ "problemId": problem["id"], "slug": "A" }),
+            assignment,
         )
         .await;
 
@@ -793,8 +831,9 @@ async fn a_window_does_not_cost_a_participant_their_submission() {
         ))
         .multipart(
             reqwest::multipart::Form::new()
-                .text("language", "cpp")
+                .text("props", r#"{"type":"standard-io@1","language":"cpp"}"#)
                 .text("code", correct.to_owned())
+                .text("fileName", "main.cpp")
                 .text("sha256", hex::encode(Sha256::digest(correct.as_bytes()))),
         )
         .send()
@@ -956,10 +995,7 @@ fn probe_config() -> Config {
         work_path: scratch.join("work"),
         work_host_path: scratch.join("work"),
         // Never used: nothing here evaluates anything.
-        images: aj_standard_io::Images {
-            cpp: String::new(),
-            python: String::new(),
-        },
+        images: aj_standard_io::Images::default(),
         allow_cgroup_v1: false,
     }
 }
@@ -975,4 +1011,77 @@ async fn claim_the_probe(server: &Server, config: &Config) -> aj_protocol::wire:
         }
     }
     panic!("no lease-probe@1 job was queued within a minute");
+}
+
+/// An assignment's own limits are the ones the submission is judged under.
+///
+/// **This is the whole configuration chain, end to end, and until 2026-08-22 it
+/// did nothing for the product's principal problem type.** The Server merged
+/// `ProblemVersion.Config` over the package and `SeriesProblem.Config` over
+/// that, sent the result with every job — and the `standard-io@1` arm parsed the
+/// package and discarded it. One library problem attached to two activities with
+/// different limits was judged under the package's limits in both, silently, and
+/// every sentence `PACKAGE_FORMAT.md` writes about the chain was untrue here.
+///
+/// The committed package gives a C++ solution a full second. This activity
+/// narrows that to ten milliseconds, which no container starts in — so the same
+/// solution that is `Accepted` everywhere else in this file has to come back as
+/// a time limit. If it does not, the overlay is being thrown away again.
+///
+/// **`limits` is restated whole, and that is the format's rule rather than this
+/// test being careful.** The merge replaces top-level members, because a deeper
+/// one would require knowing what they mean — so an assignment that narrows the
+/// time limit and says nothing about memory does not inherit the package's
+/// memory limit, it *removes* it, and the merged document then fails to read.
+/// Writing `{ "timeMs": 10 }` alone here cost a run and produced
+/// `missing field memoryBytes`, which is the error a manager would get too.
+#[tokio::test]
+#[ignore = "needs the development stack and the language images"]
+async fn an_assignments_own_limits_are_what_the_submission_is_judged_under() {
+    let admin = Session::as_("admin", "admin-development-only").await;
+    approve_the_runner(&admin).await;
+
+    let activity = publish_with_config(
+        &admin,
+        fixture("sum.zip"),
+        "standard-io@1",
+        Some(json!({ "limits": { "timeMs": 10, "memoryBytes": 268435456 } })),
+    )
+    .await;
+
+    let participant = Session::as_("student", "student-development-only").await;
+    participant
+        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .await;
+    wait_until_open(&participant, &activity).await;
+
+    let sent = participant
+        .submit(
+            &activity,
+            // **It spins for 1.2 s on purpose, and that is not padding.** A test
+            // container is killed at its limit *plus a second of grace*, and
+            // nothing compares the measured time against the limit itself — so a
+            // solution that merely exceeds the limit is still accepted, and only
+            // one that outlives the grace comes back as a time limit. This
+            // finishes inside the package's second-plus-grace and outlives the
+            // assignment's ten-milliseconds-plus-grace, which is the difference
+            // under test.
+            //
+            // A first version of this source was written by hand and did not
+            // compile, so the test passed on `Compilation error` in the
+            // sabotaged build too. Anything here that is not the sibling tests'
+            // own source is worth checking twice.
+            "#include <iostream>\n#include <chrono>\nint main(){long long a,b;std::cin>>a>>b;auto t=std::chrono::steady_clock::now();while(std::chrono::steady_clock::now()-t<std::chrono::milliseconds(1200)){}std::cout<<a+b;}\n",
+            "cpp",
+        )
+        .await;
+
+    let judged = settled(&participant, &activity, &sent).await;
+
+    assert_eq!(judged["state"], "completed", "{judged}");
+    assert_ne!(
+        judged["verdict"], "Accepted",
+        "a correct solution passed under an assignment that allows it ten \
+         milliseconds — the overlay was discarded: {judged}",
+    );
 }

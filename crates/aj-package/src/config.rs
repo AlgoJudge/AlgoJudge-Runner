@@ -14,18 +14,59 @@ use crate::error::{Error, Result};
 pub const FORMAT: &str = "standard-io";
 pub const VERSION: u32 = 1;
 
+/// The type this package is for, as **one string** — `standard-io@1`.
+///
+/// The envelope was decided as one string on 2026-08-02 and this file wrote it
+/// as two fields until 2026-08-22. Four spellings of one idea existed in the
+/// product; a convention with four spellings is not a convention.
+pub fn envelope(format: &str) -> String {
+    format!("{format}@{VERSION}")
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
-    pub format: String,
-    pub version: u32,
+    /// `standard-io@1`. **One string**, as every type discriminator in the
+    /// product is (decided 2026-08-02, applied here 2026-08-22).
+    ///
+    /// Written by everything that builds a package. Absent only in a package
+    /// built before that date, which still reads: see `format` and `version`
+    /// below, which are the old spelling and are accepted rather than
+    /// demanded — a package the Runner cannot parse is an infrastructure
+    /// failure on every submission to it, not a message anybody can act on.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+
+    /// **The old spelling, read and never written.** A package carrying these
+    /// and no `type` is one built before 2026-08-22.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
 
     pub limits: Limits,
 
-    /// Per language, keyed by the product's language id. Python is slower; this
-    /// is where that is said.
+    /// Per language, keyed by a **family** (`c`, `cpp`, `python`) or by one
+    /// toolchain (`pypy3`). Python is slower; this is where that is said.
+    ///
+    /// A family covers every toolchain in it, which is what an author almost
+    /// always means — writing sixteen entries to say "C++ gets the same" is not
+    /// a format anybody would use. See `for_language`.
     #[serde(default)]
     pub override_limits: BTreeMap<String, PartialLimits>,
+
+    /// Which toolchains may be submitted. **Empty means the package does not
+    /// say**, and an assignment that says nothing allows everything this Runner
+    /// can build.
+    ///
+    /// Ids as `language.rs` names them, so `cpp17-gcc` rather than `cpp17` —
+    /// and the family shorthands `cpp` and `python` resolve too, because that is
+    /// what every package written before the catalogue uses.
+    ///
+    /// A limit on *what may be sent* rather than on how it runs, which is why it
+    /// is a list here rather than an entry in `overrideLimits`.
+    #[serde(default)]
+    pub languages: Vec<String>,
 
     pub groups: Vec<Group>,
 
@@ -187,16 +228,37 @@ impl Config {
     /// second type required, and it is a change inside one crate rather than a
     /// second parser.
     pub fn parse_as(yaml: &str, format: &str) -> Result<Self> {
-        let config: Config = serde_yaml_ng::from_str(yaml)?;
+        let mut config: Config = serde_yaml_ng::from_str(yaml)?;
+
+        // **One string, or the two fields that used to say the same thing.**
+        // A package built before 2026-08-22 carries `format` and `version`;
+        // reading both spellings is what keeps such a package judgeable, and
+        // only one of them is ever written.
+        let declared = match (&config.kind, &config.format, config.version) {
+            (Some(kind), _, _) => kind.clone(),
+            (None, Some(old), Some(version)) => format!("{old}@{version}"),
+            _ => {
+                return Err(Error::invalid(
+                    "the package does not say what it is; `type: \"name@version\"` is required",
+                ));
+            }
+        };
 
         // A Runner that does not know the version refuses the package rather
         // than guessing at what changed in it.
-        if config.format != format || config.version != VERSION {
+        if declared != envelope(format) {
             return Err(Error::UnknownFormat {
-                format: config.format,
-                version: config.version,
+                format: declared,
+                version: VERSION,
             });
         }
+
+        // Normalised on the way in, so nothing downstream has to know which
+        // spelling arrived — and so a merged or re-serialised document carries
+        // the new one.
+        config.kind = Some(declared);
+        config.format = None;
+        config.version = None;
 
         config.validated()
     }
@@ -240,9 +302,30 @@ impl Config {
     /// judged under the package's limits in both. The format describes the chain
     /// as working and the Server computes it; the Runner was throwing it away.
     ///
-    /// Merged the same way the Server merges: **top-level members replace**. A
-    /// deeper merge would require knowing what the members mean, which is
-    /// exactly what neither side is allowed to know.
+    /// **Merged in depth, since 2026-08-22.** It used to replace whole top-level
+    /// members, on the stated grounds that anything deeper "would require
+    /// knowing what the members mean". That is not so — merging two JSON objects
+    /// is structural, and the rule cost real work: narrowing a time limit meant
+    /// restating the memory limit beside it, and an author who forgot got
+    /// `missing field memoryBytes` rather than the limit they asked for.
+    ///
+    /// So an overlay may now name one option:
+    ///
+    /// ```yaml
+    /// limits: { timeMs: 500 }     # memoryBytes stays whatever the package said
+    /// ```
+    ///
+    /// **Arrays replace, with one exception**: an array whose elements all carry
+    /// a distinct numeric `group` merges by it, so an assignment can narrow one
+    /// group without restating the rest. Uniqueness is the condition rather than
+    /// the field name — `groups` has it and the format enforces it, while
+    /// `calibration.measured` repeats a group once per language, and merging
+    /// that by group would silently collapse the languages into one row.
+    ///
+    /// **Nothing can be removed.** A deep merge adds and replaces; it has no way
+    /// to say "unset". Everything an overlay could have unset by omission is a
+    /// required field, so unsetting it only ever produced a validation error —
+    /// an overlay is for narrowing, not for cutting.
     ///
     /// An overlay naming something this format has no field for is **refused**,
     /// not ignored — a misspelled limit is a limit that silently did not apply.
@@ -259,17 +342,54 @@ impl Config {
             _ => return Ok(self),
         };
         for (name, value) in members {
-            // `format` and `version` say what the document is; an overlay does
-            // not get to change that.
-            if name == "format" || name == "version" {
+            // These say what the document *is*; an overlay does not get to
+            // change that. `format` and `version` are the spelling used before
+            // 2026-08-22 and are skipped too, so an overlay cannot reach round
+            // the front door by using the old name.
+            if name == "type" || name == "format" || name == "version" {
                 continue;
             }
-            merged.insert(name.clone(), value.clone());
+            let combined = match merged.get(name) {
+                Some(existing) => merge(existing, value),
+                None => value.clone(),
+            };
+            merged.insert(name.clone(), combined);
         }
 
         let config: Config = serde_json::from_value(serde_json::Value::Object(merged))
             .map_err(|e| Error::invalid(format!("the merged configuration will not read: {e}")))?;
         config.validated()
+    }
+
+    /// The limits before any group narrows them: the package's own, with every
+    /// override that names this submission's language applied.
+    ///
+    /// Separate from <see cref="effective"/> because it is the part that holds
+    /// for a **whole submission** — a submission has one language and many
+    /// groups — and that is what the result document can honestly state in the
+    /// single pair of numbers it carries.
+    ///
+    /// **Keys, plural, least specific first.** A language id used to be one
+    /// word (`python`) and is now two levels (`python3`, `pypy3` — see the
+    /// Runner's `language.rs`), so an override written the way this format
+    /// documents it would have stopped matching anything the day the catalogue
+    /// grew, and stopped **silently**: every Python submission held to the C++
+    /// limit, no error anywhere. The caller passes the family and then the
+    /// toolchain, and both are applied in that order, so `overrideLimits`
+    /// under `python` covers PyPy too and an entry under `pypy3` beats it
+    /// field by field.
+    ///
+    /// This crate deliberately does not know what a family is. It is handed
+    /// the keys rather than deriving them, because the catalogue that decides
+    /// them belongs to the problem type and not to the package format.
+    pub fn for_language(&self, keys: &[&str]) -> Limits {
+        let mut limits = self.limits;
+        for key in keys {
+            if let Some(over) = self.override_limits.get(*key) {
+                apply(&mut limits, over);
+            }
+        }
+        limits
     }
 
     /// The limits a test in this group, in this language, actually runs under.
@@ -287,12 +407,9 @@ impl Config {
     /// it would be a format change rather than a different resolution here.
     ///
     /// Whichever way it is settled, it is this function and nothing else.
-    pub fn effective(&self, group: u32, language: &str) -> Limits {
-        let mut limits = self.limits;
+    pub fn effective(&self, group: u32, keys: &[&str]) -> Limits {
+        let mut limits = self.for_language(keys);
 
-        if let Some(over) = self.override_limits.get(language) {
-            apply(&mut limits, over);
-        }
         if let Some(over) = self
             .groups
             .iter()
@@ -328,6 +445,67 @@ impl Config {
     pub fn max_score(&self) -> u32 {
         self.groups.iter().map(|g| g.points).sum()
     }
+}
+
+/// One value laid over another, in depth.
+///
+/// Objects merge member by member, recursively; everything else is replaced.
+/// Arrays are the one interesting case — see [`keyed_by_group`].
+fn merge(base: &serde_json::Value, over: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+
+    match (base, over) {
+        (Value::Object(below), Value::Object(above)) => {
+            let mut out = below.clone();
+            for (name, value) in above {
+                let combined = match below.get(name) {
+                    Some(existing) => merge(existing, value),
+                    None => value.clone(),
+                };
+                out.insert(name.clone(), combined);
+            }
+            Value::Object(out)
+        }
+
+        (Value::Array(below), Value::Array(above))
+            if keyed_by_group(below) && keyed_by_group(above) =>
+        {
+            let mut out = below.clone();
+            for element in above {
+                let group = group_of(element);
+                match out.iter_mut().find(|existing| group_of(existing) == group) {
+                    Some(existing) => *existing = merge(existing, element),
+                    // A group the package does not have is an addition rather
+                    // than an override. The format decides whether it is legal;
+                    // this only decides where it goes.
+                    None => out.push(element.clone()),
+                }
+            }
+            Value::Array(out)
+        }
+
+        _ => over.clone(),
+    }
+}
+
+/// Whether an array is a set of things identified by `group`.
+///
+/// **Uniqueness is the test, not the field name.** `groups` carries one entry
+/// per group and the format refuses a duplicate, so the number identifies the
+/// entry and merging by it is meaningful. `calibration.measured` carries the
+/// same group once per language, so there the number identifies nothing — and
+/// merging by it would fold several languages' measurements into one.
+fn keyed_by_group(elements: &[serde_json::Value]) -> bool {
+    let groups: Vec<Option<u64>> = elements.iter().map(group_of).collect();
+    if groups.iter().any(Option::is_none) {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::new();
+    groups.iter().all(|g| seen.insert(*g))
+}
+
+fn group_of(element: &serde_json::Value) -> Option<u64> {
+    element.get("group").and_then(serde_json::Value::as_u64)
 }
 
 fn apply(limits: &mut Limits, over: &PartialLimits) {
@@ -367,8 +545,7 @@ mod tests {
     /// The specification's own example, so this test fails if the document and
     /// the reader ever part company.
     const FROM_THE_SPECIFICATION: &str = r#"
-format: standard-io
-version: 1
+type: "standard-io@1"
 
 limits:
   timeMs: 1000
@@ -429,11 +606,11 @@ extraCompilationFiles: []
         let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
 
         // Group 2 states time and not memory, so memory stays global.
-        let group2 = config.effective(2, "cpp");
+        let group2 = config.effective(2, &["cpp"]);
         assert_eq!(group2.time_ms, 2000);
         assert_eq!(group2.memory_bytes, 268435456);
 
-        let group1 = config.effective(1, "cpp");
+        let group1 = config.effective(1, &["cpp"]);
         assert_eq!(group1.time_ms, 1000);
     }
 
@@ -441,9 +618,51 @@ extraCompilationFiles: []
     fn a_language_override_applies_where_a_group_says_nothing() {
         let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
 
-        let python = config.effective(1, "python");
+        let python = config.effective(1, &["python"]);
         assert_eq!(python.time_ms, 3000);
         assert_eq!(python.memory_bytes, 536870912);
+    }
+
+    /// **The trap the second key exists to close.** A language id used to be one
+    /// word, and every `overrideLimits` on disk is written under it. When ids
+    /// became two levels, an override under `python` stopped matching `pypy3` —
+    /// silently, because a missing override is not an error, it is the package's
+    /// own limits. Every PyPy submission would have been held to the C++ limit
+    /// and nothing anywhere would have said so.
+    #[test]
+    fn an_override_written_for_a_family_reaches_its_toolchains() {
+        let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
+
+        // What a package author wrote, and what the Runner now asks with.
+        let pypy = config.for_language(&["python", "pypy3"]);
+        assert_eq!(pypy.time_ms, 3000, "PyPy is Python");
+        assert_eq!(pypy.memory_bytes, 536870912);
+
+        // And a toolchain that has no entry of its own is unaffected by
+        // another family's.
+        let cpp = config.for_language(&["cpp", "cpp17-gcc"]);
+        assert_eq!(cpp.time_ms, 1000);
+    }
+
+    /// The other half of the rule: **least specific first**, so a package that
+    /// wants PyPy alone to differ can say so without restating the family.
+    #[test]
+    fn a_toolchains_own_override_beats_its_familys_field_by_field() {
+        let both = FROM_THE_SPECIFICATION.replace(
+            "overrideLimits:\n  python:\n",
+            "overrideLimits:\n  pypy3:\n    timeMs: 1500\n  python:\n",
+        );
+        let config = Config::parse(&both).unwrap();
+
+        let pypy = config.for_language(&["python", "pypy3"]);
+        assert_eq!(pypy.time_ms, 1500, "PyPy is faster, and says so itself");
+        assert_eq!(
+            pypy.memory_bytes, 536870912,
+            "and the family's entry still fills what PyPy did not name"
+        );
+
+        // CPython keeps the family's, untouched by PyPy's.
+        assert_eq!(config.for_language(&["python", "python3"]).time_ms, 3000);
     }
 
     /// Pins the reading documented on `effective`: most specific first. If this
@@ -452,7 +671,7 @@ extraCompilationFiles: []
     fn a_group_limit_beats_a_language_override() {
         let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
 
-        let python = config.effective(2, "python");
+        let python = config.effective(2, &["python"]);
         assert_eq!(python.time_ms, 2000, "the group's own limit wins");
         assert_eq!(
             python.memory_bytes, 536870912,
@@ -474,7 +693,7 @@ extraCompilationFiles: []
         // Everything the overlay did not name is untouched.
         assert_eq!(attached.max_score(), 100);
         assert_eq!(
-            attached.effective(2, "cpp").time_ms,
+            attached.effective(2, &["cpp"]).time_ms,
             2000,
             "the group still states its own"
         );
@@ -503,17 +722,131 @@ extraCompilationFiles: []
     #[test]
     fn an_overlay_may_not_change_what_the_document_is() {
         let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
-        let overlay = serde_json::json!({ "format": "interactive", "version": 9 });
+        let overlay = serde_json::json!({
+            "type": "interactive@9", "format": "interactive", "version": 9,
+        });
 
         let attached = config.overlaid(Some(&overlay)).unwrap();
-        assert_eq!(attached.format, "standard-io");
-        assert_eq!(attached.version, 1);
+        assert_eq!(attached.kind.as_deref(), Some("standard-io@1"));
+    }
+
+    /// **A package built before 2026-08-22 still judges.**
+    ///
+    /// It carries `format` and `version` rather than `type`, and refusing it
+    /// would be an infrastructure failure on every submission to it — not a
+    /// message anybody could act on. Read, normalised, and never written back
+    /// in that spelling.
+    #[test]
+    fn the_two_fields_that_used_to_say_this_are_still_read() {
+        let old = FROM_THE_SPECIFICATION.replace(
+            "type: \"standard-io@1\"",
+            "format: standard-io
+version: 1",
+        );
+        let config = Config::parse(&old).unwrap();
+
+        assert_eq!(config.kind.as_deref(), Some("standard-io@1"));
+        assert!(config.format.is_none(), "and is not carried forward");
+        assert!(config.version.is_none());
+
+        let written = serde_yaml_ng::to_string(&config).unwrap();
+        assert!(written.contains("type: standard-io@1"), "{written}");
+        assert!(
+            !written.contains("format:"),
+            "one spelling out, not two: {written}"
+        );
+    }
+
+    /// A document that says nothing about what it is.
+    #[test]
+    fn a_package_that_does_not_say_what_it_is_is_refused() {
+        let anonymous = FROM_THE_SPECIFICATION.replace(
+            "type: \"standard-io@1\"
+",
+            "",
+        );
+        let refused = Config::parse(&anonymous).unwrap_err().to_string();
+        assert!(refused.contains("does not say what it is"), "{refused}");
     }
 
     /// **Open question, and this is the one line.** The specification says only
     /// that each layer beats the one before, never in which direction. Today an
     /// overlay applies as given — it may raise a limit as well as tighten one.
     /// If that is settled the other way, it is settled in `overlaid`.
+    /// One option, without restating the ones beside it.
+    ///
+    /// This is what the deep merge was for. Under the old rule `limits` was
+    /// replaced whole, so narrowing the time meant repeating the memory — and an
+    /// author who forgot got `missing field memoryBytes` instead of a limit.
+    #[test]
+    fn an_overlay_may_name_one_option_and_leave_the_rest() {
+        let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
+        let before = config.limits.memory_bytes;
+
+        let narrowed = config
+            .overlaid(Some(&serde_json::json!({ "limits": { "timeMs": 250 } })))
+            .unwrap();
+
+        assert_eq!(narrowed.limits.time_ms, 250);
+        assert_eq!(
+            narrowed.limits.memory_bytes, before,
+            "the memory limit should have been inherited, not dropped",
+        );
+    }
+
+    /// One group narrowed, the others left as the package wrote them.
+    #[test]
+    fn an_overlay_may_narrow_one_group_without_restating_the_others() {
+        let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
+        let groups_before = config.groups.len();
+        let points_before: u32 = config.groups.iter().map(|g| g.points).sum();
+
+        let narrowed = config
+            .overlaid(Some(&serde_json::json!({
+                "groups": [{ "group": 1, "limits": { "timeMs": 250 } }]
+            })))
+            .unwrap();
+
+        assert_eq!(
+            narrowed.groups.len(),
+            groups_before,
+            "the other groups should have survived: {:?}",
+            narrowed.groups,
+        );
+        assert_eq!(
+            narrowed.groups.iter().map(|g| g.points).sum::<u32>(),
+            points_before,
+            "and kept their points, which the overlay never mentioned",
+        );
+        let one = narrowed.groups.iter().find(|g| g.group == 1).unwrap();
+        assert_eq!(one.limits.and_then(|l| l.time_ms), Some(250));
+    }
+
+    /// An array whose `group` is not an identity replaces instead of merging.
+    ///
+    /// `calibration.measured` carries one row per group **per language**, so the
+    /// number identifies nothing there. Merging by it would fold two languages'
+    /// measurements into one row, quietly, and the calibration that came out
+    /// would be a number nobody measured.
+    #[test]
+    fn an_array_that_repeats_a_group_is_replaced_rather_than_merged() {
+        let two_languages = serde_json::json!([
+            { "group": 1, "language": "cpp",    "timeMs": 100 },
+            { "group": 1, "language": "python", "timeMs": 900 },
+        ]);
+        let one_language = serde_json::json!([
+            { "group": 1, "language": "cpp", "timeMs": 120 },
+        ]);
+
+        let merged = merge(&two_languages, &one_language);
+
+        assert_eq!(
+            merged.as_array().map(Vec::len),
+            Some(1),
+            "a repeated group is not a key, so the array is replaced: {merged}",
+        );
+    }
+
     #[test]
     fn an_overlay_may_currently_raise_a_limit_as_well_as_lower_one() {
         let config = Config::parse(FROM_THE_SPECIFICATION).unwrap();
@@ -571,8 +904,7 @@ extraCompilationFiles: []
     }
 
     const SEVERAL_MODELS: &str = r#"
-format: standard-io
-version: 1
+type: "standard-io@1"
 limits:
   timeMs: 1000
   memoryBytes: 268435456
@@ -623,14 +955,14 @@ calibration:
 
     #[test]
     fn a_format_this_runner_does_not_know_is_refused() {
-        let yaml = FROM_THE_SPECIFICATION.replace("version: 1", "version: 2");
+        let yaml = FROM_THE_SPECIFICATION.replace("standard-io@1", "standard-io@2");
         let error = Config::parse(&yaml).unwrap_err();
         assert!(
-            matches!(error, Error::UnknownFormat { version: 2, .. }),
+            matches!(&error, Error::UnknownFormat { format, .. } if format == "standard-io@2"),
             "got {error}"
         );
 
-        let yaml = FROM_THE_SPECIFICATION.replace("format: standard-io", "format: interactive");
+        let yaml = FROM_THE_SPECIFICATION.replace("standard-io@1", "interactive@1");
         assert!(matches!(
             Config::parse(&yaml).unwrap_err(),
             Error::UnknownFormat { .. }

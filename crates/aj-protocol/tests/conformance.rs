@@ -677,9 +677,13 @@ impl Participant {
         use sha2::{Digest, Sha256};
         let checksum = hex::encode(Sha256::digest(source.as_bytes()));
 
+        // One opaque document, and a file name. The language was a field the
+        // Server read; it is a member of `props` now, and pasted source is named
+        // by the sender because the Server has no extension table any more.
         let form = reqwest::multipart::Form::new()
-            .text("language", "python")
+            .text("props", r#"{"type":"standard-io@1","language":"python"}"#)
             .text("code", source.to_owned())
+            .text("fileName", "main.py")
             .text("sha256", checksum);
 
         let response = self
@@ -692,13 +696,14 @@ impl Participant {
             .send()
             .await
             .expect("the submission");
-        assert!(
-            response.status().is_success(),
-            "submitting answered {}",
-            response.status(),
-        );
+        // **The body, not only the status.** A refusal carries a `code` naming
+        // which rule it was, and reading the status alone turns three different
+        // causes into one number nobody can act on.
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        assert!(status.is_success(), "submitting answered {status}: {text}");
 
-        let body: serde_json::Value = response.json().await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
         body["id"].as_str().expect("a submission id").to_owned()
     }
 

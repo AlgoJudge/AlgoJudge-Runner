@@ -40,19 +40,25 @@ Three properties of it shape everything here:
 
 ## The published images
 
-Pushing a `v*` tag publishes **three images under one version**, to GitHub's
+Pushing a `v*` tag publishes **five images under one version**, to GitHub's
 container registry:
 
 ```bash
 docker pull ghcr.io/algojudge/algojudge-runner:1.2.3
-docker pull ghcr.io/algojudge/lang-cpp:1.2.3
+docker pull ghcr.io/algojudge/lang-gcc:1.2.3
+docker pull ghcr.io/algojudge/lang-clang:1.2.3
 docker pull ghcr.io/algojudge/lang-python:1.2.3
+docker pull ghcr.io/algojudge/lang-pypy:1.2.3
 ```
 
-**All three, because a Runner without the language images judges nothing** — and
+**All five, because a Runner without the language images judges nothing** — and
 because the compiler version is a capability this Runner *reports*, so the
 toolchain that shipped with a version carries that version's number. They are
 built, checked and pushed together, or not at all.
+
+Four images carry **eighteen toolchains**: every C and C++ standard the catalogue
+offers is a `-std` flag rather than an image, so C++17 under GCC and C++17 under
+Clang are one image each and not one image per standard.
 
 `1.2.3`, `1.2`, `1` and `latest` point at the same image; **a prerelease
 (`v1.2.3-rc.1`) publishes only its own tag**, so nothing moving ever points at a
@@ -64,12 +70,18 @@ architecture of the host that runs it — an arm64 language image could not be u
 by any Runner that exists.
 
 A deployment names the language images explicitly, because the built-in defaults
-(`algojudge/lang-cpp:local`) are what the development stack builds locally:
+(`algojudge/lang-gcc:local`) are what the development stack builds locally:
 
 ```sh
-AJ_Sandbox__Image__Cpp=ghcr.io/algojudge/lang-cpp:1.2.3
+AJ_Sandbox__Image__Gcc=ghcr.io/algojudge/lang-gcc:1.2.3
+AJ_Sandbox__Image__Clang=ghcr.io/algojudge/lang-clang:1.2.3
 AJ_Sandbox__Image__Python=ghcr.io/algojudge/lang-python:1.2.3
+AJ_Sandbox__Image__Pypy=ghcr.io/algojudge/lang-pypy:1.2.3
 ```
+
+Each is independent: anything left unset keeps its compiled-in default, so an
+operator republishing one image says so in one line.
+`AJ_Sandbox__Image__Cpp` is the old name for `…__Gcc` and is still read.
 
 Pin the same version the Runner is, unless there is a reason not to: that pairing
 is what the release was tested as.

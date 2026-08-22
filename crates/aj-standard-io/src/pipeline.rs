@@ -79,11 +79,28 @@ pub struct Job<'a> {
     pub config: &'a Config,
     pub tests: &'a TestSet,
     pub language: &'a str,
+    /// **The name the participant uploaded it under**, which is the only thing
+    /// that can say whether they picked the language they meant to. It reached
+    /// `output-only@1` and stopped short of here, because this type selects its
+    /// file by role and had no use for the name until now.
+    pub file_name: &'a str,
     pub source: &'a [u8],
     /// The unpacked package.
     pub package: Places,
     /// Scratch for this job alone, and empty. Removed by the caller afterwards.
     pub work: Places,
+}
+
+/// The package's checker, built and ready to be run over a test.
+///
+/// Carries its image and how it is started rather than assuming both. The
+/// assumption held while `cpp` was the only compiled language there was; it
+/// stopped holding the moment a package could name `cpp17-clang` — or `python3`,
+/// where starting `/program/program` would try to execute a `.py` file.
+struct Checker {
+    at: Places,
+    image: String,
+    start: Vec<String>,
 }
 
 /// A submission that was actually judged.
@@ -145,6 +162,58 @@ impl<S: Sandbox> Pipeline<S> {
         let language = language::for_id(job.language, &self.images)
             .ok_or_else(|| format!("this Runner does not evaluate {}", job.language))?;
 
+        // ── the languages this assignment allows ────────────────────────────
+        //
+        // **The Server used to refuse this and cannot any more**: the language
+        // is one member of a document it does not read. The set travels with the
+        // job instead, in the assignment's `config`, and the refusal happens
+        // here — where a language id means something.
+        //
+        // A **verdict**, and `PolicyViolation` rather than a compilation error:
+        // nothing was offered to a compiler, the code may be perfect, and what
+        // was broken is a rule of the activity. That is exactly what this verdict
+        // is for, and it leaves the submission rejudgeable if a manager widens
+        // the set afterwards.
+        //
+        // An empty list means the assignment said nothing, which allows anything
+        // this Runner can build. It is not a way of allowing none: an assignment
+        // that meant none would have nothing to submit to.
+        if !job.config.languages.is_empty()
+            && !job
+                .config
+                .languages
+                .iter()
+                .any(|allowed| allowed == language.id || allowed == language.family.as_str())
+        {
+            return Ok(policy_violation(
+                job,
+                &language,
+                &[format!(
+                    "This problem does not accept {}. It accepts: {}.",
+                    language.label,
+                    job.config.languages.join(", "),
+                )],
+            ));
+        }
+
+        // **A verdict, not an infrastructure failure.** Choosing C++ and
+        // uploading `main.py` is the participant's own doing, the compiler
+        // would have said so thirty seconds later, and this says it in words
+        // they can act on instead of as a parse error in a language they did
+        // not think they were writing.
+        if !language.accepts(job.file_name) {
+            return Ok(compilation_failed(
+                job,
+                &language,
+                &format!(
+                    "{} is not a file {} accepts. Expected one of: {}.",
+                    job.file_name,
+                    language.label,
+                    language.extensions.join(", "),
+                ),
+            ));
+        }
+
         let source = job.work.join("src");
         let built_into = job.work.join("build");
         let artefacts = built_into.join("out");
@@ -163,9 +232,10 @@ impl<S: Sandbox> Pipeline<S> {
         // not a security boundary: a bypass is expected, and containment is the
         // sandbox's job.
         let broken = crate::policy::Dictionary::built_in()
-            .check(job.language, &String::from_utf8_lossy(job.source));
+            .check(&language, &String::from_utf8_lossy(job.source));
         if !broken.is_empty() {
-            return Ok(policy_violation(job, &broken));
+            let listed: Vec<String> = broken.iter().map(|v| v.note()).collect();
+            return Ok(policy_violation(job, &language, &listed));
         }
 
         // ── build ───────────────────────────────────────────────────────────
@@ -209,7 +279,7 @@ impl<S: Sandbox> Pipeline<S> {
                         built.wall_time, built.exit_code,
                     ),
                 };
-                return Ok(compilation_failed(job, &said));
+                return Ok(compilation_failed(job, &language, &said));
             }
             unpack(&built.collected, &built_into.here)?;
             log.push_str(&said);
@@ -224,7 +294,7 @@ impl<S: Sandbox> Pipeline<S> {
         // ── each test, in its own container ─────────────────────────────────
         let mut outcomes = Vec::new();
         for test in job.tests.iter() {
-            let limits = job.config.effective(test.group, job.language);
+            let limits = job.config.effective(test.group, &language.keys());
 
             let run = self
                 .sandbox
@@ -256,6 +326,27 @@ impl<S: Sandbox> Pipeline<S> {
                 Stopped::WallClock => Some(("Time limit exceeded", Reason::TimeLimit)),
                 Stopped::Memory => Some(("Memory limit exceeded", Reason::MemoryLimit)),
                 Stopped::Output => Some(("Output limit exceeded", Reason::OutputLimit)),
+
+                // **The limit is decided here, on the measurement, and until
+                // 2026-08-22 it was decided nowhere.** The deadline above is the
+                // limit plus a second of grace, because a program wedged in an
+                // uninterruptible syscall has to be reaped from outside — and
+                // the comment beside it has always said the verdict comes from
+                // the measurement rather than from that deadline. No such
+                // comparison existed. A solution that overran its limit by
+                // anything less than the grace finished on its own, was never
+                // reaped, and was marked correct: at a one-second limit, a
+                // program taking 1.9 s was `Accepted`.
+                //
+                // The wall clock is what decides it, deliberately —
+                // `Outcome::cpu_time` says so where it is declared, because a
+                // limit is stated in what a participant waits through. It
+                // includes the container's start, and so do the numbers a trial
+                // measures, which is what keeps a calibrated limit honest
+                // against the thing it is compared with.
+                Stopped::OnItsOwn if time_ms > limits.time_ms => {
+                    Some(("Time limit exceeded", Reason::TimeLimit))
+                }
                 Stopped::OnItsOwn => None,
             };
             if let Some((note, reason)) = stopped {
@@ -330,7 +421,7 @@ impl<S: Sandbox> Pipeline<S> {
         }
 
         let judgement = judge(job.config, job.tests, &outcomes);
-        let details = Details::of(&judgement, limits_of(job), compiled());
+        let details = Details::of(&judgement, limits_of(job, &language), compiled());
 
         Ok(Evaluated::Judged(Box::new(Verdict {
             judgement,
@@ -341,11 +432,17 @@ impl<S: Sandbox> Pipeline<S> {
 
     /// Builds the package's checker. Its failure is the **package** being
     /// broken, which is an infrastructure failure and not a verdict.
+    ///
+    /// Hands back the image it was built in as well as where it landed. Running
+    /// it used to be hard-coded to the C++ image, which was true only while
+    /// there was one — a checker built by Clang and run in the GCC image is a
+    /// coincidence away from working, and a Python checker would have been
+    /// started as though it were a binary.
     async fn build_checker(
         &self,
         job: &Job<'_>,
         declared: &aj_package::config::Source,
-    ) -> Result<Places, String> {
+    ) -> Result<Checker, String> {
         let language = language::for_id(&declared.language, &self.images).ok_or_else(|| {
             format!(
                 "the checker is in {}, which this Runner does not build",
@@ -391,7 +488,11 @@ impl<S: Sandbox> Pipeline<S> {
             ));
         }
         unpack(&built.collected, &built_into.here)?;
-        Ok(output)
+        Ok(Checker {
+            at: output,
+            image: language.image.clone(),
+            start: language.start.clone(),
+        })
     }
 
     /// Runs the checker over one test, in **its own sandbox**.
@@ -402,29 +503,28 @@ impl<S: Sandbox> Pipeline<S> {
     async fn check(
         &self,
         job: &Job<'_>,
-        checker: &Places,
+        checker: &Checker,
         answers: &Places,
         test: &str,
     ) -> Result<Result<crate::checker::Checked, Broken>, String> {
+        let mut command = checker.start.clone();
+        command.extend([
+            format!("{INPUT}/{test}.in"),
+            format!("/answers/{test}.out"),
+            format!("{INPUT}/{test}.out"),
+        ]);
+
         let run = self
             .sandbox
             .run(
-                &Profile::new(
-                    &self.images.cpp,
-                    vec![
-                        format!("{PROGRAM}/program"),
-                        format!("{INPUT}/{test}.in"),
-                        format!("/answers/{test}.out"),
-                        format!("{INPUT}/{test}.out"),
-                    ],
-                )
-                .memory_bytes(256 * 1024 * 1024)
-                .pids(16)
-                .wall_clock(Duration::from_secs(30))
-                .max_output_bytes(64 * 1024)
-                .mount(Mount::read_only(&checker.on_host, PROGRAM))
-                .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT))
-                .mount(Mount::read_only(&answers.on_host, "/answers")),
+                &Profile::new(&checker.image, command)
+                    .memory_bytes(256 * 1024 * 1024)
+                    .pids(16)
+                    .wall_clock(Duration::from_secs(30))
+                    .max_output_bytes(64 * 1024)
+                    .mount(Mount::read_only(&checker.at.on_host, PROGRAM))
+                    .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT))
+                    .mount(Mount::read_only(&answers.on_host, "/answers")),
             )
             .await
             .map_err(|e| format!("the checker could not be run: {e}"))?;
@@ -509,9 +609,7 @@ fn failed(test: &aj_package::Test, time_ms: u64, note: &str, reason: Reason) -> 
 /// are three different things to tell a participant: their code is wrong, their
 /// code does not build, or the system failed. This one is none of the three —
 /// their code may be perfect and still not allowed.
-fn policy_violation(job: &Job<'_>, broken: &[crate::policy::Violation]) -> Evaluated {
-    let listed: Vec<String> = broken.iter().map(|v| v.note()).collect();
-
+fn policy_violation(job: &Job<'_>, language: &language::Language, listed: &[String]) -> Evaluated {
     let outcomes: Vec<TestOutcome> = job
         .tests
         .iter()
@@ -521,15 +619,12 @@ fn policy_violation(job: &Job<'_>, broken: &[crate::policy::Violation]) -> Evalu
     let judgement = judge(job.config, job.tests, &outcomes);
     let details = Details::of(
         &judgement,
-        limits_of(job),
+        limits_of(job, language),
         Compilation {
             // Not an error: nothing failed to compile, because nothing was
             // offered to a compiler.
             status: Status::Warning,
-            log: listed.join(
-                "
-",
-            ),
+            log: listed.join("\n"),
         },
     );
 
@@ -539,15 +634,12 @@ fn policy_violation(job: &Job<'_>, broken: &[crate::policy::Violation]) -> Evalu
             ..judgement.clone()
         },
         details,
-        log: listed.join(
-            "
-",
-        ),
+        log: listed.join("\n"),
     }))
 }
 
 /// Every test failed for the same reason, and the reason is worth stating once.
-fn compilation_failed(job: &Job<'_>, log: &str) -> Evaluated {
+fn compilation_failed(job: &Job<'_>, language: &language::Language, log: &str) -> Evaluated {
     let outcomes: Vec<TestOutcome> = job
         .tests
         .iter()
@@ -555,7 +647,7 @@ fn compilation_failed(job: &Job<'_>, log: &str) -> Evaluated {
         .collect();
 
     let judgement = judge(job.config, job.tests, &outcomes);
-    let details = Details::of(&judgement, limits_of(job), failed_to_compile(log));
+    let details = Details::of(&judgement, limits_of(job, language), failed_to_compile(log));
 
     Evaluated::Judged(Box::new(Verdict {
         judgement: Judgement {
@@ -567,12 +659,26 @@ fn compilation_failed(job: &Job<'_>, log: &str) -> Evaluated {
     }))
 }
 
-/// The problem's stated limits, for the document a participant reads. Kibibytes
-/// in the package, mebibytes here — see `details`.
-fn limits_of(job: &Job<'_>) -> Limits {
+/// The limits this submission was actually held to, for the document a
+/// participant reads.
+///
+/// **This used to report the package's global pair**, so a Python submission
+/// judged under `overrideLimits.python` was shown a `timeMs` it was never held
+/// to — the document contradicting the run it describes. The language override
+/// holds for the whole submission, because a submission has one language, so it
+/// belongs in the one pair of numbers this document carries.
+///
+/// A group's own limits still are not in here, and cannot be: they vary across
+/// the tests of one submission and there is one slot. The per-group table
+/// belongs on the problem's own page, from the configuration, rather than in a
+/// result document that has no shape for it.
+/// The conversion is between two types of the same name — the package's and the
+/// document's — which is why this cannot simply hand the one back.
+fn limits_of(job: &Job<'_>, language: &language::Language) -> Limits {
+    let held_to = job.config.for_language(&language.keys());
     Limits {
-        time_ms: job.config.limits.time_ms,
-        memory_bytes: job.config.limits.memory_bytes,
+        time_ms: held_to.time_ms,
+        memory_bytes: held_to.memory_bytes,
     }
 }
 

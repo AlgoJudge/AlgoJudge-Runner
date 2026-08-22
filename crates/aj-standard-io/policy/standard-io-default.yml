@@ -27,7 +27,7 @@ matching:
 # C / C++
 # --------------------------------------------------------------------------
 languages:
-  cpp:
+  cpp: &c_family
     # Rule H — the primary mechanism. Matched as a #include directive.
     deniedHeaders:
       - unistd.h
@@ -254,6 +254,19 @@ languages:
       - exit
       - abort
       - _exit
+
+# --------------------------------------------------------------------------
+# C — the same rules, said once
+# --------------------------------------------------------------------------
+#
+# An alias rather than a copy. C gained toolchains on 2026-08-22 and every rule
+# above applies to it unchanged: <unistd.h> is <unistd.h>, `fopen` is `fopen`,
+# and the handful of C++-only identifiers in the list (`ifstream`, `std::thread`)
+# are words a C program cannot contain, so they cost nothing. A second copy of
+# sixty lines is two lists that drift, and the one that drifts is the one nobody
+# is reading — which for a policy control means a rule silently enforced in one
+# language and not the other.
+  c: *c_family
 
 # --------------------------------------------------------------------------
 # Python (CPython / PyPy)

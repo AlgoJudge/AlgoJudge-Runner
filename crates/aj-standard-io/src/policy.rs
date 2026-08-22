@@ -23,10 +23,13 @@
 //! that reversible: when a package can vary the rules, one that names
 //! `standard-io/default@1` keeps working unchanged.
 //!
-//! Two languages are enforced — C++ and Python, the two the Runner judges. Rust
-//! and Java are carried in the file and are **not** applied, because enforcing a
-//! dictionary for a language nothing can submit would be a rule nobody could
-//! trip and nobody could test.
+//! **Three families are enforced — C, C++ and Python**, which between them are
+//! the eighteen toolchains the Runner judges. Rust and Java are carried in the
+//! file and are **not** applied, because enforcing a dictionary for a language
+//! nothing can submit would be a rule nobody could trip and nobody could test.
+//!
+//! C's section is a YAML alias of C++'s rather than a second copy. See the
+//! profile, and `language.rs` for why the lookup is by family at all.
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -34,6 +37,8 @@ use std::sync::OnceLock;
 use indexmap::IndexMap;
 use regex::Regex;
 use serde::Deserialize;
+
+use crate::language::{Family, Language};
 
 /// The profile shipped with this Runner.
 const BUILT_IN: &str = include_str!("../policy/standard-io-default.yml");
@@ -178,16 +183,37 @@ impl Dictionary {
     ///
     /// Empty means it broke none of them — and an empty rule set for a language
     /// means the check is **skipped**, not that everything is denied.
-    pub fn check(&self, language: &str, source: &str) -> Vec<Violation> {
-        let Some(rules) = self.languages.get(language) else {
+    ///
+    /// **Takes the language rather than its name**, and this is not tidiness.
+    /// The profile was looked up by whatever string the submission carried, and
+    /// a string that matches nothing returns *no violations* — indistinguishable
+    /// from a clean submission. That was survivable while the only ids in
+    /// existence were `cpp` and `python`; it stopped being on 2026-08-22, when
+    /// they became `cpp17-gcc` and `pypy3` and every one of the eighteen would
+    /// have looked up nothing. So the rules are found by **id and then family**,
+    /// and which checks run is decided by matching the family as an enum — a
+    /// fourth family will not compile until somebody says what happens to it.
+    pub fn check(&self, language: &Language, source: &str) -> Vec<Violation> {
+        let Some(rules) = self
+            .languages
+            .get(language.id)
+            .or_else(|| self.languages.get(language.family.as_str()))
+        else {
+            // Reached only by a profile that omits a family this Runner can
+            // judge — which is the profile being wrong, not the submission.
+            tracing::warn!(
+                language = language.id,
+                family = language.family.as_str(),
+                "the policy profile has no rules for this language, so nothing is enforced"
+            );
             return Vec::new();
         };
 
-        let stripped = strip(source, language, &self.matching);
+        let stripped = strip(source, language.family, &self.matching);
         let mut found = Vec::new();
 
-        match language {
-            "cpp" => {
+        match language.family {
+            Family::C | Family::Cpp => {
                 headers(&stripped, rules, &mut found);
                 // Identifiers are matched against everything **except** the
                 // include directives, which are rule H's business alone (§7.4).
@@ -196,7 +222,7 @@ impl Dictionary {
                 // positive on a line that was already correctly reported once.
                 groups(&without_includes(&stripped), rules, &mut found);
             }
-            "python" => {
+            Family::Python => {
                 imports(&stripped, rules, &mut found);
                 builtins(&stripped, rules, &mut found);
                 patterns(
@@ -206,9 +232,6 @@ impl Dictionary {
                     &mut found,
                 );
             }
-            // Carried in the file, not enforced. Saying so here is better than a
-            // silent `_ => {}` that reads as "checked and clean".
-            _ => tracing::debug!(language, "no policy rules are enforced for this language"),
         }
 
         if !self.matching.report_all_matches {
@@ -226,12 +249,13 @@ impl Dictionary {
 /// afterwards is the line number in the file the participant wrote. A comment
 /// saying "nie używam fork" must not fail a submission, and a message pointing
 /// at the wrong line is nearly as bad as no message.
-fn strip(source: &str, language: &str, matching: &Matching) -> String {
+fn strip(source: &str, family: Family, matching: &Matching) -> String {
     let bytes: Vec<char> = source.chars().collect();
     let mut out: Vec<char> = Vec::with_capacity(bytes.len());
     let mut i = 0;
 
-    let line_comment = if language == "python" { "#" } else { "//" };
+    let python = family == Family::Python;
+    let line_comment = if python { "#" } else { "//" };
 
     while i < bytes.len() {
         let rest: String = bytes[i..bytes.len().min(i + 3)].iter().collect();
@@ -243,7 +267,7 @@ fn strip(source: &str, language: &str, matching: &Matching) -> String {
             }
             continue;
         }
-        if matching.strip_comments && language != "python" && rest.starts_with("/*") {
+        if matching.strip_comments && !python && rest.starts_with("/*") {
             while i < bytes.len() {
                 let two: String = bytes[i..bytes.len().min(i + 2)].iter().collect();
                 let end = two.starts_with("*/");
@@ -262,10 +286,8 @@ fn strip(source: &str, language: &str, matching: &Matching) -> String {
         if matching.strip_string_literals && (bytes[i] == '"' || bytes[i] == '\'') {
             let quote = bytes[i];
             // Triple quotes are one literal in Python, not three empty ones.
-            let triple = language == "python"
-                && bytes.len() > i + 2
-                && bytes[i + 1] == quote
-                && bytes[i + 2] == quote;
+            let triple =
+                python && bytes.len() > i + 2 && bytes[i + 1] == quote && bytes[i + 2] == quote;
 
             out.push(' ');
             i += 1;
@@ -466,8 +488,15 @@ fn builtins(source: &str, rules: &LanguageRules, found: &mut Vec<Violation>) {
 mod tests {
     use super::*;
 
+    use crate::language::{catalogue, for_id, Images};
+
+    /// By toolchain id, because that is what a submission carries. Every
+    /// assertion below is therefore also an assertion that the id resolved to a
+    /// family and the family found its rules.
     fn check(language: &str, source: &str) -> Vec<Violation> {
-        Dictionary::built_in().check(language, source)
+        let resolved = for_id(language, &Images::default())
+            .unwrap_or_else(|| panic!("{language} is not in the catalogue"));
+        Dictionary::built_in().check(&resolved, source)
     }
 
     #[test]
@@ -476,7 +505,66 @@ mod tests {
         assert_eq!(dictionary.id, "standard-io/default@1");
         assert_eq!(dictionary.version, 1);
         assert!(dictionary.languages.contains_key("cpp"));
+        assert!(dictionary.languages.contains_key("c"));
         assert!(dictionary.languages.contains_key("python"));
+    }
+
+    /// **The trap this lookup exists to close.** Every toolchain in the
+    /// catalogue has to reach a rule set, because one that does not returns no
+    /// violations — which reads exactly like a clean submission and would have
+    /// disabled the dictionary for sixteen of the eighteen the day they were
+    /// added.
+    ///
+    /// Proven by a submission that breaks a rule rather than by looking the
+    /// profile up: a lookup asserted against itself would keep passing if the
+    /// checks stopped running.
+    #[test]
+    fn every_toolchain_in_the_catalogue_is_actually_policed() {
+        let breaks_a_rule = |family| match family {
+            Family::C => {
+                "#include <unistd.h>
+int main(){return 0;}
+"
+            }
+            Family::Cpp => {
+                "#include <unistd.h>
+int main(){}
+"
+            }
+            Family::Python => {
+                "import os
+"
+            }
+        };
+
+        for language in catalogue(&Images::default()) {
+            let found = Dictionary::built_in().check(&language, breaks_a_rule(language.family));
+            assert!(
+                !found.is_empty(),
+                "{} enforced nothing, so its rules were not found",
+                language.id,
+            );
+        }
+    }
+
+    /// C is an alias of C++ in the profile, and an alias that stopped resolving
+    /// would be a language with no rules at all.
+    #[test]
+    fn c_is_policed_by_the_same_rules_as_cpp() {
+        let opening_a_file = "#include <stdio.h>
+int main(){ FILE* f = fopen(\"x\", \"r\"); return 0; }
+";
+
+        assert_eq!(
+            check("c11-gcc", opening_a_file),
+            check("cpp17-gcc", opening_a_file),
+        );
+        assert!(!check(
+            "c89-clang",
+            "#include <unistd.h>
+"
+        )
+        .is_empty());
     }
 
     // ── the reason the header list exists ───────────────────────────────────
@@ -642,10 +730,26 @@ int main() { std::cout << "system fopen dlopen\n"; }
 
     /// Carried in the profile, deliberately not enforced: nothing can submit
     /// Rust or Java, so a rule for them could never be tripped or tested.
+    ///
+    /// The boundary moved when `check` started taking a `Language`. It is no
+    /// longer possible to *ask* about Rust — there is no such toolchain to ask
+    /// with — which is a better answer than the old one, where an unsubmittable
+    /// language and a misspelled one were both silently clean.
     #[test]
-    fn languages_that_cannot_be_submitted_are_not_enforced() {
-        assert!(check("rust", "use std::fs::File;\n").is_empty());
-        assert!(check("java", "new java.io.File(\"x\");\n").is_empty());
-        assert!(check("cobol", "anything at all").is_empty());
+    fn languages_that_cannot_be_submitted_have_no_way_in() {
+        let images = Images::default();
+
+        for carried in ["rust", "java"] {
+            assert!(
+                Dictionary::built_in().languages.contains_key(carried),
+                "{carried} is still carried in the profile",
+            );
+            assert!(
+                for_id(carried, &images).is_none(),
+                "{carried} must not be submittable",
+            );
+        }
+
+        assert!(for_id("cobol", &images).is_none());
     }
 }

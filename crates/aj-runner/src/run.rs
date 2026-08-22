@@ -587,17 +587,47 @@ async fn judge(
     // arm plus a crate. Nothing about it reaches the Server.
     match job.problem_type.as_str() {
         "standard-io@1" => {
-            let package_config = aj_package::Config::parse(&declared).map_err(|e| e.to_string())?;
+            // **The overlay was written, documented, tested — and called from
+            // the other arm only.** `output-only@1` below has applied it since
+            // it was added; this one parsed the package and stopped, so for the
+            // product's principal problem type `ProblemVersion.Config` and
+            // `SeriesProblem.Config` were computed by the Server, sent with
+            // every job, and thrown away on arrival. One library problem
+            // attached to two activities with different limits was judged under
+            // the package's limits in both, and every sentence the format writes
+            // about the configuration chain was untrue here.
+            //
+            // The trial path above deliberately does not do this: a `ClaimedTrial`
+            // carries no config, because a trial calibrates the package itself
+            // rather than one activity's use of it.
+            let package_config = aj_package::Config::parse(&declared)
+                .and_then(|c| c.overlaid(job.config.as_ref()))
+                .map_err(|e| e.to_string())?;
             let tests = aj_package::TestSet::read(&package.here, &package_config)
                 .map_err(|e| e.to_string())?;
             let bytes = std::fs::read(source.path()).map_err(|e| e.to_string())?;
-            let language = job.language.as_deref().unwrap_or("cpp");
+
+            // **Required, and not guessed at.** It defaulted to `cpp`, which
+            // was harmless while C++ was one of two languages and is not now:
+            // a submission arriving without one would be compiled as C++20 by
+            // GCC and reported as a compilation error in a language nobody
+            // chose. An absent language is the Server or the Client having
+            // sent an incomplete job — an infrastructure failure, which leaves
+            // the submission rejudgeable once that is fixed, rather than a
+            // verdict against somebody's work.
+            // **`props.language` is where it lives**, and `standard-io@1` is
+            // what decides that: the Server carries the document without
+            // reading a member of it, so the member's name is this crate's to
+            // know. A second problem type may call it something else.
+            let language = language_of(job.props.as_ref())
+                .ok_or("the submission names no language, and this Runner will not guess one")?;
 
             let evaluated = pipeline
                 .evaluate(&aj_standard_io::Job {
                     config: &package_config,
                     tests: &tests,
                     language,
+                    file_name: &submitted.file_name,
                     source: &bytes,
                     package,
                     work: work.places.join("scratch"),
@@ -902,8 +932,52 @@ fn total_memory_bytes() -> Option<u64> {
 const FIVE: Duration = Duration::from_secs(5);
 const THIRTY: Duration = Duration::from_secs(30);
 
+/// Which member of a submission's `props` names the language.
+///
+/// **`standard-io@1` decides this, and nothing above it does.** The Server
+/// carries the document without reading a member, so the member's name belongs
+/// to the problem type — a second type may call it something else, or have no
+/// language at all.
+///
+/// A named function rather than a chain at the call site, because it is the one
+/// piece of the language's journey that no other test reaches: everything below
+/// it is exercised by the judging suite against a pipeline, and everything above
+/// it by the Server's.
+fn language_of(props: Option<&serde_json::Value>) -> Option<&str> {
+    props?.get("language")?.as_str()
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_language_is_read_out_of_the_submissions_own_document() {
+        let props = serde_json::json!({ "type": "standard-io@1", "language": "cpp17-gcc" });
+        assert_eq!(language_of(Some(&props)), Some("cpp17-gcc"));
+    }
+
+    /// Every one of these is a job that arrived incomplete or wrong, and each
+    /// makes the caller report an infrastructure failure rather than guess. It
+    /// guessed `cpp` until 2026-08-22, which with eighteen toolchains means
+    /// compiling somebody's Python as C++20 and calling the result their
+    /// compilation error.
+    #[test]
+    fn anything_that_does_not_name_a_language_names_none() {
+        assert_eq!(language_of(None), None);
+        assert_eq!(language_of(Some(&serde_json::json!({}))), None);
+        assert_eq!(
+            language_of(Some(&serde_json::json!({ "lang": "cpp17-gcc" }))),
+            None
+        );
+        assert_eq!(
+            language_of(Some(&serde_json::json!({ "language": 17 }))),
+            None
+        );
+        assert_eq!(
+            language_of(Some(&serde_json::json!({ "language": null }))),
+            None
+        );
+    }
     use super::*;
 
     use aj_protocol::error::Refusal;
@@ -1070,10 +1144,7 @@ mod tests {
             cache_max_bytes: 0,
             work_path: "/dev/null".into(),
             work_host_path: "/dev/null".into(),
-            images: aj_standard_io::Images {
-                cpp: String::new(),
-                python: String::new(),
-            },
+            images: aj_standard_io::Images::default(),
             allow_cgroup_v1: false,
         }
     }

@@ -64,6 +64,11 @@ pub async fn measure<S: Sandbox>(
                 config,
                 tests,
                 language: &model.language,
+                // The path the package declares, which carries the extension.
+                // A model solution whose name disagrees with its declared
+                // language now fails the trial by saying so, rather than as a
+                // compiler error in a language nobody meant to write.
+                file_name: &model.source,
                 source: &bytes,
                 package: package.clone(),
                 work: mine,
@@ -125,8 +130,7 @@ mod tests {
     #[test]
     fn one_model_names_no_language_and_several_name_theirs() {
         let one = r#"
-format: standard-io
-version: 1
+type: "standard-io@1"
 limits: { timeMs: 1000, memoryBytes: 268435456 }
 groups: [{ group: 1, points: 100 }]
 modelSolution: { source: solutions/model.cpp, language: cpp }
@@ -134,8 +138,7 @@ modelSolution: { source: solutions/model.cpp, language: cpp }
         assert_eq!(Config::parse(one).unwrap().models().len(), 1);
 
         let several = r#"
-format: standard-io
-version: 1
+type: "standard-io@1"
 limits: { timeMs: 1000, memoryBytes: 268435456 }
 groups: [{ group: 1, points: 100 }]
 modelSolutions:
