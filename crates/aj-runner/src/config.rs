@@ -15,6 +15,14 @@ pub struct Config {
     pub key_path: PathBuf,
     pub problem_types: Vec<String>,
 
+    /// Which pools this Runner belongs to, from `AJ_Runner__Tags`.
+    ///
+    /// **Read at the first registration and never again.** It exists so a room
+    /// of machines can be deployed from one Compose file rather than tagged one
+    /// at a time in the panel; changing it afterwards changes nothing, because
+    /// the operator owns the value from then on.
+    pub tags: Vec<String>,
+
     pub poll_min: Duration,
     pub poll_max: Duration,
     pub heartbeat: Duration,
@@ -78,6 +86,15 @@ impl Config {
                 .unwrap_or_else(|| "standard-io@1".into())
                 .split(',')
                 .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty())
+                .collect(),
+            // Empty by default, which the Server reads as the general pool —
+            // the same pool an untagged activity is in, so a Runner that names
+            // nothing behaves exactly as every Runner did before tags existed.
+            tags: var("Runner__Tags")
+                .unwrap_or_default()
+                .split(',')
+                .map(|t| t.trim().to_lowercase())
                 .filter(|t| !t.is_empty())
                 .collect(),
 

@@ -35,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
         fingerprint = %identity.fingerprint(),
         server = %config.base_url,
         problem_types = ?config.problem_types,
+        tags = ?config.tags,
         "starting",
     );
 

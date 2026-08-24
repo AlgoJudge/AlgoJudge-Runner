@@ -984,6 +984,7 @@ fn probe_config() -> Config {
         name: unique("lease-probe"),
         key_path: scratch.join("identity.key"),
         problem_types: vec!["lease-probe@1".into()],
+        tags: vec![],
         poll_min: Duration::from_secs(1),
         poll_max: Duration::from_secs(5),
         heartbeat: Duration::from_secs(60),

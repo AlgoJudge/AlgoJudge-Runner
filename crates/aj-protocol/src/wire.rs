@@ -102,6 +102,24 @@ pub struct Register {
     #[serde(default)]
     pub external: bool,
 
+    /// Which pools this Runner belongs to — a laboratory, a room, a machine
+    /// class. The Server pairs a Runner with work when the two lists **share at
+    /// least one** tag, and an empty list on either side means `default`, so a
+    /// Runner that names a pool leaves the general queue as well as joining a
+    /// reserved one.
+    ///
+    /// **A seed, and the Server honours it once.** Every other field here is
+    /// refreshed whenever this Runner registers again — which is how a restart
+    /// is reported — and this one is not: from the first registration onwards
+    /// the operator owns it in the panel. A Runner that could re-declare its
+    /// tags on restart would put itself into an examination's pool with nobody
+    /// approving it.
+    ///
+    /// Skipped when empty, so a Runner that names none sends what it always
+    /// sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+
     /// Host facts, stored opaquely and only ever shown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine: Option<serde_json::Value>,

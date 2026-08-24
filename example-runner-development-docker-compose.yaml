@@ -111,6 +111,18 @@ services:
       AJ_Server__BaseUrl: http://server:8080/api/v1
       AJ_Runner__Name: runner-dev
       AJ_Runner__ProblemTypes: standard-io@1,output-only@1
+      # Which pools this Runner belongs to, comma-separated — a laboratory, a
+      # room, a machine class. Left unset it is in `default`, which is where
+      # every untagged activity's work is, and it behaves as every Runner did
+      # before tags existed.
+      #
+      # **Read once.** The Server takes it at the first registration and the
+      # panel owns it from then on, so changing it here later changes nothing:
+      # a restart must not be able to move a Runner into an examination's pool.
+      # It is here so a room of machines can be deployed from one file rather
+      # than tagged one at a time.
+      #
+      # AJ_Runner__Tags: lab-a
       # Short, so a developer watching the log sees it ask rather than wondering
       # whether it is alive. Production leaves these alone.
       AJ_Poll__MinSeconds: "1"

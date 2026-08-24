@@ -27,6 +27,7 @@ pub async fn admitted(server: &Server, identity: &Identity, config: &Config) -> 
         problem_types: config.problem_types.clone(),
         // This one runs code where it stands. Nothing leaves.
         external: false,
+        tags: config.tags.clone(),
         machine: Some(machine()),
     };
 
@@ -1136,6 +1137,7 @@ mod tests {
             name: "test".into(),
             key_path: "/dev/null".into(),
             problem_types: vec!["standard-io@1".into()],
+            tags: vec![],
             poll_min: FIVE,
             poll_max: THIRTY,
             heartbeat: THIRTY,

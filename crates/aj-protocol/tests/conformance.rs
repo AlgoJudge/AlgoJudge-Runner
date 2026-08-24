@@ -55,6 +55,7 @@ fn registration(identity: &Identity, name: &str) -> Register {
         public_key: identity.public_key(),
         external: false,
         problem_types: vec!["standard-io@1".into()],
+        tags: vec![],
         machine: None,
     }
 }
@@ -146,6 +147,7 @@ async fn a_key_that_is_not_thirty_two_bytes_is_refused() {
                 public_key: public_key.into(),
                 external: false,
                 problem_types: vec!["standard-io@1".into()],
+                tags: vec![],
                 machine: None,
             })
             .await
