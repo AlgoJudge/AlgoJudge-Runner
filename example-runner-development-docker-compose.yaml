@@ -50,6 +50,12 @@ services:
     environment:
       DOTNET_ENVIRONMENT: Development
       AJ_ConnectionStrings__DbConnectionString: Host=postgres;Database=algojudge;Username=algojudge;Password=algojudge
+      # **Without this the Server refuses to start**, and has since 2026-08-23:
+      # nothing may be assumed about whose word to take for a visitor's address.
+      # `none` is the full answer for a Server reached directly, which this one
+      # is. This file went without it for a day and the stack it exists to raise
+      # would not come up.
+      AJ_Forwarded__KnownProxies: none
       # What `/admin/**` asks for on top of being called from inside the
       # container: the maintenance switch and the endpoint that sets the
       # administrator's password. **Empty closes the whole group.**
