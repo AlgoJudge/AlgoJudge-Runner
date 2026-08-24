@@ -56,6 +56,21 @@ accident:
   new configuration, a new key and a new registration.
 - **A token carries no scope beyond this Runner.**
 
+**`AJ_Runner__Tags` is a seed, not a setting** (2026-08-24). It names the pools
+this Runner belongs to, and the Server pairs a Runner with work when the two
+lists **share at least one** tag — with an empty list on either side meaning
+`default`, so a Runner that names a pool leaves the general queue as well as
+joining a reserved one. Two things about it are easy to get wrong here:
+
+- **The Server reads it once, at the first registration.** Every other field
+  in `Register` is refreshed when a Runner registers again, which is how a
+  restart is reported; this one is not, and the operator owns it in the panel
+  from then on. Changing the variable later changes nothing, and that is the
+  point: a restart must not move a Runner into an examination's pool.
+- **It is skipped when empty**, so a Runner in no pool sends exactly the
+  registration it always sent. `tags_are_sent_only_when_there_are_any` is what
+  keeps that true.
+
 ## Decisions in force (2026-08-06, recorded here 2026-08-08)
 
 - **Rust.** `tokio`, `reqwest`, `serde`, `tracing`, `ed25519-dalek`, `bollard`

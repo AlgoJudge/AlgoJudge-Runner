@@ -500,6 +500,31 @@ mod tests {
         assert!(json.get("verdict").is_none());
     }
 
+    /// A Runner in no pool sends the registration it has always sent, so an
+    /// older Server sees nothing new — and one that names a pool sends it
+    /// exactly once, because the Server honours the field on the first
+    /// registration only.
+    #[test]
+    fn tags_are_sent_only_when_there_are_any() {
+        let mut register = Register {
+            name: "runner-01".into(),
+            product: "AlgoJudge-Runner".into(),
+            version: "1.0.0".into(),
+            public_key: "aaaa".into(),
+            problem_types: vec!["standard-io@1".into()],
+            external: false,
+            tags: vec![],
+            machine: None,
+        };
+
+        let json = serde_json::to_value(&register).unwrap();
+        assert!(json.get("tags").is_none());
+
+        register.tags = vec!["lab-a".into()];
+        let json = serde_json::to_value(&register).unwrap();
+        assert_eq!(json["tags"], serde_json::json!(["lab-a"]));
+    }
+
     fn header(value: &str) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
