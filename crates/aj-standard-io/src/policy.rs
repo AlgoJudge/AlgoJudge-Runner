@@ -134,8 +134,8 @@ pub struct LanguageRules {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Group {
-    /// What the participant is told. Not the group's letter — "Otwieranie
-    /// pliku" teaches something, "F" does not.
+    /// What the participant is told. Not the group's letter — "Opening a
+    /// file" teaches something, "F" does not.
     pub name: String,
     #[serde(default = "yes", deserialize_with = "switch")]
     pub default: bool,
@@ -157,7 +157,7 @@ pub struct Violation {
 impl Violation {
     /// The line for a result's `note`.
     pub fn note(&self) -> String {
-        format!("{} — {} (wiersz {})", self.rule, self.matched, self.line)
+        format!("{} — {} (line {})", self.rule, self.matched, self.line)
     }
 }
 

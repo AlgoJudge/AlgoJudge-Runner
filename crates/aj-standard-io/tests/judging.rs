@@ -635,10 +635,10 @@ int main() { long long a, b; std::cin >> a >> b; system("ls"); std::cout << a + 
         "the header rule is not named: {said}"
     );
     assert!(
-        said.contains("Uruchamianie innego programu"),
+        said.contains("Running another program"),
         "the participant is told the rule's name, not its letter: {said}",
     );
-    assert!(said.contains("wiersz"), "and where it was: {said}");
+    assert!(said.contains("(line "), "and where it was: {said}");
 }
 
 /// A correct solution that merely *mentions* a forbidden word in a comment is
