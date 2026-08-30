@@ -216,8 +216,12 @@ security **test cases**, not a production specification.
 
 - [AlgoJudge-Server](https://github.com/AlgoJudge/AlgoJudge-Server) — jobs, packages, results
 - [AlgoJudge-Client](https://github.com/AlgoJudge/AlgoJudge-Client) — the web frontend
-- `AlgoJudge-Runner-UVa` (private) — the second Runner implementation, forwarding `uva@1` submissions to `onlinejudge.org`. It consumes this repository's `aj-protocol` crate over Git, pinned to a revision in its `Cargo.toml`, so a breaking change here is a change two repositories have to agree on
-- `AlgoJudge-Ops` (private) — the production Compose stack, which is what runs this image at an installation
+- `AlgoJudge-Runner-UVa` (private) — the second Runner implementation, forwarding
+  `uva@1` submissions to `onlinejudge.org`. It consumes this repository's
+  `aj-protocol` crate over Git, pinned to a revision in its `Cargo.toml`, so a
+  breaking change here is a change two repositories have to agree on
+- `AlgoJudge-Ops` (private) — the production Compose stack, which is what runs
+  this image at an installation
 
 ## License
 
