@@ -16,3 +16,8 @@ aj-package = { path = "../aj-package" }
 aj-standard-io = { path = "../aj-standard-io" }
 
 tracing.workspace = true
+
+[dev-dependencies]
+# Building an answer archive is how `unpack` and the flat-or-nested lookup get
+# exercised at all; the crate itself never writes one.
+zip.workspace = true
