@@ -103,7 +103,10 @@ pub fn mark(package: &Path, config: &Config, tests: &TestSet, answers: &Answers)
             Ok(bytes) => bytes,
             Err(e) => {
                 tracing::error!(test = %test.name, %e, "the package's expected output is unreadable");
-                outcomes.push(missing(test, "the package has no expected output for this test"));
+                outcomes.push(missing(
+                    test,
+                    "the package has no expected output for this test",
+                ));
                 continue;
             }
         };
