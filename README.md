@@ -1,7 +1,10 @@
 # AlgoJudge Runner
 
-Isolated execution and evaluation of submitted solutions for
-[AlgoJudge](https://github.com/AlgoJudge).
+AlgoJudge is open-source, self-hosted software for programming contests and
+courses, with automatic evaluation of submitted solutions.
+
+This is the component that does the evaluating: isolated execution and marking,
+for [AlgoJudge](https://github.com/AlgoJudge).
 
 ## Status
 
@@ -10,8 +13,43 @@ holds and renews a lease, downloads and verifies packages, unpacks them,
 compiles and runs a submission in isolated containers, scores it by groups, and
 reports the mark with the compiler's log and a per-test table attached.
 
-`standard-io@1`, in C++ and Python. What is not here yet: the forbidden-word
-dictionary, calibration from a model solution, and a second problem type.
+**Two problem types, and eighteen toolchains.** `standard-io@1` in C, C++ and
+Python — the table is `crates/aj-standard-io/src/language.rs`, counted at 18 on
+2026-08-30 — and `output-only@1`, where the participant uploads answers rather
+than a program.
+
+> **This said "`standard-io@1`, in C++ and Python", and listed three things as
+> not here yet: the forbidden-word dictionary, calibration from a model
+> solution, and a second problem type.** All three shipped, and the sentence
+> outlived them by weeks. `crates/aj-standard-io/src/policy.rs` is the
+> dictionary, `crates/aj-standard-io/src/calibrate.rs` and `run_trial` in
+> `crates/aj-runner/src/run.rs` are the calibration, and `crates/aj-output-only/`
+> is the second type. Corrected 2026-08-30.
+
+### `output-only@1` is the evidence for the invariant
+
+**Adding a problem type must not require a Server change.** The product has
+asserted that from the beginning, and until 2026-08-09 nothing had tested it:
+one problem type is not a boundary, it is a shape.
+
+`output-only@1` was built to be the test rather than because anybody asked for
+it, and it differs from `standard-io@1` on all three axes that could have forced
+a Server change — the submission is a file rather than source in an editor, the
+package declares no language and needs no compiler, and the evaluation **runs no
+untrusted code at all**, because the participant sent the answers. It is
+therefore the safest type in the product and the one with the least machinery:
+no build container, no run container, no policy dictionary, nothing that can
+escape because nothing executes.
+
+**The Server did not change.** The commit is `e126fed`, 2026-08-09, *"Add a
+second problem type, and leave the Server untouched"*; verified 2026-08-30 —
+`output-only` appears nowhere in `AlgoJudge-Server`'s C# or `openapi.json`. What
+a type costs here is one `match` arm in `crates/aj-runner/src/run.rs` and a
+crate. Everything around it — claiming, leasing, the package cache, integrity,
+reporting — is shared.
+
+One untrusted archive is opened in the product, and it is this one: a
+participant's answers, unpacked under limits tighter than a package's.
 
 ## What it is for
 
@@ -21,7 +59,11 @@ Runner implementation, and several may coexist.
 
 The contract is
 `AlgoJudge-Design/specifications/server-runner/SERVER_RUNNER_API.md`, **v1.1**,
-**`Accepted` 2026-08-08, amended 2026-08-09**, with ten conformance cases in
+**`Accepted` 2026-08-08; amended 2026-08-09 with §9, unavailability; amended
+2026-08-22, §5 and §6; amended 2026-08-24, §3 and §5, Runner tags** — copied
+from that document's own header on 2026-08-30, where this had cited the first
+amendment only. **Read its amendment tables before the body**, which states the
+pre-amendment form of an amended section. Ten conformance cases, in
 `AlgoJudge.Server.Tests/RunnerConformanceTests.cs`.
 
 Three properties of it shape everything here:
@@ -174,6 +216,12 @@ security **test cases**, not a production specification.
 
 - [AlgoJudge-Server](https://github.com/AlgoJudge/AlgoJudge-Server) — jobs, packages, results
 - [AlgoJudge-Client](https://github.com/AlgoJudge/AlgoJudge-Client) — the web frontend
+- `AlgoJudge-Runner-UVa` (private) — the second Runner implementation, forwarding
+  `uva@1` submissions to `onlinejudge.org`. It consumes this repository's
+  `aj-protocol` crate over Git, pinned to a revision in its `Cargo.toml`, so a
+  breaking change here is a change two repositories have to agree on
+- `AlgoJudge-Ops` (private) — the production Compose stack, which is what runs
+  this image at an installation
 
 ## License
 

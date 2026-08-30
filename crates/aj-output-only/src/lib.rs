@@ -103,7 +103,10 @@ pub fn mark(package: &Path, config: &Config, tests: &TestSet, answers: &Answers)
             Ok(bytes) => bytes,
             Err(e) => {
                 tracing::error!(test = %test.name, %e, "the package's expected output is unreadable");
-                outcomes.push(missing(test, "Brak oczekiwanego wyniku w paczce"));
+                outcomes.push(missing(
+                    test,
+                    "the package has no expected output for this test",
+                ));
                 continue;
             }
         };
@@ -112,7 +115,7 @@ pub fn mark(package: &Path, config: &Config, tests: &TestSet, answers: &Answers)
             // Not an error and not a crash: a participant who answered four of
             // five tests gets four tests' worth of credit and is told which one
             // is missing.
-            outcomes.push(missing(test, "Brak odpowiedzi dla tego testu"));
+            outcomes.push(missing(test, "no answer was uploaded for this test"));
             continue;
         };
 
