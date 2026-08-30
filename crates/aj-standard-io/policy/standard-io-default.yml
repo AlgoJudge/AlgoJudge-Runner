@@ -9,7 +9,7 @@
 # PolicyViolation with score 0; the submission is neither compiled nor run.
 #
 # Shipped with the Runner and versioned (D-10): a package names this profile
-# rather than restating sixty words, so a task written today still gets a
+# rather than restating sixty words, so a problem written today still gets a
 # reviewed set tomorrow.
 
 version: 1
@@ -21,7 +21,7 @@ matching:
   wholeToken: true             # \b...\b, never substring
   caseSensitive: true
   reportAllMatches: true
-  passes: [source]             # [source, preprocessed] is opt-in per task
+  passes: [source]             # [source, preprocessed] is opt-in per problem
 
 # --------------------------------------------------------------------------
 # C / C++
@@ -112,13 +112,13 @@ languages:
     groups:
 
       P:
-        name: "Uruchamianie innego programu"
+        name: "Running another program"
         default: on
         identifiers: [system, popen, pclose]
         patterns: ['std\s*::\s*system']
 
       F:
-        name: "Otwieranie pliku"
+        name: "Opening a file"
         default: on
         identifiers:
           - fopen
@@ -154,34 +154,34 @@ languages:
         patterns: ['std\s*::\s*filesystem']
 
       D:
-        name: "Zmienianie systemu plików"
+        name: "Changing the file system"
         # OFF by default: `remove` collides with std::remove / std::remove_if,
         # which is entirely legal. See decision D-8.
         default: off
         identifiers: [remove, rename]
 
       E:
-        name: "Czytanie środowiska"
+        name: "Reading the environment"
         default: on
         identifiers: [getenv, secure_getenv, setenv, putenv, unsetenv, clearenv, environ]
 
       L:
-        name: "Ładowanie zewnętrznego kodu"
+        name: "Loading external code"
         default: on
         identifiers: [dlopen, dlsym, dlmopen, dlvsym, dlclose, dladdr]
 
       K:
-        name: "Bezpośrednie wywołanie jądra"
+        name: "Calling the kernel directly"
         default: on
         identifiers: [syscall, ptrace]
 
       A:
-        name: "Wstawki asemblerowe"
+        name: "Inline assembly"
         default: on
         identifiers: [asm, __asm, __asm__]
 
       T:
-        name: "Tworzenie wątków"
+        name: "Creating threads"
         default: on
         identifiers: [pthread_create, pthread_attr_init, thrd_create, omp_set_num_threads]
         patterns:
@@ -191,7 +191,7 @@ languages:
           - 'std\s*::\s*this_thread'
 
       O:
-        name: "Zmienianie optymalizacji kompilatora"
+        name: "Changing compiler optimisation"
         default: on
         patterns:
           - '#\s*pragma\s+GCC\s+optimize'
@@ -304,8 +304,8 @@ languages:
     deniedAttributes: ['#[link]', '#[no_mangle]']
     optional:
       unsafe:
-        name: "Kod unsafe"
-        default: off      # decision D-11 — off by default, available per task
+        name: "unsafe code"
+        default: off      # decision D-11 — off by default, available per problem
 
 # --------------------------------------------------------------------------
 # Java — carried here, not yet enforced.
