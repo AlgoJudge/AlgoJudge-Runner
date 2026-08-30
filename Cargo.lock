@@ -24,6 +24,7 @@ dependencies = [
  "aj-package",
  "aj-standard-io",
  "tracing",
+ "zip",
 ]
 
 [[package]]
