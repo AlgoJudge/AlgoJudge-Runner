@@ -37,9 +37,17 @@ A Runner:
 ## The contract is accepted, and it is not here
 
 `AlgoJudge-Design/specifications/server-runner/SERVER_RUNNER_API.md`, **v1.1**,
-**`Accepted` 2026-08-08, amended 2026-08-09** with §9 and unavailability. It is
-the contract; where this repository and that document disagree, **the document
-wins and the difference is reported** rather than worked around.
+**`Accepted` 2026-08-08; amended 2026-08-09 with §9, unavailability; amended
+2026-08-22, §5 and §6; amended 2026-08-24, §3 and §5, Runner tags.** It is the
+contract; where this repository and that document disagree, **the document wins
+and the difference is reported** rather than worked around. Read its amendment
+tables before the body: an amended section still states its pre-amendment form.
+
+> **The list above cited the 2026-08-09 amendment alone until 2026-08-30**, and
+> the omission was odd rather than harmless: this file already described the
+> other two, under *Where a job's parts come from* and in the `AJ_Runner__Tags`
+> bullets, without saying either was an amendment to the contract. Copied from
+> the document's own header on 2026-08-30.
 
 Its conformance suite is `AlgoJudge.Server.Tests/RunnerConformanceTests.cs` in
 AlgoJudge-Server — **ten cases** a second implementation must also pass. The
@@ -101,6 +109,18 @@ joining a reserved one. Two things about it are easy to get wrong here:
   lease token, a delivery count and a result. *Supersedes the 2026-08-02
   decision that deferred it onto `Result`.*
 - `main` is the integration and default branch.
+
+## The problem types
+
+**Two, and the second one is an experiment that stayed.** `standard-io@1` is the
+product's principal type; `output-only@1` exists because *adding a problem type
+must not require a Server change* was an invariant nothing had ever tested.
+
+The dispatch is one `match` on `job.problem_type` in `crates/aj-runner/src/run.rs`
+and nothing above or below it is type-aware. **That is the whole cost of a type
+here**, and the Server's cost is nil: verified 2026-08-30, `output-only` appears
+nowhere in `AlgoJudge-Server`'s C# or in `openapi.json`. A third type is another
+arm plus a crate.
 
 ## `standard-io@1`
 
@@ -187,6 +207,41 @@ submission stays rejudgeable.
 
 Do not treat the historical LXD scripts from the engineering thesis as a
 production specification. They are a source of security test cases.
+
+## `output-only@1`
+
+**The participant uploads answers, not a program**, and it was added on
+2026-08-09 by `e126fed`, *"Add a second problem type, and leave the Server
+untouched"*. `crates/aj-output-only/` is all of it — this file did not name it
+until 2026-08-30, despite the crate and the dispatch arm.
+
+It differs from `standard-io@1` on the three axes that could have forced a Server
+change, which is what makes it a test of the invariant rather than a variation:
+the submission is a file rather than source, the package declares no language and
+needs no compiler, and **nothing untrusted is executed**. No build container, no
+run container, no policy dictionary — there is no code to read — and nothing that
+can escape, because nothing runs.
+
+Four things about it are easy to get wrong:
+
+- **It opens the only untrusted archive in the product.** A package comes from a
+  problem author and is semi-trusted; these answers come from a participant.
+  `Answers::unpack` goes through `aj_package::extract` under limits of its own,
+  tighter than a package's — 2 000 entries, 64 MiB an entry, 256 MiB unpacked, a
+  ratio of 200 — so a zip bomb is refused rather than unpacked.
+- **A bare file is accepted when the problem has exactly one test**, and refused
+  with a sentence naming the test count when it has more.
+- **An answer flat in the archive and an answer one directory deep both count.**
+  Zipping a selection and zipping a folder are both what people do.
+- **A missing answer is a wrong answer, not a failure.** Somebody who answered
+  four tests of five is marked on four and told which one is absent; nothing
+  crashes and nothing is rejudgeable on that account.
+
+**There is no checker**, deliberately: one would add a sandbox to the one handler
+whose point is that it needs none. The checker module is shared with
+`standard-io@1` when somebody wants one. `details()` reports compilation as a
+warning saying nothing was compiled, rather than `OK`, which would imply
+something was.
 
 ## Working here
 
