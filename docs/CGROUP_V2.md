@@ -18,10 +18,15 @@ The Runner asks the **container runtime**, not the filesystem:
 docker info --format '{{.CgroupVersion}}'      # must print 2
 ```
 
-`crates/aj-sandbox/src/docker.rs:211` reads `info.cgroup_version` and refuses to
-start on anything else. Asking the daemon rather than reading `/sys/fs/cgroup`
-is deliberate: the Runner may itself be in a container, and what *it* sees is a
-different question from what the containers *it starts* will get.
+`crates/aj-sandbox/src/docker.rs:334` reads `info.cgroup_version`, matches
+`SystemInfoCgroupVersionEnum::_2`, and refuses to start on anything else.
+Asking the daemon rather than reading `/sys/fs/cgroup` is deliberate: the Runner
+may itself be in a container, and what *it* sees is a different question from
+what the containers *it starts* will get.
+
+*This cited `:211` until 2026-08-30, which was right when it was written and had
+drifted since. Located again that day; a line number is the citation most likely
+to be wrong, so search for `cgroup_version` rather than trusting this one.*
 
 **Do not test with `[ -s /sys/fs/cgroup/cgroup.controllers ]`.** A cgroup
 pseudo-file reports `st_size` zero however much it holds, so the size test calls
@@ -84,9 +89,29 @@ memory.events: oom 1, oom_kill 1
 memory.peak  = 33554432        exactly the limit
 ```
 
-Both suites pass on this host with **no escape hatch**:
+Both suites passed on this host with **no escape hatch**, on 2026-08-09:
 `aj-sandbox --test adversarial` **11/11**, `aj-standard-io --test judging`
 **10/10**.
+
+> **Both suites have grown since, so those fractions describe 2026-08-09 and
+> nothing later.** Counted on 2026-08-30: `crates/aj-sandbox/tests/adversarial.rs`
+> holds **12** cases and `crates/aj-standard-io/tests/judging.rs` holds **21**,
+> none of them ignored. That is a count of the files, not a run — this document
+> reports one measurement on one host and a fresh number belongs to a fresh
+> measurement.
+>
+> **And neither command above is runnable as written.** Rust is not installed on
+> the development host; everything goes through the container wrapper:
+>
+> ```
+> AJ_DOCKER_SOCKET=1 ./x test -p aj-sandbox --test adversarial
+> ./x test -p aj-standard-io --test judging
+> ```
+>
+> `AJ_DOCKER_SOCKET` is what mounts the runtime socket and `/sys/fs/cgroup`, and
+> the adversarial suite cannot run without it: it starts sibling containers and
+> reads their cgroups. An ordinary `./x test` deliberately does not take that
+> privilege — anything that can reach the socket is root on the host.
 
 ## 4. Swap, which is easy to get wrong in both directions
 
