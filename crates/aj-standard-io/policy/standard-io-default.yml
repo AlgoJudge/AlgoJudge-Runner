@@ -9,7 +9,7 @@
 # PolicyViolation with score 0; the submission is neither compiled nor run.
 #
 # Shipped with the Runner and versioned (D-10): a package names this profile
-# rather than restating sixty words, so a task written today still gets a
+# rather than restating sixty words, so a problem written today still gets a
 # reviewed set tomorrow.
 
 version: 1
@@ -21,7 +21,7 @@ matching:
   wholeToken: true             # \b...\b, never substring
   caseSensitive: true
   reportAllMatches: true
-  passes: [source]             # [source, preprocessed] is opt-in per task
+  passes: [source]             # [source, preprocessed] is opt-in per problem
 
 # --------------------------------------------------------------------------
 # C / C++
@@ -305,7 +305,7 @@ languages:
     optional:
       unsafe:
         name: "Kod unsafe"
-        default: off      # decision D-11 — off by default, available per task
+        default: off      # decision D-11 — off by default, available per problem
 
 # --------------------------------------------------------------------------
 # Java — carried here, not yet enforced.
