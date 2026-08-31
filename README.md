@@ -194,6 +194,6 @@ By contributing you agree that your work is licensed under the terms below.
 ## License
 
 This project is licensed under the MIT License.
-See LICENSE.
+See [LICENSE](LICENSE).
 
-Authors are listed in AUTHORS.txt.
+Authors are listed in [AUTHORS.txt](AUTHORS.txt).
