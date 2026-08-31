@@ -175,8 +175,10 @@ gate.
 
 - [AlgoJudge-Server](https://github.com/AlgoJudge/AlgoJudge-Server) — jobs, packages, results
 - [AlgoJudge-Client](https://github.com/AlgoJudge/AlgoJudge-Client) — the web frontend
-- [AlgoJudge-Runner-UVa](https://github.com/AlgoJudge/AlgoJudge-Runner-UVa) —
-  the second Runner implementation, forwarding `uva@1` submissions to
+- [AlgoJudge-External-Runner](https://github.com/AlgoJudge/AlgoJudge-External-Runner) —
+  the second Runner implementation, which judges nothing: it forwards
+  submissions to external judging systems and reports their verdicts, with UVa
+  Online Judge as its one integration, serving `uva@1` against
   `onlinejudge.org`. It consumes this repository's `aj-protocol` crate over Git,
   pinned to a revision in its `Cargo.toml`, so a breaking change here is a
   change two repositories have to agree on
