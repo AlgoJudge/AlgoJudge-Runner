@@ -54,21 +54,26 @@ the next line — so the two properties are mutually exclusive across the pipeli
 A running submission's only writable path is `/dev/shm`, which the contract below
 describes as a surface nobody declared and rule 3's test names explicitly.
 
-Most rows have a test in `crates/aj-sandbox/tests/adversarial.rs` asserting the
-program was stopped correctly, and most of those also assert **the host is
-unchanged afterwards** — a sandbox that contains a program by leaking a process
+Every row has a test in `crates/aj-sandbox/tests/adversarial.rs`, and each
+asserts two things: the program was stopped correctly, **and the host is
+unchanged afterwards**. A sandbox that contains a program by leaking a process
 has not contained it.
 
-**Neither is "every", and this said it was until 2026-08-31.** Four rows have no
-test in that file at all: `--cap-drop=ALL`, `--security-opt=no-new-privileges`,
-`--user 65534:65534` and the CPU pair. Every case builds its profile through one
-helper that sets none of them, so identity, capabilities and CPU pinning are
-configured and unproven here. And of the sixteen cases, eleven assert no
-leftovers; the five that do not include the one this document cites by name below
-as the proof of rule 3, `nothing_survives_from_one_run_to_the_next`.
+**That was untrue for a day, and the four rows it was untrue of are worth
+naming.** Until 2026-08-31 nothing tested `--cap-drop=ALL`,
+`--security-opt=no-new-privileges`, `--user 65534:65534` or the CPU pair — every
+case built its profile through one helper that set none of them, so identity,
+capabilities and CPU pinning were configured and unproven. Five cases also had
+no leftovers assertion, among them the one this document cites below as the proof
+of rule 3. All of it is closed; the suite is twenty cases now.
 
-That is a gap in the tests, recorded rather than papered over. Closing it is a
-change to `adversarial.rs`, not to this table.
+**One of those four taught something that outlives it.** The obvious capability
+test — assert the effective set is empty — is no test at all here. Measured with
+`cap_drop` deleted and nothing else changed: `CapInh`, `CapPrm`, `CapEff` and
+`CapAmb` stay all zeros, because the kernel clears them on the drop to uid 65534.
+Only `CapBnd` moves, to `00000000a80425fb`. The bounding set is the assertion
+that gates, and it is also the one that matters: it is the ceiling on what may
+ever be *regained*.
 
 Two more, from the pipeline rather than the sandbox:
 
