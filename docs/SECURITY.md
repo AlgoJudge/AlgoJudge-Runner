@@ -39,8 +39,7 @@ correctly.
 | `--network=none` | no route anywhere |
 | `--cap-drop=ALL` | no capabilities |
 | `--security-opt=no-new-privileges` | and none may be gained |
-| read-only root filesystem | writes go to a tmpfs or nowhere |
-| tmpfs `rw,noexec,nosuid` | scratch that cannot be executed from |
+| read-only root filesystem | writes go nowhere it covers — see `/dev/shm` below |
 | `--user 65534:65534` | never root, even inside |
 | `--memory` **with `--memory-swap` equal** | without the second the limit means nothing: the process swaps instead of being killed |
 | `--pids-limit` | a fork bomb hits a wall |
@@ -48,10 +47,28 @@ correctly.
 | wall clock = the problem's limit **plus one second** | something outside the process has to reap one stuck in an uninterruptible syscall |
 | an output cap enforced **while it runs** | read afterwards, a flooding program fills the host's disk first |
 
-Every row has a test in `crates/aj-sandbox/tests/adversarial.rs`, and each
-asserts two things: the program was stopped correctly, **and the host is
-unchanged afterwards**. A sandbox that contains a program by leaking a process
+**The tmpfs row was in this table until 2026-08-31 and did not belong**: no step
+that runs a submission is given one. The two profiles that ask for a tmpfs are
+the submission build and the checker build, and both ask for a writable root on
+the next line — so the two properties are mutually exclusive across the pipeline.
+A running submission's only writable path is `/dev/shm`, which the contract below
+describes as a surface nobody declared and rule 3's test names explicitly.
+
+Most rows have a test in `crates/aj-sandbox/tests/adversarial.rs` asserting the
+program was stopped correctly, and most of those also assert **the host is
+unchanged afterwards** — a sandbox that contains a program by leaking a process
 has not contained it.
+
+**Neither is "every", and this said it was until 2026-08-31.** Four rows have no
+test in that file at all: `--cap-drop=ALL`, `--security-opt=no-new-privileges`,
+`--user 65534:65534` and the CPU pair. Every case builds its profile through one
+helper that sets none of them, so identity, capabilities and CPU pinning are
+configured and unproven here. And of the sixteen cases, eleven assert no
+leftovers; the five that do not include the one this document cites by name below
+as the proof of rule 3, `nothing_survives_from_one_run_to_the_next`.
+
+That is a gap in the tests, recorded rather than papered over. Closing it is a
+change to `adversarial.rs`, not to this table.
 
 Two more, from the pipeline rather than the sandbox:
 

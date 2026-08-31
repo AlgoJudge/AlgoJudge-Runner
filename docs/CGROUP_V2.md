@@ -18,15 +18,16 @@ The Runner asks the **container runtime**, not the filesystem:
 docker info --format '{{.CgroupVersion}}'      # must print 2
 ```
 
-`crates/aj-sandbox/src/docker.rs:334` reads `info.cgroup_version`, matches
+`crates/aj-sandbox/src/docker.rs` reads `info.cgroup_version`, matches
 `SystemInfoCgroupVersionEnum::_2`, and refuses to start on anything else.
 Asking the daemon rather than reading `/sys/fs/cgroup` is deliberate: the Runner
 may itself be in a container, and what *it* sees is a different question from
 what the containers *it starts* will get.
 
-*This cited `:211` until 2026-08-30, which was right when it was written and had
-drifted since. Located again that day; a line number is the citation most likely
-to be wrong, so search for `cgroup_version` rather than trusting this one.*
+*This cited `:211` until 2026-08-30 and `:334` until 2026-08-31, each right when
+written and drifted within the day. **The number is gone rather than re-pinned a
+third time** — search for `cgroup_version`. A line number is the citation most
+likely to be wrong, and this document said so while carrying one.*
 
 **Do not test with `[ -s /sys/fs/cgroup/cgroup.controllers ]`.** A cgroup
 pseudo-file reports `st_size` zero however much it holds, so the size test calls
@@ -95,23 +96,36 @@ Both suites passed on this host with **no escape hatch**, on 2026-08-09:
 
 > **Both suites have grown since, so those fractions describe 2026-08-09 and
 > nothing later.** Counted on 2026-08-30: `crates/aj-sandbox/tests/adversarial.rs`
-> holds **12** cases and `crates/aj-standard-io/tests/judging.rs` holds **21**,
-> none of them ignored. That is a count of the files, not a run — this document
-> reports one measurement on one host and a fresh number belongs to a fresh
-> measurement.
+> held **12** cases and `crates/aj-standard-io/tests/judging.rs` held **21**; on
+> 2026-08-31 they hold **16** and **22**. That is a count of the files, not a
+> run — this document reports one measurement on one host and a fresh number
+> belongs to a fresh measurement.
+>
+> **This said "none of them ignored", and the truth is the opposite: every one
+> is.** Both suites need a container runtime, so every case carries `#[ignore]`
+> and `--include-ignored` is mandatory — which is why the commands below carry
+> it. A reader who believed the old clause ran them without it and saw
+> `0 passed; 0 failed; 16 ignored`, which reads like a pass.
 >
 > **And neither command above is runnable as written.** Rust is not installed on
 > the development host; everything goes through the container wrapper:
 >
 > ```
-> AJ_DOCKER_SOCKET=1 ./x test -p aj-sandbox --test adversarial
-> ./x test -p aj-standard-io --test judging
+> AJ_DOCKER_SOCKET=1 ./x test -p aj-sandbox --test adversarial -- --include-ignored --test-threads=1
+> AJ_DOCKER_SOCKET=1 ./x test -p aj-standard-io --test judging -- --include-ignored --test-threads=1
 > ```
 >
-> `AJ_DOCKER_SOCKET` is what mounts the runtime socket and `/sys/fs/cgroup`, and
-> the adversarial suite cannot run without it: it starts sibling containers and
+> Both suites need the socket, and this named only the adversarial one until
+> 2026-08-31 — so the judging command was printed without it and could not have
+> worked. `AJ_DOCKER_SOCKET` is what mounts the runtime socket and
+> `/sys/fs/cgroup`; both start sibling containers, and the adversarial one also
 > reads their cgroups. An ordinary `./x test` deliberately does not take that
 > privilege — anything that can reach the socket is root on the host.
+>
+> `--test-threads=1` is load-bearing too: run in parallel these fight over the
+> container runtime and all of them fail. And **the judging suite needs the four
+> language images built first** — nothing builds them for you, and every case
+> fails at its first line without them.
 
 ## 4. Swap, which is easy to get wrong in both directions
 
@@ -216,6 +230,22 @@ cgroup as the root and would read an empty directory rather than fail.
 --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup
 AJ_Sandbox__CgroupRoot      # defaults to /sys/fs/cgroup
 ```
+
+**And a third requirement, unstated here until 2026-08-31: the daemon's cgroup
+driver must be `cgroupfs`.** `resolve_cgroup_root` gives up on any other driver
+and logs it at `info` — so with `systemd`, the default on RHEL 9+, Fedora and
+Ubuntu, an operator can satisfy every row of the table above, mount the hierarchy
+writable, pass `--cgroupns=host`, and still get no peak memory, with one `info`
+line to say so.
+
+```
+docker info --format '{{.CgroupDriver}}'       # must print cgroupfs
+```
+
+This is how it was found, and the code records it: CI caught it and the
+workstation did not, because the workstation runs `cgroupfs` and the runner runs
+`systemd`, so every container in the adversarial suite failed to start on a host
+the author never used.
 
 **It costs write permission, not a capability.** Creating a directory in a
 mounted cgroup2 needs neither `CAP_SYS_ADMIN` nor privilege — which is the whole

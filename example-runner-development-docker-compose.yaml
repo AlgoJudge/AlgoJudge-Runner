@@ -2,13 +2,20 @@
 # need all three.
 #
 #   docker compose -f example-runner-development-docker-compose.yaml up -d --build --wait
-#   ./x test --test conformance -- --include-ignored
+#   ./x test --test conformance -- --include-ignored --test-threads=1
 #   docker compose -f example-runner-development-docker-compose.yaml down -v
 #
-# **Not the production stack.** That belongs in `AlgoJudge-Ops` and does not
-# exist yet. This one builds the Server from a sibling checkout, so it needs
-# `AlgoJudge-Server` beside this repository, and it publishes the Server's port
-# so a test on the host can drive it.
+# **`--test-threads=1` is a requirement of that suite, not a preference.** Several
+# of its cases drain the queue or read a submission's state, and two running at
+# once take each other's jobs. The recipe here dropped it until 2026-08-31, alone
+# among the three copies in this repository.
+#
+# **Not the production stack.** That is `AlgoJudge-Ops`, which has existed since
+# 2026-08-30 — this said it did not, and said so until 2026-08-31. What stays
+# true is the division: Ops is what an administrator installs, this is how a
+# developer runs the Server. This one builds it from a sibling checkout, so it
+# needs `AlgoJudge-Server` beside this repository, and it publishes the Server's
+# port so a test on the host can drive it.
 
 name: algojudge-runner-dev
 

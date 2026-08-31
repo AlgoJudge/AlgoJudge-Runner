@@ -64,10 +64,9 @@ docker pull ghcr.io/algojudge/lang-python:1.2.3
 docker pull ghcr.io/algojudge/lang-pypy:1.2.3
 ```
 
-**All five, because a Runner without the language images judges nothing** — and
-because the compiler version is a capability this Runner *reports*, so the
-toolchain that shipped with a version carries that version's number. They are
-built, checked and pushed together, or not at all.
+**All five, because a Runner without the language images judges nothing**, and
+because a release is tested as one set: the images and the binary are built,
+checked and pushed together, or not at all.
 
 Four images carry **eighteen toolchains**: every C and C++ standard the catalogue
 offers is a `-std` flag rather than an image, so C++17 under GCC and C++17 under
@@ -150,8 +149,12 @@ answer about a program that was never run.
 **Sibling containers.** The Runner is trusted and holds the container runtime's
 socket; the containers that run submissions never do. Each step of the pipeline
 — compile, run, check — has its own profile, and every one of them drops all
-capabilities, disables the network, mounts a read-only root filesystem, runs as
-an unprivileged user, and caps memory, processes, CPU, wall time and output.
+capabilities, disables the network, runs as an unprivileged user, and caps
+memory, processes, CPU, wall time and output. **The read-only root filesystem is
+the one that is not universal**: the two build steps ask for a writable root,
+because a compiler has to put the program it made somewhere `collect` can read
+it back from. They still get no writable *host* path, and the layer dies with
+the container. Every step that runs a submission is read-only.
 One container **per test**, never reused.
 
 [`docs/SECURITY.md`](docs/SECURITY.md) is written for the person deploying
