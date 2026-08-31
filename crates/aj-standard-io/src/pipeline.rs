@@ -36,6 +36,30 @@ use crate::score::{judge, Judgement, Reason, Status, TestOutcome};
 /// checker.
 const BUILD_TMPFS_BYTES: u64 = 64 * 1024 * 1024;
 
+/// What a build may write, and what the Runner will hold of what it wrote.
+///
+/// **The `fsize` limit is the one that matters, and it belongs on the
+/// container.** `char pad[240*1024*1024] = {1};` is one line of source and a
+/// binary that size; the profile's default is 256 MiB and neither build
+/// overrode it, so the artefact was read into the trusted process — twice, at
+/// the moment of joining — and `unpack` wrote a third copy into the job's
+/// scratch, where it is mounted into every test container.
+///
+/// Applied to the container rather than caught afterwards, because `SIGXFSZ`
+/// makes an oversized artefact the participant's **compilation error**, which
+/// is a verdict they can act on, instead of an infrastructure failure that
+/// claims the system broke. A statically linked C++ binary with heavy
+/// templates is tens of megabytes, so this refuses what is not a program.
+const BUILD_ARTEFACT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// What a build may say, for **both** builds.
+///
+/// One constant for the reason the tmpfs above is one: the submission's build
+/// capped its output at 256 KiB and the checker's capped nothing, so a checker
+/// that would not stop talking put 64 MiB — the profile's default — into an
+/// infrastructure-failure message and into the uploaded log.
+const BUILD_LOG_BYTES: u64 = 256 * 1024;
+
 /// The largest submission this problem type will look at.
 ///
 /// **The Runner validates the participant's input, because nothing above it
@@ -316,10 +340,11 @@ impl<S: Sandbox> Pipeline<S> {
                         .memory_bytes(512 * 1024 * 1024)
                         .pids(128)
                         .wall_clock(Duration::from_secs(60))
-                        .max_output_bytes(256 * 1024)
+                        .max_output_bytes(BUILD_LOG_BYTES)
+                        .max_file_bytes(BUILD_ARTEFACT_BYTES as i64)
                         .tmpfs_bytes(BUILD_TMPFS_BYTES)
                         .writable_root()
-                        .collect(BUILD_OUTPUT)
+                        .collect(BUILD_OUTPUT, BUILD_ARTEFACT_BYTES)
                         .mount(Mount::read_only(&source.on_host, SOURCE)),
                 )
                 .await
@@ -541,9 +566,11 @@ impl<S: Sandbox> Pipeline<S> {
                     .memory_bytes(512 * 1024 * 1024)
                     .pids(128)
                     .wall_clock(Duration::from_secs(60))
+                    .max_output_bytes(BUILD_LOG_BYTES)
+                    .max_file_bytes(BUILD_ARTEFACT_BYTES as i64)
                     .tmpfs_bytes(BUILD_TMPFS_BYTES)
                     .writable_root()
-                    .collect(BUILD_OUTPUT)
+                    .collect(BUILD_OUTPUT, BUILD_ARTEFACT_BYTES)
                     .mount(Mount::read_only(&source.on_host, SOURCE)),
             )
             .await
