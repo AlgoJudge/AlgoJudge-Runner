@@ -116,11 +116,18 @@ joining a reserved one. Two things about it are easy to get wrong here:
 product's principal type; `output-only@1` exists because *adding a problem type
 must not require a Server change* was an invariant nothing had ever tested.
 
-The dispatch is one `match` on `job.problem_type` in `crates/aj-runner/src/run.rs`
-and nothing above or below it is type-aware. **That is the whole cost of a type
-here**, and the Server's cost is nil: verified 2026-08-30, `output-only` appears
-nowhere in `AlgoJudge-Server`'s C# or in `openapi.json`. A third type is another
-arm plus a crate.
+The dispatch is a `match` on the problem type in `crates/aj-runner/src/run.rs`,
+and the Server's cost is nil: verified 2026-08-30, `output-only` appears nowhere
+in `AlgoJudge-Server`'s C# or in `openapi.json`.
+
+**There are two such matches, not one, and this said one until 2026-08-31.**
+Judging dispatches on `job.problem_type`; calibration dispatches on
+`trial.problem_type` some two hundred lines above it, and the code names it "the
+same dispatch as judging, on the same string". The calibration one has a single
+arm — `standard-io@1` — so `output-only@1`, the very type this section is about,
+falls to its error arm and cannot be trialled. A third type is therefore **two**
+arms plus a crate, and a type added by following the old instruction judges but
+silently cannot be measured.
 
 ## `standard-io@1`
 
@@ -249,8 +256,9 @@ Rust is **not installed on the development host**; `cargo` runs in a container.
 Use the wrapper rather than calling `cargo` directly, so everyone builds against
 the same pinned toolchain.
 
-Two environment variables exist because the Runner starts **sibling**
-containers, and both are easy to lose an afternoon to:
+Three environment variables are easy to lose an afternoon to. The first two exist
+because the Runner starts **sibling** containers; the third does not, and was
+introduced under the word "both" until 2026-08-31:
 
 - `AJ_DOCKER_SOCKET=1` lets `./x` hand the build container the runtime socket,
   which the isolation and judging suites need. Off by default, because anything

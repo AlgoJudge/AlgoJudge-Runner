@@ -49,8 +49,12 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc g++ libc6-dev libstdc++-14-dev \
  && rm -rf /var/lib/apt/lists/*
 
-# Reported to the Server as this Runner's capability, and written into the
-# result's log so a verdict can be traced to the compiler that produced it.
+# **Nothing reads this file.** It said it was reported to the Server as a
+# capability and written into the result's log, and neither happens: the
+# registration payload has no field for a toolchain, and the only attachments a
+# result carries are the compiler's own diagnostics and the details document.
+# Kept because `docker run --rm <image> cat /etc/algojudge-toolchain` is how a
+# person checks what an image actually shipped. Corrected 2026-08-31.
 RUN { gcc --version | head -1; g++ --version | head -1; } > /etc/algojudge-toolchain
 
 # Where a build puts what it made. Part of the image on purpose: the container
