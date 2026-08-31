@@ -413,8 +413,14 @@ impl Docker {
         // finishes normally. Whichever of "the container exited" and "the log
         // stream ended" won the `select!` decided the verdict — so a fast,
         // silent program was sometimes reported as having flooded its output,
-        // which on a real submission is a correct solution marked wrong. A flag
-        // read after the wait cannot race with anything.
+        // which on a real submission is a correct solution marked wrong.
+        //
+        // The flag is read below, **after the collector has finished**. After
+        // the wait alone is not enough, and that was the other half of the same
+        // race: a program that floods and then exits on its own leaves the
+        // collector still draining the runtime's buffered stream, so the flag
+        // is read before it is raised — and the truncated log is then scored as
+        // the participant's wrong answer instead of an output-limit verdict.
         let flooded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let collector = tokio::spawn(collect(
             self.client.clone(),
@@ -427,7 +433,7 @@ impl Docker {
             .client
             .wait_container(name, None::<WaitContainerOptions>);
 
-        let mut stopped = tokio::select! {
+        let stopped = tokio::select! {
             _ = waiter.next() => Stopped::OnItsOwn,
             _ = tokio::time::sleep(profile.wall_clock) => {
                 tracing::debug!(container = name, "killed at the wall clock");
@@ -435,10 +441,6 @@ impl Docker {
                 Stopped::WallClock
             }
         };
-
-        if flooded.load(std::sync::atomic::Ordering::SeqCst) {
-            stopped = Stopped::Output;
-        }
 
         let wall_time = started.elapsed();
 
@@ -452,6 +454,13 @@ impl Docker {
         let (stdout, stderr) = collector
             .await
             .map_err(|e| Error::Refused(format!("the output collector did not finish: {e}")))??;
+
+        // Now that the collector is done, and not before: see above.
+        let stopped = if flooded.load(std::sync::atomic::Ordering::SeqCst) {
+            Stopped::Output
+        } else {
+            stopped
+        };
 
         // The kernel's own answer, and the only reliable one: a container over
         // its memory limit is OOM-killed, and asking afterwards is how the
