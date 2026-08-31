@@ -60,19 +60,32 @@ const BUILD_ARTEFACT_BYTES: u64 = 64 * 1024 * 1024;
 /// infrastructure-failure message and into the uploaded log.
 const BUILD_LOG_BYTES: u64 = 256 * 1024;
 
-/// The largest submission this problem type will look at.
+/// The largest submission this problem type will look at — **the outer wall,
+/// and not a rule of anybody's activity.**
 ///
-/// **The Runner validates the participant's input, because nothing above it
-/// can.** The Server stores a submission without opening it, and what makes one
-/// well formed belongs to the problem type — which is exactly why
-/// `output-only@1` bounds its own archive here rather than asking for that to
-/// be done upstream. A Server that validated this would need a rule per type,
-/// which is the thing the product's boundary exists to prevent.
+/// **The manager's limit is not this one and is not enforced here.** It is
+/// `Activity.MaxUploadBytes`, narrowed per problem by `SeriesProblem`, and the
+/// Server applies it to the bytes as they arrive. That is a decision, taken
+/// 2026-08-04: *a limit the Server must enforce is an explicit column, never
+/// part of the opaque configuration — the Server cannot police what it cannot
+/// read*, and it rejects the request before anything runs. Time and memory stay
+/// in the configuration chain because they only become knowable while the
+/// solution is running. So the number a manager sets deliberately never reaches
+/// this crate, and nothing here should pretend otherwise.
 ///
-/// Generous on purpose. A solution is a few kilobytes and a generated one
-/// carrying lookup tables is tens of them, so this bounds what is plainly not a
-/// program rather than judging anybody's style.
-const MAX_SOURCE_BYTES: usize = 1024 * 1024;
+/// **This was 1 MiB, and that was a defect.** The Server's own ceiling is 8 MiB
+/// and an activity ships with it, so a 2 MiB submission was accepted by the
+/// Server, stored, claimed, and then refused here as a `PolicyViolation` citing
+/// a rule no manager had set — the Runner overriding the manager, which is the
+/// opposite of what the split above is for.
+///
+/// Set to the Server's `UploadLimits.Submission` so it cannot contradict a
+/// manager at any setting they are able to choose. What it still buys is that
+/// this crate's own work — the policy scan above all — is bounded by something
+/// this crate states, rather than by trusting that whatever handed us a job
+/// bounded it first. A rejudge of a submission stored under an older, larger
+/// wall is the case where it is not merely theoretical.
+const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 
 /// How many broken rules a participant is told about at once.
 ///
@@ -284,13 +297,17 @@ impl<S: Sandbox> Pipeline<S> {
         // ── the size of what was uploaded ───────────────────────────────────
         //
         // Checked before the bytes are written anywhere, and before the policy
-        // scan reads them. See [`MAX_SOURCE_BYTES`] for why this is the
-        // Runner's job and not the Server's.
+        // scan reads them — the scan's cost is what this bounds.
         //
-        // A **verdict**, and `PolicyViolation` for the same reason the language
-        // check above is one: nothing was offered to a compiler, the code may
-        // be perfect, and what was broken is a rule of the activity. The
-        // submission stays rejudgeable.
+        // **The activity's own limit is the Server's and was applied before the
+        // submission was ever stored.** This is the wall behind it; see
+        // [`MAX_SOURCE_BYTES`], which is also where the reason it must not be
+        // set below the Server's is written down.
+        //
+        // A **verdict** rather than an infrastructure failure, for the reason
+        // the language check above gives: nothing was offered to a compiler and
+        // the file has the size the participant chose. The submission stays
+        // rejudgeable.
         if job.source.len() > MAX_SOURCE_BYTES {
             return Ok(policy_violation(
                 job,
