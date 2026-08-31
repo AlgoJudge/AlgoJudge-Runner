@@ -619,16 +619,19 @@ int main() {
 #[tokio::test]
 #[ignore = "needs a container runtime and the language images"]
 async fn a_submission_too_large_to_be_a_program_is_a_policy_violation() {
-    // Valid C++ and over the megabyte, so what refuses it is its size and not
-    // the compiler — and padding rather than code, so no rule but the size can
-    // match.
+    // Valid C++ and over the wall, so what refuses it is its size and not the
+    // compiler — and padding rather than code, so no rule but the size can
+    // match. Past **eight** megabytes, not one: the wall is the Server's own
+    // submission ceiling, because a Runner refusing below what a manager may
+    // set would be overriding the manager.
     let huge = format!(
         "#include <iostream>\n{}int main() {{ long long a, b; std::cin >> a >> b; std::cout << a + b; }}\n",
-        "// padding padding padding padding padding padding padding\n".repeat(20_000),
+        "// padding padding padding padding padding padding padding\n".repeat(150_000),
     );
     assert!(
-        huge.len() > 1024 * 1024,
-        "the case needs to be over the cap"
+        huge.len() > 8 * 1024 * 1024,
+        "the case needs to be over the wall, and is {} bytes",
+        huge.len(),
     );
 
     let judged = verdict(judge("cpp-too-large", "cpp", &huge).await);
