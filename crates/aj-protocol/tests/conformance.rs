@@ -587,7 +587,7 @@ async fn a_package_that_does_not_verify_is_refused_and_the_entry_is_discarded() 
 
     let root = std::env::temp_dir().join(format!("aj-cache-conformance-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    let cache = Arc::new(Cache::new(&root, 1 << 30));
+    let cache = Arc::new(Cache::new(&root, 1 << 30, "test-conformance"));
 
     let wrong = "0".repeat(64);
     let error = cache

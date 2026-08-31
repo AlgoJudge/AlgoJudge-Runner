@@ -40,7 +40,18 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let server = Arc::new(Server::new(&config.base_url)?);
-    let cache = Arc::new(Cache::new(&config.cache_path, config.cache_max_bytes));
+    // The same fingerprint the sandbox is given, and for the same reason: a
+    // cache volume may be shared between Runners on one host, and an entry one
+    // of them is reading must not be evicted by another.
+    let cache = Arc::new(Cache::new(
+        &config.cache_path,
+        config.cache_max_bytes,
+        identity.fingerprint(),
+    ));
+    // What a previous incarnation of this Runner was reading when it stopped.
+    // Nobody else can release those, and an entry nobody can evict is a disk
+    // that fills.
+    cache.sweep();
 
     // Checked before anything is claimed, and loudly. A sandbox that silently
     // cannot enforce a limit does not produce errors — it produces wrong
