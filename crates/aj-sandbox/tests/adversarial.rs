@@ -24,12 +24,20 @@ use aj_sandbox::{Docker, Mount, Profile, Sandbox, Stopped};
 
 const IMAGE: &str = "alpine:3";
 
+/// Whose containers this suite's are. See `Docker::connect`.
+const SUITE: &str = "test-adversarial";
+
 /// A sandbox with the image present and nothing left over from before.
 ///
 /// The sweep is not tidiness — it is the production behaviour, run here for the
 /// same reason it runs at start: sibling containers outlive whatever made them.
 async fn sandbox() -> Docker {
-    let docker = Docker::connect().expect("a container runtime");
+    // A name of this suite's own, and a fixed one. Fixed so a previous run's
+    // leftovers are still swept; its own so the sweep below cannot reach a
+    // Runner judging on the same host — which, before instance labels existed,
+    // it did, killing live evaluations and then failing these tests over the
+    // containers it found.
+    let docker = Docker::connect(SUITE).expect("a container runtime");
 
     // The Runner requires cgroup v2 and `preflight` refuses without it. That is
     // the right behaviour and is **not relaxed here** — the escape hatch is in
@@ -496,4 +504,49 @@ async fn a_program_cannot_write_a_file_larger_than_it_is_allowed() {
         1024 * 1024,
     );
     assert_eq!(leftovers(&docker).await, 0);
+}
+
+// ── Two Runners on one host ─────────────────────────────────────────────────
+
+/// **A sweep is one Runner's, and it removes by force.**
+///
+/// Several Runners share one host and one daemon — an operator runs two to use
+/// the machine, and a developer runs this suite while the development stack's
+/// Runner is judging. Until instance labels existed, `sweep()` filtered on the
+/// constant `algojudge.sandbox=1`, so the first thing either of them did on
+/// starting was force-remove the other's running build, test and checker
+/// containers. In the victim, `wait_container` returns, the inspect that
+/// follows 404s, and every job it held fails as "a test could not be run".
+///
+/// The second half is this suite's own: `leftovers` asserts the count is zero,
+/// so a co-resident Runner's live container made these tests fail, reporting a
+/// leaked process that was somebody else's working one.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn a_sweep_leaves_another_runners_containers_alone() {
+    let mine = sandbox().await;
+    let theirs = Docker::connect("test-a-second-runner").expect("a container runtime");
+
+    // Long enough to still be running when the sweep below happens, and well
+    // inside the profile's own wall clock.
+    let running = tokio::spawn(async move {
+        let outcome = theirs.run(&shell("sleep 5; echo survived")).await;
+        (theirs, outcome)
+    });
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    assert_eq!(
+        mine.sweep().await.expect("a sweep"),
+        0,
+        "it removed a container belonging to another Runner",
+    );
+
+    let (theirs, outcome) = running.await.expect("the other Runner's run");
+    let outcome = outcome.expect("the other Runner's container was destroyed mid-run");
+    assert_eq!(String::from_utf8_lossy(&outcome.stdout).trim(), "survived");
+    assert_eq!(outcome.stopped, Stopped::OnItsOwn);
+
+    // And it is still able to clear up after itself.
+    assert_eq!(leftovers(&mine).await, 0);
+    assert_eq!(theirs.sweep().await.expect("a sweep"), 0);
 }

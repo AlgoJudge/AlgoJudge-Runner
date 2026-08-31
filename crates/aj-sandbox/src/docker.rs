@@ -35,6 +35,21 @@ use crate::{Error, Result, Sandbox};
 
 pub struct Docker {
     client: bollard::Docker,
+    /// Whose containers these are.
+    ///
+    /// **Several Runners share one host and one daemon**, and [`Self::sweep`]
+    /// force-removes what it finds — so a label saying only "a sandbox" hands
+    /// every Runner on the host the power to kill every other Runner's running
+    /// evaluations, and the isolation and judging suites the same power over
+    /// all of them.
+    ///
+    /// **Stable across a restart**, because that is the case the sweep exists
+    /// for: a Runner's orphans have to carry the id it will have again. A pid
+    /// cannot do it — the sweep is run by a *new* process clearing up after the
+    /// old one. So the caller passes something that outlives the process; the
+    /// Runner passes its key fingerprint, which is on disk and which the
+    /// product already requires to be one Runner's alone.
+    instance: String,
     /// Where this Runner may create a cgroup of its own, if anywhere.
     ///
     /// **This is how peak memory is measured, and there is no other way.**
@@ -67,9 +82,11 @@ pub struct Docker {
 }
 
 impl Docker {
-    pub fn connect() -> Result<Self> {
+    /// `instance` says whose the containers started here are — see the field.
+    pub fn connect(instance: impl Into<String>) -> Result<Self> {
         Ok(Self {
             client: bollard::Docker::connect_with_local_defaults()?,
+            instance: instance.into(),
             cgroup_root: std::sync::OnceLock::new(),
         })
     }
@@ -154,13 +171,19 @@ impl Docker {
         (peak, cpu)
     }
 
-    /// Every container this Runner has ever started carries these, so an orphan
-    /// from a previous incarnation can be found and removed. Job containers
-    /// outlive the Runner — that is the one real cost of the sibling model, and
-    /// without a sweep a crash-loop fills the evaluation host with dead
-    /// sandboxes.
+    /// Two labels: one saying a container is ours at all, one saying **whose**.
+    ///
+    /// The first is the product-wide handle — `docker ps --filter
+    /// label=algojudge.sandbox=1` finds every sandbox on a host, which is what
+    /// an operator reaches for and what the CI cleanup step runs. The second is
+    /// what lets [`Self::sweep`] leave another Runner's evaluation alone, and
+    /// it is why an orphan from a previous incarnation can still be found: both
+    /// carry the id its Runner has again after a restart.
     fn labels(&self) -> HashMap<String, String> {
-        HashMap::from([("algojudge.sandbox".to_owned(), "1".to_owned())])
+        HashMap::from([
+            ("algojudge.sandbox".to_owned(), "1".to_owned()),
+            ("algojudge.instance".to_owned(), self.instance.clone()),
+        ])
     }
 
     /// Pulls an image if it is not here yet.
@@ -190,13 +213,28 @@ impl Docker {
         Ok(())
     }
 
-    /// Removes every sandbox container this Runner is responsible for, and says
-    /// how many there were.
+    /// Removes the sandbox containers **this Runner** is responsible for, and
+    /// says how many there were.
     ///
     /// **Run at start.** Job containers are siblings, so they outlive the
     /// process that made them — that is the one real cost of not using nested
     /// containers. Without this sweep a crash-loop fills the evaluation host
     /// with dead sandboxes until it runs out of disk.
+    ///
+    /// **It removes by force, so whose they are decides whether it is correct.**
+    /// The filter was the constant `algojudge.sandbox=1` until 2026-08-31, while
+    /// this comment already claimed the containers were this Runner's — which
+    /// that label cannot express. A second Runner starting on the host killed
+    /// the first one's running builds and tests; so did the isolation and
+    /// judging suites, which call this for a clean slate on every case and then
+    /// assert the count is zero, failing over somebody else's live container as
+    /// though the sandbox had leaked a process.
+    ///
+    /// A container carrying **no** instance label is taken as ours. It can only
+    /// have come from a Runner older than that change, so it belongs to nobody
+    /// now, and leaving it is leaving the disk to fill. Docker's filters cannot
+    /// ask for an absent label, so the listing is by the sandbox label and the
+    /// decision is made here.
     pub async fn sweep(&self) -> Result<usize> {
         let listed = self
             .client
@@ -210,6 +248,13 @@ impl Docker {
 
         let mut swept = 0;
         for container in listed {
+            let whose = container
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("algojudge.instance"));
+            if whose.is_some_and(|whose| whose != &self.instance) {
+                continue;
+            }
             if let Some(id) = container.id {
                 self.remove(&id).await;
                 swept += 1;
