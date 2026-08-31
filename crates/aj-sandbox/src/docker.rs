@@ -494,7 +494,7 @@ impl Docker {
         // having, and the container is gone a moment later either way.
         let collected = match &profile.collect {
             None => None,
-            Some(path) => self.take(name, path).await,
+            Some(path) => self.take(name, path, profile.max_collected_bytes).await?,
         };
         let (stdout, stderr) = collector
             .await
@@ -544,25 +544,39 @@ impl Docker {
     /// the exit code. Turning "no artefact" into an infrastructure failure
     /// would report a participant's unbuildable submission as the system being
     /// broken.
-    async fn take(&self, name: &str, path: &str) -> Option<Vec<u8>> {
-        use futures_util::TryStreamExt as _;
-
+    /// **Bounded, and accumulated once.** It used to `try_collect()` every chunk
+    /// into a `Vec<Bytes>` and then `concat()` them, so the whole artefact
+    /// existed twice at the moment of joining, with nothing capping either copy
+    /// — in the trusted process, on bytes a participant's compilation produced.
+    ///
+    /// Refused rather than truncated, for the reason the output collector gives
+    /// above: a silently shortened artefact is a program that will not run, and
+    /// nothing downstream could tell that from a build that never worked.
+    async fn take(&self, name: &str, path: &str, cap: u64) -> Result<Option<Vec<u8>>> {
         let options = DownloadFromContainerOptionsBuilder::new()
             .path(path)
             .build();
-        let collected: std::result::Result<Vec<bytes::Bytes>, _> = self
-            .client
-            .download_from_container(name, Some(options))
-            .try_collect()
-            .await;
+        let mut stream = self.client.download_from_container(name, Some(options));
 
-        match collected {
-            Ok(chunks) => Some(chunks.concat()),
-            Err(e) => {
-                tracing::debug!(container = name, path, %e, "nothing to collect");
-                None
+        let mut collected: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                // See the doc comment: not being there is the ordinary way a
+                // failed build looks, and the caller reads the exit code.
+                Err(e) => {
+                    tracing::debug!(container = name, path, %e, "nothing to collect");
+                    return Ok(None);
+                }
+            };
+            if collected.len() as u64 + chunk.len() as u64 > cap {
+                return Err(Error::Refused(format!(
+                    "what the build produced is larger than {cap} bytes"
+                )));
             }
+            collected.extend_from_slice(&chunk);
         }
+        Ok(Some(collected))
     }
 
     /// Best effort, and deliberately not an error.

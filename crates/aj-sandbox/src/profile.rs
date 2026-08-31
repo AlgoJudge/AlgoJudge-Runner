@@ -99,6 +99,21 @@ pub struct Profile {
     /// directory to everybody. Reading it back through the runtime API means
     /// the build container gets no writable host path at all.
     pub collect: Option<String>,
+
+    /// The most the Runner will hold while reading that path back.
+    ///
+    /// **Set together with `collect`, and it has to be**: what comes back is
+    /// whatever compiling untrusted code produced, it arrives in the *trusted*
+    /// process, and a bound nobody stated is a bound nobody has. A submission
+    /// declaring a 240 MiB initialised array is a one-line source and a binary
+    /// that size.
+    ///
+    /// The container's own `fsize` is the first bound and the better one — it
+    /// makes an oversized artefact the participant's compilation error rather
+    /// than the machinery refusing after the fact. This is the second, and it
+    /// exists because the first is a limit the *runtime* applies and this one
+    /// is a limit **we** apply.
+    pub max_collected_bytes: u64,
 }
 
 // Standard input is deliberately not a field here. A test's input is mounted
@@ -129,6 +144,7 @@ impl Profile {
             cpuset: None,
             writable_root: false,
             collect: None,
+            max_collected_bytes: 0,
         }
     }
 
@@ -177,8 +193,11 @@ impl Profile {
         self
     }
 
-    pub fn collect(mut self, path: impl Into<String>) -> Self {
+    /// What to read back, and the most of it that will be held. **One call for
+    /// both**, so a caller cannot ask for the first and forget the second.
+    pub fn collect(mut self, path: impl Into<String>, max_bytes: u64) -> Self {
         self.collect = Some(path.into());
+        self.max_collected_bytes = max_bytes;
         self
     }
 }

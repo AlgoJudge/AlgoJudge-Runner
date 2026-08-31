@@ -20,7 +20,7 @@
 
 use std::time::Duration;
 
-use aj_sandbox::{Docker, Mount, Profile, Sandbox, Stopped};
+use aj_sandbox::{Docker, Error, Mount, Profile, Sandbox, Stopped};
 
 const IMAGE: &str = "alpine:3";
 
@@ -549,4 +549,78 @@ async fn a_sweep_leaves_another_runners_containers_alone() {
     // And it is still able to clear up after itself.
     assert_eq!(leftovers(&mine).await, 0);
     assert_eq!(theirs.sweep().await.expect("a sweep"), 0);
+}
+
+// ── A9 — it builds something enormous ────────────────────────────────────────
+
+/// **What comes back from a build is bounded, and refused rather than cut.**
+///
+/// The artefact is whatever compiling untrusted code produced, and it is read
+/// into the *trusted* process. It used to be collected chunk by chunk into a
+/// `Vec<Bytes>` and then joined, so the whole of it existed twice at once with
+/// nothing capping either copy — and `char pad[240*1024*1024] = {1};` is one
+/// line of source.
+///
+/// The container's own `fsize` is the first bound and the better one, because
+/// it makes an oversized artefact the participant's compilation error. This is
+/// the second, and the one that holds if a backend ever applies the first
+/// differently: the limit **we** apply, in the process that would otherwise
+/// hold the bytes.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn an_artefact_over_the_cap_is_refused_rather_than_held() {
+    let docker = sandbox().await;
+
+    let outcome = docker
+        .run(
+            // `/tmp` rather than `/out`: a language image declares `/out` and
+            // chowns it precisely because a container running as nobody cannot
+            // create a directory at its own root, and `alpine` has no such
+            // directory. On the writable layer either way, which is where a
+            // real build's artefact goes.
+            &shell("dd if=/dev/zero of=/tmp/program bs=1M count=8 2>/dev/null")
+                .writable_root()
+                .collect("/tmp", 1024 * 1024)
+                .wall_clock(Duration::from_secs(20)),
+        )
+        .await;
+
+    match outcome {
+        Err(Error::Refused(said)) => assert!(
+            said.contains("larger than"),
+            "refused for the wrong reason: {said}",
+        ),
+        Err(other) => panic!("refused, but not for its size: {other}"),
+        Ok(_) => panic!("eight megabytes came back against a cap of one"),
+    }
+
+    assert_eq!(leftovers(&docker).await, 0);
+}
+
+/// The same profile, under the cap: what a build makes still comes back whole.
+///
+/// A bound that refused everything would pass the test above and break every
+/// submission, which is the failure a one-sided test does not see.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn an_artefact_under_the_cap_comes_back_whole() {
+    let docker = sandbox().await;
+
+    let outcome = docker
+        .run(
+            &shell("dd if=/dev/zero of=/tmp/program bs=1K count=64 2>/dev/null")
+                .writable_root()
+                .collect("/tmp", 1024 * 1024)
+                .wall_clock(Duration::from_secs(20)),
+        )
+        .await
+        .expect("the run");
+
+    let collected = outcome.collected.expect("the artefact");
+    assert!(
+        collected.len() > 64 * 1024,
+        "a tar of 64 KiB cannot be {} bytes",
+        collected.len(),
+    );
+    assert_eq!(leftovers(&docker).await, 0);
 }
