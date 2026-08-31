@@ -99,6 +99,11 @@ operator republishing one image says so in one line.
 Pin the same version the Runner is, unless there is a reason not to: that pairing
 is what the release was tested as.
 
+**`.env.example` lists every variable this Runner reads**, with what each one
+defaults to and which of them cannot be turned off by writing `false`. A test
+compares it against the source, so a key added to the code and not to that file
+reddens the gate.
+
 ## How it is built
 
 **Rust**, one static `x86_64-unknown-linux-musl` binary with every backend

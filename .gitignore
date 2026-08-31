@@ -20,3 +20,10 @@
 # and it holds the Server admin token. Never committed.
 /.env
 /.env.*
+#
+# **Except the example, which is the point of having one.** The pattern above
+# is deliberately broad — `.env.local` and `.env.production` are somebody's real
+# values under a different name — and it swallowed the one file that must ship.
+# `git add .env.example` said nothing and added nothing until 2026-08-31, which
+# is half of why this repository had no such file for so long.
+!/.env.example
