@@ -200,3 +200,75 @@ fn default_name() -> String {
         .filter(|h| !h.trim().is_empty())
         .unwrap_or_else(|| "algojudge-runner".into())
 }
+
+#[cfg(test)]
+mod tests {
+    /// **`.env.example` claims to list every variable, and nothing checked it.**
+    ///
+    /// This repository had no such file at all until 2026-08-31, and one reason
+    /// it did not is that `.gitignore` silently swallowed it — `/.env.*` matches
+    /// `.env.example`, so `git add` said nothing and added nothing. A list that
+    /// cannot be committed and a list nobody checks fail the same way: an
+    /// operator cannot configure what they cannot see, and a variable missing
+    /// from the file is not undocumented but *invisible*, because there is
+    /// nowhere to look for it.
+    ///
+    /// Both halves are read as text. The drift is between two files and no
+    /// compiler sees either of them as configuration, so nothing else can catch
+    /// it. A commented-out line counts as listed — that is how a switch is
+    /// offered without being set, which several of them must be.
+    ///
+    /// **Only `AJ_`-prefixed keys are checked.** `RUST_LOG`, `NO_COLOR`,
+    /// `DOCKER_HOST` and the proxy four are read by libraries this Runner links
+    /// rather than by its own source, so no file here mentions them and the
+    /// comparison would reject every one. They are listed by hand.
+    #[test]
+    fn every_variable_the_config_reads_is_in_the_example_and_no_others() {
+        // This file names its keys without the prefix, `AJ_` being added by the
+        // helper. The sandbox reaches for the environment directly and writes
+        // the whole name, so both shapes are collected.
+        let mut read: std::collections::BTreeSet<String> = include_str!("config.rs")
+            .split('"')
+            .filter(|piece| a_key(piece))
+            .map(|piece| format!("AJ_{piece}"))
+            .collect();
+        read.extend(
+            include_str!("../../aj-sandbox/src/docker.rs")
+                .split('"')
+                .filter(|piece| piece.starts_with("AJ_") && a_key(&piece[3..]))
+                .map(|piece| piece.to_owned()),
+        );
+
+        let listed: std::collections::BTreeSet<String> = include_str!("../../../.env.example")
+            .lines()
+            .map(|line| line.trim_start_matches('#').trim())
+            .filter_map(|line| line.split_once('='))
+            .map(|(name, _)| name.trim().to_owned())
+            .filter(|name| name.starts_with("AJ_"))
+            .collect();
+
+        let missing: Vec<_> = read.difference(&listed).collect();
+        assert!(
+            missing.is_empty(),
+            "read by this Runner and absent from .env.example: {missing:?}"
+        );
+
+        let stale: Vec<_> = listed.difference(&read).collect();
+        assert!(
+            stale.is_empty(),
+            "listed in .env.example and read by nothing: {stale:?}"
+        );
+    }
+
+    /// A configuration key exactly, and not a sentence that mentions one.
+    fn a_key(piece: &str) -> bool {
+        let Some((section, rest)) = piece.split_once("__") else {
+            return false;
+        };
+        matches!(
+            section,
+            "Server" | "Runner" | "Cache" | "Lease" | "Poll" | "Heartbeat" | "Work" | "Sandbox"
+        ) && !rest.is_empty()
+            && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+}
