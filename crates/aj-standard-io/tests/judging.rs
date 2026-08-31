@@ -609,6 +609,44 @@ int main() {
 
 // ── The activity's rules ────────────────────────────────────────────────────
 
+/// **The Runner validates what was uploaded, because nothing above it can.**
+///
+/// The Server stores a submission without opening it, and what makes one well
+/// formed belongs to the problem type — the same reason `output-only@1` bounds
+/// its own archive rather than asking for that upstream. A file far too large
+/// to be a program breaks a rule of the activity; it is not a compilation
+/// error, because nothing was offered to a compiler.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_submission_too_large_to_be_a_program_is_a_policy_violation() {
+    // Valid C++ and over the megabyte, so what refuses it is its size and not
+    // the compiler — and padding rather than code, so no rule but the size can
+    // match.
+    let huge = format!(
+        "#include <iostream>\n{}int main() {{ long long a, b; std::cin >> a >> b; std::cout << a + b; }}\n",
+        "// padding padding padding padding padding padding padding\n".repeat(20_000),
+    );
+    assert!(
+        huge.len() > 1024 * 1024,
+        "the case needs to be over the cap"
+    );
+
+    let judged = verdict(judge("cpp-too-large", "cpp", &huge).await);
+
+    assert_eq!(judged.judgement.verdict, "PolicyViolation");
+    assert_eq!(judged.judgement.score, 0.0);
+
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    // Nothing failed to compile, because nothing reached a compiler.
+    assert_eq!(document["compilation"]["status"], "WARNING");
+
+    let said = document["compilation"]["log"].as_str().unwrap();
+    assert!(
+        said.contains("KiB"),
+        "a participant is not told what the limit was: {said}",
+    );
+}
+
 /// Never compiled, never run, and told which rule it broke.
 ///
 /// The three outcomes a participant must be able to tell apart are "your answer

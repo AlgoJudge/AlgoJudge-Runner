@@ -36,6 +36,33 @@ use crate::score::{judge, Judgement, Reason, Status, TestOutcome};
 /// checker.
 const BUILD_TMPFS_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The largest submission this problem type will look at.
+///
+/// **The Runner validates the participant's input, because nothing above it
+/// can.** The Server stores a submission without opening it, and what makes one
+/// well formed belongs to the problem type — which is exactly why
+/// `output-only@1` bounds its own archive here rather than asking for that to
+/// be done upstream. A Server that validated this would need a rule per type,
+/// which is the thing the product's boundary exists to prevent.
+///
+/// Generous on purpose. A solution is a few kilobytes and a generated one
+/// carrying lookup tables is tens of them, so this bounds what is plainly not a
+/// program rather than judging anybody's style.
+const MAX_SOURCE_BYTES: usize = 1024 * 1024;
+
+/// How many broken rules a participant is told about at once.
+///
+/// **Measured 2026-08-31**: one megabyte of a denied identifier is about
+/// 150 000 violations and seven megabytes of text — written *twice*, into the
+/// result document and into the uploaded `log`, neither of which was bounded.
+/// The compiler's own log has been capped at 256 KiB since it existed; this
+/// path had nothing.
+///
+/// A cap on the count rather than on the joined text, so a participant reads
+/// whole lines, and how many were dropped is **said** rather than the text
+/// being quietly cut off mid-rule.
+const MAX_REPORTED_VIOLATIONS: usize = 100;
+
 /// A directory as this process sees it, and as the container runtime does.
 ///
 /// The two differ whenever the Runner is itself in a container, and a bind
@@ -230,6 +257,28 @@ impl<S: Sandbox> Pipeline<S> {
             ));
         }
 
+        // ── the size of what was uploaded ───────────────────────────────────
+        //
+        // Checked before the bytes are written anywhere, and before the policy
+        // scan reads them. See [`MAX_SOURCE_BYTES`] for why this is the
+        // Runner's job and not the Server's.
+        //
+        // A **verdict**, and `PolicyViolation` for the same reason the language
+        // check above is one: nothing was offered to a compiler, the code may
+        // be perfect, and what was broken is a rule of the activity. The
+        // submission stays rejudgeable.
+        if job.source.len() > MAX_SOURCE_BYTES {
+            return Ok(policy_violation(
+                job,
+                &language,
+                &[format!(
+                    "The submission is {} KiB, and a solution may be at most {} KiB.",
+                    job.source.len() / 1024,
+                    MAX_SOURCE_BYTES / 1024,
+                )],
+            ));
+        }
+
         let source = job.work.join("src");
         let built_into = job.work.join("build");
         let artefacts = built_into.join("out");
@@ -250,8 +299,11 @@ impl<S: Sandbox> Pipeline<S> {
         let broken = crate::policy::Dictionary::built_in()
             .check(&language, &String::from_utf8_lossy(job.source));
         if !broken.is_empty() {
-            let listed: Vec<String> = broken.iter().map(|v| v.note()).collect();
-            return Ok(policy_violation(job, &language, &listed));
+            return Ok(policy_violation(
+                job,
+                &language,
+                &listed(&broken, MAX_REPORTED_VIOLATIONS),
+            ));
         }
 
         // ── build ───────────────────────────────────────────────────────────
@@ -625,6 +677,26 @@ fn failed(test: &aj_package::Test, time_ms: u64, note: &str, reason: Reason) -> 
 /// are three different things to tell a participant: their code is wrong, their
 /// code does not build, or the system failed. This one is none of the three —
 /// their code may be perfect and still not allowed.
+/// The broken rules a participant is shown, and how many were left out.
+///
+/// A named function with a test rather than a `map` at the call site, because
+/// what it bounds is not visible from there: every line here is written twice
+/// into documents somebody stores, and the number of lines is chosen by whoever
+/// wrote the submission.
+fn listed(broken: &[crate::policy::Violation], cap: usize) -> Vec<String> {
+    let mut listed: Vec<String> = broken.iter().take(cap).map(|v| v.note()).collect();
+    if broken.len() > cap {
+        // Said rather than left to be inferred from a list that stops. A
+        // participant who fixes a hundred rules and finds a hundred more was
+        // not told the first time.
+        listed.push(format!(
+            "and {} more, not listed. Fix these first.",
+            broken.len() - cap,
+        ));
+    }
+    listed
+}
+
 fn policy_violation(job: &Job<'_>, language: &language::Language, listed: &[String]) -> Evaluated {
     let outcomes: Vec<TestOutcome> = job
         .tests
@@ -711,6 +783,44 @@ pub fn scratch(root: &Path, job_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::policy::Violation;
+
+    fn violations(how_many: usize) -> Vec<Violation> {
+        (1..=how_many)
+            .map(|line| Violation {
+                rule: "forbidden call".into(),
+                matched: "getenv".into(),
+                line,
+            })
+            .collect()
+    }
+
+    /// **What a participant is shown is bounded, and the bound is stated.**
+    ///
+    /// Measured 2026-08-31: a megabyte of one denied identifier is about
+    /// 150 000 violations and seven megabytes of text, written into the result
+    /// document *and* into the uploaded log. Both are documents somebody
+    /// stores, and how long they are was chosen by whoever wrote the
+    /// submission.
+    #[test]
+    fn a_participant_is_told_the_first_rules_and_how_many_were_left() {
+        let shown = listed(&violations(250), 100);
+
+        assert_eq!(shown.len(), 101, "a hundred rules, and one line saying so");
+        assert!(shown[99].contains("line 100"), "{}", shown[99]);
+        assert_eq!(shown[100], "and 150 more, not listed. Fix these first.");
+    }
+
+    /// Nothing is appended when nothing was dropped: a list that ends because
+    /// it ended must not read like a list that was cut.
+    #[test]
+    fn a_list_short_enough_to_show_whole_says_nothing_about_more() {
+        let shown = listed(&violations(3), 100);
+
+        assert_eq!(shown.len(), 3);
+        assert!(shown.iter().all(|line| !line.contains("not listed")));
+    }
 
     /// The answer key is not in the container the submission runs in.
     ///
