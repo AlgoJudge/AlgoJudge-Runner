@@ -289,6 +289,27 @@ impl Config {
             partial(limits, &format!("overrideLimits.{language}"))?;
         }
 
+        // **The paths this document declares are package paths.** They are read
+        // with `package.join(source)` — in `pipeline.rs` for the checker, in
+        // `calibrate.rs` for a model solution — and `join` on an absolute path
+        // discards everything to its left. Unvalidated, `source:
+        // /var/lib/algojudge-runner/identity.key` is a file the Runner reads
+        // and then quotes back: the build fails, and the compiler's diagnostics
+        // carry the offending lines into the failure reason and the uploaded
+        // `log`.
+        //
+        // `archive.rs` has refused these names in an archive entry from the
+        // beginning, so this is that rule one layer up and nothing new: a name
+        // it rejects could not have been extracted into the package either. It
+        // holds for an overlay too, since `overlaid` ends here — and an
+        // activity's `config` can name a checker.
+        for declared in self.checker.iter().chain(self.models()) {
+            crate::archive::safe_path(
+                &declared.source,
+                crate::archive::Limits::default().max_path_length,
+            )?;
+        }
+
         Ok(self)
     }
 
@@ -984,6 +1005,50 @@ calibration:
         );
         let error = Config::parse(&yaml).unwrap_err();
         assert!(matches!(error, Error::Invalid(_)), "got {error}");
+    }
+
+    /// **A path in this document is a path inside the package.** It is joined
+    /// onto the package root and `join` discards that root the moment the path
+    /// is absolute — so an unvalidated one names any file the Runner can read,
+    /// and the build that then fails carries its contents back to the Server in
+    /// the compiler's own diagnostics.
+    #[test]
+    fn a_checker_outside_the_package_is_refused() {
+        for source in [
+            "/var/lib/algojudge-runner/identity.key",
+            "/etc/passwd",
+            "../../../../etc/passwd",
+            "checker/../../../etc/shadow",
+        ] {
+            let yaml = FROM_THE_SPECIFICATION.replace("checker/checker.cpp", source);
+            let error = Config::parse(&yaml).unwrap_err();
+            assert!(matches!(error, Error::Refused(_)), "{source} got {error}");
+        }
+    }
+
+    /// The same join, in `calibrate.rs`, for a package's own reference.
+    #[test]
+    fn a_model_solution_outside_the_package_is_refused() {
+        for source in ["/etc/passwd", "../../elsewhere/model.cpp"] {
+            let yaml = FROM_THE_SPECIFICATION.replace("solutions/model.cpp", source);
+            let error = Config::parse(&yaml).unwrap_err();
+            assert!(matches!(error, Error::Refused(_)), "{source} got {error}");
+        }
+    }
+
+    /// **An overlay is a second author.** The activity's `config` merges the
+    /// `checker` member like any other, so the rule has to hold after the merge
+    /// and not only on the package's own document.
+    #[test]
+    fn an_overlay_cannot_repoint_the_checker_out_of_the_package() {
+        let overlay = serde_json::json!({
+            "checker": { "source": "/var/lib/algojudge-runner/identity.key" },
+        });
+        let error = Config::parse(FROM_THE_SPECIFICATION)
+            .unwrap()
+            .overlaid(Some(&overlay))
+            .unwrap_err();
+        assert!(matches!(error, Error::Refused(_)), "got {error}");
     }
 
     /// An unknown field is a typo, and a typo in a limit is a limit that

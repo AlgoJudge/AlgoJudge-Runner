@@ -373,6 +373,48 @@ async fn flooding_output_is_stopped_at_the_cap() {
     assert_eq!(leftovers(&docker).await, 0);
 }
 
+/// **The other half of A6, and the one that was wrong**: a program that floods
+/// and then exits by itself.
+///
+/// `yes` above never stops, so the collector has long since raised its flag by
+/// the time the container is killed. A program that prints past the cap and
+/// returns 0 is the opposite order — the wait resolves the moment the process
+/// exits, and the collector has still to open its log stream and read what the
+/// runtime buffered, so the flag read at that moment is false.
+///
+/// **A short burst rather than a large one, deliberately.** Megabytes give the
+/// collector time to cross the cap while the program is still writing, which is
+/// the case the test above already covers; 64 KiB written and exited in a
+/// millisecond is the one that loses the race. Measured against the old
+/// ordering: `Stopped::OnItsOwn`, exit 0, and stdout silently truncated to the
+/// 4 KiB cap. `pipeline.rs` scores that truncated prefix, so the participant is
+/// told their answer is wrong and no output-limit verdict is ever produced for
+/// a program that exits on its own.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn output_over_the_cap_is_the_verdict_when_the_program_exits_by_itself() {
+    let docker = sandbox().await;
+
+    let outcome = docker
+        .run(
+            &shell("yes aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | head -c 65536")
+                .max_output_bytes(4 * 1024)
+                .wall_clock(Duration::from_secs(20)),
+        )
+        .await
+        .expect("the run");
+
+    assert_eq!(
+        outcome.stopped,
+        Stopped::Output,
+        "exit {} after {:?}, {} bytes kept",
+        outcome.exit_code,
+        outcome.wall_time,
+        outcome.stdout.len(),
+    );
+    assert_eq!(leftovers(&docker).await, 0);
+}
+
 // ── A7 — it tries to persist ────────────────────────────────────────────────
 
 /// One container per test, never reused. A fresh container is the only answer

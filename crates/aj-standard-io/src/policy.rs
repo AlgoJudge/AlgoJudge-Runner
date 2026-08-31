@@ -31,8 +31,8 @@
 //! C's section is a YAML alias of C++'s rather than a second copy. See the
 //! profile, and `language.rs` for why the lookup is by family at all.
 
-use std::collections::BTreeSet;
-use std::sync::OnceLock;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use indexmap::IndexMap;
 use regex::Regex;
@@ -209,7 +209,7 @@ impl Dictionary {
             return Vec::new();
         };
 
-        let stripped = strip(source, language.family, &self.matching);
+        let stripped = Scanned::of(strip(source, language.family, &self.matching));
         let mut found = Vec::new();
 
         match language.family {
@@ -220,7 +220,11 @@ impl Dictionary {
                 // Otherwise `#include <asm/unistd.h>` also trips the inline-
                 // assembly group, because `/` is a word boundary — a false
                 // positive on a line that was already correctly reported once.
-                groups(&without_includes(&stripped), rules, &mut found);
+                groups(
+                    &Scanned::of(without_includes(&stripped.text)),
+                    rules,
+                    &mut found,
+                );
             }
             Family::Python => {
                 imports(&stripped, rules, &mut found);
@@ -255,22 +259,30 @@ fn strip(source: &str, family: Family, matching: &Matching) -> String {
     let mut i = 0;
 
     let python = family == Family::Python;
-    let line_comment = if python { "#" } else { "//" };
+
+    // Characters compared where they stand. This used to build a `String` out
+    // of the next three characters on every iteration — **one heap allocation
+    // per character of the submission**, in the Runner's own process, on bytes
+    // a participant chose.
+    let at = |k: usize, c: char| bytes.get(k) == Some(&c);
 
     while i < bytes.len() {
-        let rest: String = bytes[i..bytes.len().min(i + 3)].iter().collect();
+        let line_comment = if python {
+            at(i, '#')
+        } else {
+            at(i, '/') && at(i + 1, '/')
+        };
 
-        if matching.strip_comments && rest.starts_with(line_comment) {
+        if matching.strip_comments && line_comment {
             while i < bytes.len() && bytes[i] != '\n' {
                 out.push(' ');
                 i += 1;
             }
             continue;
         }
-        if matching.strip_comments && !python && rest.starts_with("/*") {
+        if matching.strip_comments && !python && at(i, '/') && at(i + 1, '*') {
             while i < bytes.len() {
-                let two: String = bytes[i..bytes.len().min(i + 2)].iter().collect();
-                let end = two.starts_with("*/");
+                let end = at(i, '*') && at(i + 1, '/');
                 out.push(if bytes[i] == '\n' { '\n' } else { ' ' });
                 i += 1;
                 if end {
@@ -360,13 +372,61 @@ fn include_pattern() -> &'static Regex {
     })
 }
 
-fn line_of(text: &str, offset: usize) -> usize {
-    text[..offset].matches('\n').count() + 1
+/// A text to match against, with its line breaks already found.
+///
+/// **The two travel together on purpose.** Pairing an offset with the wrong
+/// text is a wrong line number and nothing else — no error, no failure, just a
+/// message pointing a participant at a line they did not write — and there are
+/// two texts here: the stripped source, and the same source with its include
+/// directives blanked out.
+///
+/// The line number used to be `text[..offset].matches('\n').count() + 1`,
+/// computed **per violation**. That is a scan of everything before the hit, and
+/// `reportAllMatches` is on, so a source with many matches cost the product of
+/// its length and their number — untrusted bytes, in the Runner's own process,
+/// with nothing bounding the work. The offsets are ascending by construction,
+/// which is what makes the lookup a binary search.
+struct Scanned {
+    text: String,
+    newlines: Vec<usize>,
+}
+
+impl Scanned {
+    fn of(text: String) -> Self {
+        let newlines = text.match_indices('\n').map(|(at, _)| at).collect();
+        Self { text, newlines }
+    }
+
+    fn line_of(&self, offset: usize) -> usize {
+        self.newlines.partition_point(|&at| at < offset) + 1
+    }
+}
+
+/// A compiled pattern, kept for the life of the process.
+///
+/// The profile is fixed and every submission is checked against the same
+/// hundred and sixty or so patterns, so compiling them per submission is work
+/// done once and then done again for every job the Runner ever takes. A
+/// `Regex` matches through `&self` and is `Send + Sync`, so one compilation
+/// serves all of them.
+///
+/// A pattern that will not compile is remembered as such, so the profile's own
+/// mistake is not recompiled on every submission either.
+fn compiled(pattern: &str) -> Option<Arc<Regex>> {
+    static COMPILED: OnceLock<Mutex<HashMap<String, Option<Arc<Regex>>>>> = OnceLock::new();
+
+    COMPILED
+        .get_or_init(Default::default)
+        .lock()
+        .expect("the pattern cache is never poisoned")
+        .entry(pattern.to_owned())
+        .or_insert_with(|| Regex::new(pattern).ok().map(Arc::new))
+        .clone()
 }
 
 /// `#include <x>` — matched as a directive, never as a word.
-fn headers(source: &str, rules: &LanguageRules, found: &mut Vec<Violation>) {
-    for capture in include_pattern().captures_iter(source) {
+fn headers(scanned: &Scanned, rules: &LanguageRules, found: &mut Vec<Violation>) {
+    for capture in include_pattern().captures_iter(&scanned.text) {
         let named = capture
             .get(1)
             .expect("the group is in the pattern")
@@ -384,13 +444,13 @@ fn headers(source: &str, rules: &LanguageRules, found: &mut Vec<Violation>) {
             found.push(Violation {
                 rule: format!("forbidden header <{named}>"),
                 matched: named.to_owned(),
-                line: line_of(source, capture.get(0).expect("the whole match").start()),
+                line: scanned.line_of(capture.get(0).expect("the whole match").start()),
             });
         }
     }
 }
 
-fn groups(source: &str, rules: &LanguageRules, found: &mut Vec<Violation>) {
+fn groups(scanned: &Scanned, rules: &LanguageRules, found: &mut Vec<Violation>) {
     for group in rules.groups.values() {
         // A group that is off is off. `remove` collides with `std::remove`,
         // which is entirely legal, and a rule that fails correct solutions is
@@ -399,46 +459,46 @@ fn groups(source: &str, rules: &LanguageRules, found: &mut Vec<Violation>) {
             continue;
         }
         for identifier in &group.identifiers {
-            whole_word(source, identifier, &group.name, found);
+            whole_word(scanned, identifier, &group.name, found);
         }
-        patterns(source, &group.patterns, &group.name, found);
+        patterns(scanned, &group.patterns, &group.name, found);
     }
 }
 
-fn whole_word(source: &str, word: &str, rule: &str, found: &mut Vec<Violation>) {
-    let Ok(pattern) = Regex::new(&format!(r"\b{}\b", regex::escape(word))) else {
+fn whole_word(scanned: &Scanned, word: &str, rule: &str, found: &mut Vec<Violation>) {
+    let Some(pattern) = compiled(&format!(r"\b{}\b", regex::escape(word))) else {
         return;
     };
-    for hit in pattern.find_iter(source) {
+    for hit in pattern.find_iter(&scanned.text) {
         found.push(Violation {
             rule: rule.to_owned(),
             matched: word.to_owned(),
-            line: line_of(source, hit.start()),
+            line: scanned.line_of(hit.start()),
         });
     }
 }
 
-fn patterns(source: &str, patterns: &[String], rule: &str, found: &mut Vec<Violation>) {
+fn patterns(scanned: &Scanned, patterns: &[String], rule: &str, found: &mut Vec<Violation>) {
     for declared in patterns {
         // A pattern that will not compile is a mistake in the profile, not in
         // the submission. Skipped and logged rather than failing somebody's
         // solution over it.
-        let Ok(pattern) = Regex::new(declared) else {
+        let Some(pattern) = compiled(declared) else {
             tracing::warn!(pattern = %declared, "a policy pattern will not compile");
             continue;
         };
-        for hit in pattern.find_iter(source) {
+        for hit in pattern.find_iter(&scanned.text) {
             found.push(Violation {
                 rule: rule.to_owned(),
                 matched: hit.as_str().trim().to_owned(),
-                line: line_of(source, hit.start()),
+                line: scanned.line_of(hit.start()),
             });
         }
     }
 }
 
 /// `import x`, `from x import`, `__import__("x")`.
-fn imports(source: &str, rules: &LanguageRules, found: &mut Vec<Violation>) {
+fn imports(scanned: &Scanned, rules: &LanguageRules, found: &mut Vec<Violation>) {
     let denied: BTreeSet<&str> = rules.denied_imports.iter().map(String::as_str).collect();
 
     static IMPORT: OnceLock<Regex> = OnceLock::new();
@@ -447,7 +507,7 @@ fn imports(source: &str, rules: &LanguageRules, found: &mut Vec<Violation>) {
             .expect("a fixed pattern")
     });
 
-    for capture in import.captures_iter(source) {
+    for capture in import.captures_iter(&scanned.text) {
         let named = capture
             .get(1)
             .or_else(|| capture.get(2))
@@ -460,25 +520,25 @@ fn imports(source: &str, rules: &LanguageRules, found: &mut Vec<Violation>) {
             found.push(Violation {
                 rule: format!("forbidden module {root}"),
                 matched: named.to_owned(),
-                line: line_of(source, capture.get(0).expect("the whole match").start()),
+                line: scanned.line_of(capture.get(0).expect("the whole match").start()),
             });
         }
     }
 }
 
-fn builtins(source: &str, rules: &LanguageRules, found: &mut Vec<Violation>) {
+fn builtins(scanned: &Scanned, rules: &LanguageRules, found: &mut Vec<Violation>) {
     for builtin in &rules.denied_builtins {
         // Only where it is called: `open` as a variable name is not the
         // built-in, and failing a solution over a local called `open` is the
         // false positive this whole design is trying to avoid.
-        let Ok(pattern) = Regex::new(&format!(r"\b{}\s*\(", regex::escape(builtin))) else {
+        let Some(pattern) = compiled(&format!(r"\b{}\s*\(", regex::escape(builtin))) else {
             continue;
         };
-        for hit in pattern.find_iter(source) {
+        for hit in pattern.find_iter(&scanned.text) {
             found.push(Violation {
                 rule: format!("forbidden builtin {builtin}"),
                 matched: builtin.clone(),
-                line: line_of(source, hit.start()),
+                line: scanned.line_of(hit.start()),
             });
         }
     }

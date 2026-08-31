@@ -147,7 +147,12 @@ pub fn extract(archive: &Path, into: &Path, limits: &Limits) -> Result<usize> {
 /// deliberately narrow character set. The allow-list is the part that ages well:
 /// a deny-list of "dangerous" names needs updating every time somebody finds a
 /// new one.
-fn safe_path(name: &str, max_length: usize) -> Result<PathBuf> {
+/// The one rule for a name that is meant to be **inside the package**.
+///
+/// Shared with `config.rs` rather than private here, because a path the
+/// document *declares* is joined onto the package root exactly as a path the
+/// archive *carries* is — and `join` on an absolute path replaces the lot.
+pub(crate) fn safe_path(name: &str, max_length: usize) -> Result<PathBuf> {
     if name.is_empty() {
         return Err(Error::refused("an entry has no name"));
     }

@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     // verdicts, which look like somebody's solution being wrong.
     let sandbox = aj_sandbox::Docker::connect()?;
     if let Err(e) = sandbox.preflight().await {
-        if !config.allow_cgroup_v1 {
+        if !below_specification(&e, config.allow_cgroup_v1) {
             return Err(e.into());
         }
         // Said on every start, at the loudest level there is, because a
@@ -74,4 +74,42 @@ async fn main() -> anyhow::Result<()> {
     run::admitted(&server, &identity, &config).await?;
 
     run::work(&server, &cache, &pipeline, &config).await
+}
+
+/// Whether a failed preflight is the one failure the development override is
+/// allowed to start past.
+///
+/// **`Refused` and nothing else.** That variant is preflight's own verdict on
+/// the host — today, cgroup v1 — and it is what `AJ_Sandbox__AllowCgroupV1` is
+/// documented to permit, in `config.rs` and in `docs/SECURITY.md` §5 alike.
+///
+/// The switch used to suppress every failure the check could produce. `Runtime`
+/// and `Io` are the container runtime being unreachable, which on a development
+/// stack usually means the socket is mounted wrong; a Runner that starts past
+/// that can judge nothing at all, and reported it as running below
+/// specification.
+fn below_specification(error: &aj_sandbox::Error, allow_cgroup_v1: bool) -> bool {
+    allow_cgroup_v1 && matches!(error, aj_sandbox::Error::Refused(_))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_override_starts_past_the_cgroup_verdict() {
+        let refused = aj_sandbox::Error::Refused("this host reports cgroup version 1".into());
+        assert!(below_specification(&refused, true));
+        assert!(!below_specification(&refused, false));
+    }
+
+    /// The half the switch was never for: a Runner that cannot reach the
+    /// container runtime judges nothing, and must say so by exiting.
+    #[test]
+    fn no_override_starts_past_a_runtime_that_is_not_there() {
+        let unreachable =
+            aj_sandbox::Error::Io(std::io::Error::other("/var/run/docker.sock: not found"));
+        assert!(!below_specification(&unreachable, true));
+        assert!(!below_specification(&unreachable, false));
+    }
 }

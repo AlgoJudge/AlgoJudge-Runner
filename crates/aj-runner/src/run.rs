@@ -645,7 +645,7 @@ async fn judge(
                 .map_err(|e| e.to_string())?;
 
             let into = work.places.join("answers").here;
-            let answers = if submitted.file_name.ends_with(".zip") {
+            let answers = if is_archive(&submitted.file_name) {
                 // Untrusted, and the only untrusted archive the product opens.
                 aj_output_only::Answers::unpack(source.path(), &into)?
             } else if tests.len() == 1 {
@@ -948,6 +948,18 @@ fn language_of(props: Option<&serde_json::Value>) -> Option<&str> {
     props?.get("language")?.as_str()
 }
 
+/// Whether an `output-only@1` upload is the archive rather than a bare answer.
+///
+/// **Case-insensitively, like `Language::accepts`.** `answers.ZIP` is what
+/// Windows Explorer and several archivers produce, and read case-sensitively it
+/// is not an archive: a one-test problem writes the ZIP container's own bytes
+/// out as the answer and marks it wrong against binary, and a problem with more
+/// tests refuses it with a sentence saying the file is not an archive — which
+/// is untrue of the file they sent, and leaves them nothing to fix.
+fn is_archive(file_name: &str) -> bool {
+    file_name.to_ascii_lowercase().ends_with(".zip")
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -978,6 +990,24 @@ mod tests {
             language_of(Some(&serde_json::json!({ "language": null }))),
             None
         );
+    }
+
+    /// The extension a person's tools produce, not the one a specification
+    /// writes. Both branches downstream are wrong for an upload read as a bare
+    /// answer when it is an archive, and neither says anything a participant
+    /// could act on.
+    #[test]
+    fn an_archive_is_an_archive_whatever_case_the_extension_arrived_in() {
+        for name in ["answers.zip", "answers.ZIP", "Answers.Zip", "ANSWERS.ZIP"] {
+            assert!(is_archive(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_bare_answer_is_not_an_archive() {
+        for name in ["1a.out", "answer.txt", "zip", "notazip", "answers.zip.txt"] {
+            assert!(!is_archive(name), "{name}");
+        }
     }
     use super::*;
 

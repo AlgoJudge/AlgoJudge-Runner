@@ -61,7 +61,10 @@ impl Comparison {
 fn quote(token: &str) -> String {
     const LIMIT: usize = 32;
     if token.is_empty() {
-        return "brak".to_owned();
+        // English, like everything the Runner writes itself (2026-08-09). This
+        // note travels to the participant and can become the verdict's own
+        // text, so it is not the place for the one Polish word left in it.
+        return "nothing".to_owned();
     }
     let shown: String = token.chars().take(LIMIT).collect();
     if shown.chars().count() < token.chars().count() {
@@ -168,6 +171,17 @@ mod tests {
             "the note was {} bytes",
             found.note().len()
         );
+    }
+
+    /// **Anything the Runner writes itself is English** (2026-08-09), and a
+    /// `note` is named in that rule. This one also reaches the participant as
+    /// the submission's verdict by way of `score.rs`.
+    #[test]
+    fn a_token_the_program_never_printed_is_reported_in_english() {
+        let found = compare(b"1 2\n", b"1\n");
+        let note = found.note();
+        assert!(note.ends_with("got nothing"), "{note}");
+        assert!(note.is_ascii(), "{note}");
     }
 
     /// Invalid bytes are a wrong answer, not a broken evaluation.

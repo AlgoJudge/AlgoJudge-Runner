@@ -20,6 +20,22 @@ use crate::details::{compiled, failed_to_compile, Compilation, Details, Limits};
 use crate::language::{self, Images, BUILD_OUTPUT, INPUT, PROGRAM, SOURCE};
 use crate::score::{judge, Judgement, Reason, Status, TestOutcome};
 
+/// The scratch a compiler is given, for **every** build.
+///
+/// GCC's driver writes its intermediate `.s` and `.o` under `/tmp`, so this is
+/// a compiler's working set rather than a guess. One constant because there is
+/// one number: the checker is built by the same compiler, in the same image,
+/// with the same command as a submission.
+///
+/// It was 64 MiB for a submission and 64 KiB for a checker — a dropped
+/// `* 1024`, and not a difference anybody would read as one. The consequence
+/// was silent and total: any checker whose assembly ran past 64 KiB, which is
+/// most of them once `<iostream>` is included, failed to build with "No space
+/// left on device", and that is an **infrastructure failure on every
+/// submission to the problem**, reported in words that blame the author's
+/// checker.
+const BUILD_TMPFS_BYTES: u64 = 64 * 1024 * 1024;
+
 /// A directory as this process sees it, and as the container runtime does.
 ///
 /// The two differ whenever the Runner is itself in a container, and a bind
@@ -249,7 +265,7 @@ impl<S: Sandbox> Pipeline<S> {
                         .pids(128)
                         .wall_clock(Duration::from_secs(60))
                         .max_output_bytes(256 * 1024)
-                        .tmpfs_bytes(64 * 1024 * 1024)
+                        .tmpfs_bytes(BUILD_TMPFS_BYTES)
                         .writable_root()
                         .collect(BUILD_OUTPUT)
                         .mount(Mount::read_only(&source.on_host, SOURCE)),
@@ -473,7 +489,7 @@ impl<S: Sandbox> Pipeline<S> {
                     .memory_bytes(512 * 1024 * 1024)
                     .pids(128)
                     .wall_clock(Duration::from_secs(60))
-                    .tmpfs_bytes(64 * 1024)
+                    .tmpfs_bytes(BUILD_TMPFS_BYTES)
                     .writable_root()
                     .collect(BUILD_OUTPUT)
                     .mount(Mount::read_only(&source.on_host, SOURCE)),
