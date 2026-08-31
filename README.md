@@ -17,13 +17,9 @@ reports the mark with the compiler's log and a per-test table attached.
 Python — the table is `crates/aj-standard-io/src/language.rs` — and
 `output-only@1`, where the participant uploads answers rather than a program.
 
-`output-only@1` differs from `standard-io@1` on all three axes that could have
-forced a Server change: the submission is a file rather than source in an
-editor, the package declares no language and needs no compiler, and the
-evaluation **runs no untrusted code at all**, because the participant sent the
-answers. **The Server holds nothing about either type.** A problem type costs
-one `match` arm in `crates/aj-runner/src/run.rs` and a crate; claiming, leasing,
-the package cache, integrity and reporting are shared.
+**The Server holds nothing about either type.** A problem type costs one `match`
+arm in `crates/aj-runner/src/run.rs` and a crate; claiming, leasing, the package
+cache, integrity and reporting are shared.
 
 ## What it is for
 
@@ -31,11 +27,11 @@ The Runner is the component that actually runs untrusted code. It is
 deliberately interchangeable: the Server must never depend on any particular
 Runner implementation, and several may coexist.
 
-The contract is
-`AlgoJudge-Design/specifications/server-runner/SERVER_RUNNER_API.md`, **v1.1**,
-amended three times. **Read its amendment tables before the body**, which states
-the pre-amendment form of an amended section. Ten conformance cases hold the
-Server to it, in `AlgoJudge.Server.Tests/RunnerConformanceTests.cs`.
+The Server–Runner contract is at **v1.1**, amended three times. **Ten
+conformance cases hold the Server to it**, in
+`AlgoJudge.Server.Tests/RunnerConformanceTests.cs`; the protocol is written up
+for a reader in [AlgoJudge-Docs](https://github.com/AlgoJudge/AlgoJudge-Docs),
+under `/protocol/`.
 
 Three properties of it shape everything here:
 
@@ -68,18 +64,13 @@ docker pull ghcr.io/algojudge/lang-pypy:1.2.3
 because a release is tested as one set: the images and the binary are built,
 checked and pushed together, or not at all.
 
-Four images carry **eighteen toolchains**: every C and C++ standard the catalogue
-offers is a `-std` flag rather than an image, so C++17 under GCC and C++17 under
-Clang are one image each and not one image per standard.
-
 `1.2.3`, `1.2`, `1` and `latest` point at the same image; **a prerelease
 (`v1.2.3-rc.1`) publishes only its own tag**, so nothing moving ever points at a
 release candidate.
 
 The Runner is `linux/amd64` only. That is not an oversight: cgroup v2 on amd64 is
 what the measurement rests on, and a submission's container has to match the
-architecture of the host that runs it — an arm64 language image could not be used
-by any Runner that exists.
+architecture of the host that runs it.
 
 A deployment names the language images explicitly, because the built-in defaults
 (`algojudge/lang-gcc:local`) are what the development stack builds locally:
@@ -138,12 +129,6 @@ Nothing here is claimed without a test that runs it.
 The last four need a container runtime and are `#[ignore]`d so an ordinary
 `./x test` stays fast. All of them run in CI.
 
-`end_to_end` covers **six outcomes in one run** — accepted, wrong answer, time
-limit, compilation error, policy violation, and an infrastructure failure. The
-sixth is the one that is not a verdict: a package the Runner cannot open ends
-`failed` with **no score at all**, because a zero on a board reads as a wrong
-answer about a program that was never run.
-
 ## Isolation
 
 **Sibling containers.** The Runner is trusted and holds the container runtime's
@@ -163,10 +148,10 @@ host is therefore assumed to be — no secrets on it, reproducible, nothing else
 running.
 
 **cgroup v2 is required and is checked at start.** The limits are enforced on v1
-too — measured, not assumed — but peak memory and CPU time cannot be read
-honestly there, and those numbers are shown to a participant beside their
-verdict. `AJ_Sandbox__AllowCgroupV1` starts anyway, for a development machine
-whose Docker still reports v1, and says so at `ERROR` on every start.
+too, but peak memory and CPU time cannot be read honestly there, and those
+numbers are shown to a participant beside their verdict.
+`AJ_Sandbox__AllowCgroupV1` starts anyway, for a development machine whose
+Docker still reports v1, and says so at `ERROR` on every start.
 
 ## Security requirements
 
@@ -184,14 +169,14 @@ gate.
 - [AlgoJudge-Server](https://github.com/AlgoJudge/AlgoJudge-Server) — jobs, packages, results
 - [AlgoJudge-Client](https://github.com/AlgoJudge/AlgoJudge-Client) — the web frontend
 - [AlgoJudge-External-Runner](https://github.com/AlgoJudge/AlgoJudge-External-Runner) —
-  the second Runner implementation, which judges nothing: it forwards
-  submissions to external judging systems and reports their verdicts, with UVa
-  Online Judge as its one integration, serving `uva@1` against
-  `onlinejudge.org`. It consumes this repository's `aj-protocol` crate over Git,
-  pinned to a revision in its `Cargo.toml`, so a breaking change here is a
-  change two repositories have to agree on
+  a second Runner, forwarding submissions to external judging systems. It
+  consumes this repository's `aj-protocol` crate over Git, pinned to a revision
+  in its `Cargo.toml`, so a breaking change here is a change two repositories
+  have to agree on
 - [AlgoJudge-Ops](https://github.com/AlgoJudge/AlgoJudge-Ops) — the production
   Compose stack, which is what runs this image at an installation
+- [AlgoJudge-Docs](https://github.com/AlgoJudge/AlgoJudge-Docs) — the public
+  documentation site, whose `/runner/` and `/protocol/` sections describe this
 
 ## Contributing
 
