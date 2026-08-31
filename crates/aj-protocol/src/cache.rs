@@ -124,6 +124,12 @@ impl Cache {
         }
 
         tokio::fs::rename(&temporary, &path).await?;
+        // Wanted **now**, not at the first later hit. An entry with no marker
+        // sorts as the epoch, so without this the package downloaded a moment
+        // ago is the first thing evicted and every entry older than it survives
+        // — the eviction order upside down, and a cache that re-downloads the
+        // one package a contest is about to ask for again.
+        self.touch(&path);
         tracing::info!(file_id, "cached");
 
         self.evict_to_fit();
@@ -277,6 +283,66 @@ mod tests {
             cache.path_for(lower, "id"),
             cache.path_for(&lower.to_ascii_uppercase(), "id"),
         );
+    }
+
+    /// One file over HTTP, once. Enough to drive `fetch` end to end without a
+    /// Server, which is the only way to observe what a download leaves behind.
+    async fn serving(body: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Read only far enough for the client to finish sending. What it
+            // asked for is not interesting: this server has one file.
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n",
+                body.len(),
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+            socket.flush().await.unwrap();
+        });
+
+        (format!("http://127.0.0.1:{port}/api/v1"), handle)
+    }
+
+    /// **The eviction order, for the entry most likely to be wanted again.**
+    ///
+    /// An entry with no marker sorts as the epoch, so a download that is not
+    /// recorded as wanted is evicted ahead of everything cached before it — and
+    /// during a contest that is the package every submission is about to ask
+    /// for, re-downloaded each time.
+    #[tokio::test]
+    async fn a_download_is_recorded_as_wanted_when_it_arrives() {
+        use sha2::Digest as _;
+
+        const BODY: &[u8] = b"a package, as far as the cache is concerned";
+        let sha256 = hex::encode(sha2::Sha256::digest(BODY));
+
+        let cache = Arc::new(Cache::new(scratch("fresh"), 1 << 30));
+        let (base, handle) = serving(BODY).await;
+        let server = Server::new(&base).unwrap();
+
+        let entry = cache.fetch(&server, "a-file-id", &sha256).await.unwrap();
+        handle.await.unwrap();
+
+        let (_, _, used) = cache
+            .entries()
+            .into_iter()
+            .find(|(path, _, _)| path.file_name().is_some_and(|n| n == "a-file-id"))
+            .expect("the download is in the cache");
+        assert!(
+            used > std::time::UNIX_EPOCH,
+            "a fresh download sorted as the epoch, so it evicts before every older entry",
+        );
+
+        drop(entry);
     }
 
     #[test]
