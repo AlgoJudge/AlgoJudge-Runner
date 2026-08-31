@@ -35,24 +35,33 @@ impl Comparison {
         matches!(self, Comparison::Equal)
     }
 
-    /// A line for the participant's `note`, naming what differed without
-    /// quoting so much that the expected output is disclosed.
+    /// A line for the participant's `note`: **where** the output differed, and
+    /// what they produced there.
+    ///
+    /// **It does not name the expected token, and that is the whole point.** It
+    /// did until 2026-08-31, quoted to 32 characters on the stated grounds that
+    /// a bound keeps the expected output from being disclosed. A bound is not a
+    /// boundary: an answer is usually far shorter than 32 characters, so the
+    /// whole of it was disclosed — and this note travels for **every** test in
+    /// the result document, so one deliberately wrong submission came back with
+    /// the first differing token of every failing test at once. For a problem
+    /// answered with one number per test, that is the answer key.
+    ///
+    /// `input_mount` was changed on 2026-08-09 so that `<name>.out` never
+    /// reaches the participant's container. This was the same file reaching
+    /// them by the other road, and `output-only@1` shares this function — where
+    /// the answers *are* the submission, so it mattered more there still.
+    ///
+    /// What is left is what they can act on: which token, and what they put
+    /// there. Their own output discloses nothing they did not send.
     pub fn note(&self) -> String {
         match self {
             Comparison::Equal => String::new(),
-            Comparison::Different {
-                token,
-                expected,
-                actual,
-            } => {
+            Comparison::Different { token, actual, .. } => {
                 // Bounded on purpose: a `note` travels in the result document
                 // for every test, and a program that printed a megabyte on one
                 // line would otherwise put it there.
-                format!(
-                    "token {token} differs: expected {}, got {}",
-                    quote(expected),
-                    quote(actual),
-                )
+                format!("token {token} differs: got {}", quote(actual))
             }
         }
     }
@@ -170,6 +179,28 @@ mod tests {
             found.note().len() < 200,
             "the note was {} bytes",
             found.note().len()
+        );
+    }
+
+    /// **The note must not name the expected token.**
+    ///
+    /// It is read out of `<name>.out`, and this note travels for every test in
+    /// the result document — so one deliberately wrong submission would come
+    /// back with the first differing token of every failing test, which for a
+    /// problem answered in one number per test is the answer key.
+    #[test]
+    fn a_note_never_discloses_the_expected_output() {
+        let found = compare(b"1 42 3\n", b"1 0 3\n");
+        let note = found.note();
+
+        assert!(note.contains("token 2"), "{note}");
+        assert!(
+            note.contains(r#""0""#),
+            "their own output is theirs to read: {note}",
+        );
+        assert!(
+            !note.contains("42"),
+            "the expected token reached the note: {note}",
         );
     }
 

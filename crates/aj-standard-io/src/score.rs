@@ -172,14 +172,38 @@ fn verdict(tests: &[ScoredTest], score: f64, max_score: f64) -> String {
     tests
         .iter()
         .find(|t| !t.outcome.status.passed())
-        .map(|t| {
-            if t.outcome.note.is_empty() {
-                "Wrong answer".to_owned()
-            } else {
-                t.outcome.note.clone()
-            }
-        })
+        .map(|t| word_for(t.outcome.reason).to_owned())
         .unwrap_or_else(|| "Partial".to_owned())
+}
+
+/// The verdict vocabulary — one word per [`Reason`], and **never the note**.
+///
+/// This returned the failing test's `note` verbatim until 2026-08-31. For a run
+/// the machinery stopped, that note is already one of the words below and
+/// nothing changes; for a wrong answer it is `compare`'s own sentence, which
+/// named the expected token read out of `<name>.out`. A verdict is stored,
+/// shown and counted, and it is no place for a checker's text either — a
+/// checker's comment is up to 64 KiB of whatever an untrusted program printed
+/// beside it.
+///
+/// A `match` on the enum rather than a lookup, so a problem type that adds a
+/// reason does not compile until somebody says what it is called.
+fn word_for(reason: Option<Reason>) -> &'static str {
+    match reason {
+        Some(Reason::TimeLimit) => "Time limit exceeded",
+        Some(Reason::MemoryLimit) => "Memory limit exceeded",
+        Some(Reason::OutputLimit) => "Output limit exceeded",
+        Some(Reason::RuntimeError) => "Runtime error",
+        // The spelling `pipeline.rs` already sets for these two directly, since
+        // neither reaches this function: every test carries the same reason and
+        // the verdict is decided there. Kept identical so the vocabulary has one
+        // spelling rather than two.
+        Some(Reason::PolicyViolation) => "PolicyViolation",
+        Some(Reason::CompilationError) => "Compilation error",
+        // A test that did not pass and names no reason should not exist. If one
+        // does, the honest word is the one claiming least about it.
+        Some(Reason::WrongAnswer) | None => "Wrong answer",
+    }
 }
 
 /// Two decimals. A mark shown to a participant with fifteen of them reads as a
@@ -342,9 +366,33 @@ groups:
         let (config, tests) = package();
         let mut outcomes = all_passing();
         outcomes[3].status = Status::Error;
-        outcomes[3].note = "Time limit exceeded".into();
+        outcomes[3].reason = Some(Reason::TimeLimit);
 
         let judged = judge(&config, &tests, &outcomes);
         assert_eq!(judged.verdict, "Time limit exceeded");
+    }
+
+    /// **The verdict is a word, and a note is not one.**
+    ///
+    /// A wrong answer's note is `compare`'s sentence, which until 2026-08-31
+    /// named the expected token; with a checker it is whatever the checker
+    /// wrote, beside an untrusted program. This field is stored, shown and
+    /// counted, and nothing of either may reach it.
+    #[test]
+    fn the_verdict_carries_no_text_from_a_note() {
+        let (config, tests) = package();
+        let mut outcomes = all_passing();
+        outcomes[3].status = Status::Error;
+        outcomes[3].reason = Some(Reason::WrongAnswer);
+        outcomes[3].note = r#"token 1 differs: expected "42", got "0""#.into();
+
+        let judged = judge(&config, &tests, &outcomes);
+        assert_eq!(judged.verdict, "Wrong answer");
+        // Stated separately, so it still holds if the vocabulary is reworded.
+        assert!(
+            !judged.verdict.contains("42"),
+            "the note reached the verdict: {}",
+            judged.verdict,
+        );
     }
 }

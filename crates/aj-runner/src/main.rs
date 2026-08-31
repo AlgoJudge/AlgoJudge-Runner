@@ -45,7 +45,10 @@ async fn main() -> anyhow::Result<()> {
     // Checked before anything is claimed, and loudly. A sandbox that silently
     // cannot enforce a limit does not produce errors — it produces wrong
     // verdicts, which look like somebody's solution being wrong.
-    let sandbox = aj_sandbox::Docker::connect()?;
+    // The fingerprint names this Runner's own containers, so a second Runner on
+    // the host sweeps its orphans and not this one's evaluations. It is on disk
+    // and survives a restart, which is the case the sweep exists for.
+    let sandbox = aj_sandbox::Docker::connect(identity.fingerprint())?;
     if let Err(e) = sandbox.preflight().await {
         if !below_specification(&e, config.allow_cgroup_v1) {
             return Err(e.into());
@@ -55,7 +58,9 @@ async fn main() -> anyhow::Result<()> {
         // happen. It cannot be reported to the Server's panel: `MachineDto` is
         // a closed shape and drops anything it does not name.
         tracing::error!(
-            "STARTING BELOW SPECIFICATION — {e}.              AJ_Sandbox__AllowCgroupV1 is set. Times and memory reported beside              a verdict on this host are not to be trusted."
+            "STARTING BELOW SPECIFICATION — {e}. AJ_Sandbox__AllowCgroupV1 is set. \
+             Times and memory reported beside a verdict on this host are not to \
+             be trusted."
         );
     }
 

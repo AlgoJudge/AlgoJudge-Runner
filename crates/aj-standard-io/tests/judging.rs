@@ -64,7 +64,10 @@ int main(void) {
 "#;
 
 async fn pipeline() -> Pipeline<Docker> {
-    let docker = Docker::connect().expect("a container runtime");
+    // This suite's own name, so the clean slate below is this suite's and not a
+    // Runner's that happens to be judging on the same host. Fixed rather than
+    // per-run, so a previous run's leftovers are still swept.
+    let docker = Docker::connect("test-judging").expect("a container runtime");
     if let Err(e) = docker.preflight().await {
         assert!(
             std::env::var("AJ_SANDBOX_ALLOW_CGROUP_V1").is_ok(),

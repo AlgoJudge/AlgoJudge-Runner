@@ -654,7 +654,8 @@ async fn judge(
                 aj_output_only::Answers::single(&bytes, &only, &into)?
             } else {
                 return Err(format!(
-                    "this problem has {} tests, so the answers arrive as an archive,                      and {} is not one",
+                    "this problem has {} tests, so the answers arrive as an archive, \
+                     and {} is not one",
                     tests.len(),
                     submitted.file_name,
                 )
