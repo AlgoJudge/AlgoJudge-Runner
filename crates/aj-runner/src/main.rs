@@ -55,7 +55,9 @@ async fn main() -> anyhow::Result<()> {
         // happen. It cannot be reported to the Server's panel: `MachineDto` is
         // a closed shape and drops anything it does not name.
         tracing::error!(
-            "STARTING BELOW SPECIFICATION — {e}.              AJ_Sandbox__AllowCgroupV1 is set. Times and memory reported beside              a verdict on this host are not to be trusted."
+            "STARTING BELOW SPECIFICATION — {e}. AJ_Sandbox__AllowCgroupV1 is set. \
+             Times and memory reported beside a verdict on this host are not to \
+             be trusted."
         );
     }
 
