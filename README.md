@@ -6,6 +6,19 @@ courses, with automatic evaluation of submitted solutions.
 This is the component that does the evaluating: isolated execution and marking,
 for [AlgoJudge](https://github.com/AlgoJudge).
 
+## Documentation
+
+**[docs.algojudge.pl](https://docs.algojudge.pl/en/runner/)** is written for
+somebody who does not have this source open. This README is the other half:
+what the repository is, and how to build, run and change it.
+
+| | |
+|---|---|
+| [`/en/runner/`](https://docs.algojudge.pl/en/runner/) | what a Runner is, isolation and limits, the four languages, problem types, routing by tags, and every configuration key |
+| [`/en/protocol/`](https://docs.algojudge.pl/en/protocol/) | the contract this Runner and the Server share, written for a reader rather than as a specification |
+
+Both are English. Polish covers `/client/` and `/install/`.
+
 ## What it does
 
 **It judges.** This Runner registers, is approved, authenticates, claims jobs,
@@ -30,8 +43,8 @@ Runner implementation, and several may coexist.
 The Server–Runner contract is at **v1.1**, amended three times. **Ten
 conformance cases hold the Server to it**, in
 `AlgoJudge.Server.Tests/RunnerConformanceTests.cs`; the protocol is written up
-for a reader in [AlgoJudge-Docs](https://github.com/AlgoJudge/AlgoJudge-Docs),
-under `/protocol/`.
+for a reader at
+[`/en/protocol/`](https://docs.algojudge.pl/en/protocol/).
 
 Three properties of it shape everything here:
 
@@ -186,8 +199,8 @@ gate.
   have to agree on
 - [AlgoJudge-Ops](https://github.com/AlgoJudge/AlgoJudge-Ops) — the production
   Compose stack, which is what runs this image at an installation
-- [AlgoJudge-Docs](https://github.com/AlgoJudge/AlgoJudge-Docs) — the public
-  documentation site, whose `/runner/` and `/protocol/` sections describe this
+- [AlgoJudge-Docs](https://github.com/AlgoJudge/AlgoJudge-Docs) — the source of
+  the documentation site linked under *Documentation* above
 
 ## Contributing
 
