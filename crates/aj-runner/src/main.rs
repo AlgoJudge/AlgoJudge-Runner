@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
     // and survives a restart, which is the case the sweep exists for.
     let sandbox = aj_sandbox::Docker::connect(identity.fingerprint())?;
     if let Err(e) = sandbox.preflight().await {
-        if !below_specification(&e, config.allow_cgroup_v1) {
+        if !below_specification(&e, config.allow_unmeasured) {
             return Err(e.into());
         }
         // Said on every start, at the loudest level there is, because a
@@ -69,9 +69,10 @@ async fn main() -> anyhow::Result<()> {
         // happen. It cannot be reported to the Server's panel: `MachineDto` is
         // a closed shape and drops anything it does not name.
         tracing::error!(
-            "STARTING BELOW SPECIFICATION — {e}. AJ_Sandbox__AllowCgroupV1 is set. \
-             Times and memory reported beside a verdict on this host are not to \
-             be trusted."
+            "STARTING BELOW SPECIFICATION — {e}. AJ_Sandbox__AllowUnmeasured is set. \
+             A time limit is decided on processor time read from this host's \
+             cgroups, so this Runner registers and answers the protocol and then \
+             fails every job it claims."
         );
     }
 
@@ -96,16 +97,17 @@ async fn main() -> anyhow::Result<()> {
 /// allowed to start past.
 ///
 /// **`Refused` and nothing else.** That variant is preflight's own verdict on
-/// the host — today, cgroup v1 — and it is what `AJ_Sandbox__AllowCgroupV1` is
-/// documented to permit, in `config.rs` and in `docs/SECURITY.md` §5 alike.
+/// the host — cgroup v1, a driver that is not `cgroupfs`, or a cgroup tree it
+/// cannot write to — and it is what `AJ_Sandbox__AllowUnmeasured` is documented
+/// to permit, in `config.rs` and in `docs/SECURITY.md` §5 alike.
 ///
 /// The switch used to suppress every failure the check could produce. `Runtime`
 /// and `Io` are the container runtime being unreachable, which on a development
 /// stack usually means the socket is mounted wrong; a Runner that starts past
 /// that can judge nothing at all, and reported it as running below
 /// specification.
-fn below_specification(error: &aj_sandbox::Error, allow_cgroup_v1: bool) -> bool {
-    allow_cgroup_v1 && matches!(error, aj_sandbox::Error::Refused(_))
+fn below_specification(error: &aj_sandbox::Error, allow_unmeasured: bool) -> bool {
+    allow_unmeasured && matches!(error, aj_sandbox::Error::Refused(_))
 }
 
 #[cfg(test)]

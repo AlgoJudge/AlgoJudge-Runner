@@ -105,33 +105,54 @@ impl Docker {
     /// Found by CI and not locally: this workstation runs `cgroupfs` and the
     /// runner runs `systemd`, so every container in the adversarial suite failed
     /// to start on a host the author never used.
-    fn resolve_cgroup_root(&self, driver: Option<String>) -> Option<std::path::PathBuf> {
+    fn resolve_cgroup_root(&self, driver: Option<String>) -> Result<std::path::PathBuf> {
         let driver = driver.unwrap_or_default();
         if driver != "cgroupfs" {
-            tracing::info!(
-                driver = %driver,
-                "peak memory will not be measured: a cgroup parent is only a path \
-                 under the cgroupfs driver",
-            );
-            return None;
+            return Err(Error::Refused(format!(
+                "this host's cgroup driver is {driver:?}, and the Runner requires cgroupfs. \
+                 A cgroup parent is only a path under cgroupfs; under systemd it has to be a \
+                 slice, which belongs to systemd rather than to whoever calls mkdir. Without \
+                 a cgroup of its own this Runner cannot read cpu.stat, and a time limit is \
+                 decided on processor time. Set native.cgroupdriver=cgroupfs in \
+                 /etc/docker/daemon.json and restart the daemon"
+            )));
         }
 
-        let root = std::path::PathBuf::from(
-            std::env::var("AJ_Sandbox__CgroupRoot").unwrap_or_else(|_| "/sys/fs/cgroup".to_owned()),
-        );
-        let ours = root.join("algojudge");
-        match std::fs::create_dir_all(&ours) {
-            Ok(()) => Some(ours),
-            Err(e) => {
-                tracing::info!(
-                    root = %root.display(),
-                    error = %e,
-                    "peak memory will not be measured: this Runner cannot create a cgroup. \
-                     Mount the host's cgroup filesystem writable to enable it",
-                );
-                None
-            }
+        // **Empty is unset, and the trap this closes is not hypothetical.** This
+        // reads the variable directly rather than through `Config`, so it never
+        // had that filter: an empty value became `PathBuf::from("")`, joined to
+        // the relative path `algojudge`, which `create_dir_all` may well succeed
+        // at in the working directory — handing back a path the daemon resolves
+        // somewhere else entirely. The measurement then reads an empty directory
+        // rather than failing, which was survivable while it was optional and is
+        // not now that a verdict depends on it.
+        let root = std::env::var("AJ_Sandbox__CgroupRoot")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "/sys/fs/cgroup".to_owned());
+        let root = std::path::PathBuf::from(root);
+        if !root.is_absolute() {
+            return Err(Error::Refused(format!(
+                "AJ_Sandbox__CgroupRoot is {}, which is not an absolute path. This Runner \
+                 writes through this path while the daemon resolves --cgroup-parent against \
+                 its own root, so a relative one names a directory the daemon has never \
+                 heard of, and the measurement would read an empty directory rather than fail",
+                root.display()
+            )));
         }
+
+        let ours = root.join("algojudge");
+        std::fs::create_dir_all(&ours).map(|()| ours).map_err(|e| {
+            Error::Refused(format!(
+                "this Runner cannot create a cgroup under {}: {e}. A time limit is decided on \
+                 processor time, read from cpu.stat in a cgroup this Runner makes for each \
+                 run, so it cannot judge without one. Mount the host's cgroup tree writable \
+                 and share its namespace: --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup, \
+                 or in Compose `cgroup: host` on the service plus the same volume",
+                root.display()
+            ))
+        })
     }
 
     /// A cgroup for one run, and the path the daemon knows it by.
@@ -370,21 +391,33 @@ impl Sandbox for Docker {
         // about whether the sandbox holds.
         let info = self.client.info().await?;
 
-        // Decided here because it needs the daemon's answer, and cached because
-        // it cannot change while the daemon is the same one.
-        let _ = self
-            .cgroup_root
-            .set(self.resolve_cgroup_root(info.cgroup_driver.map(|d| d.to_string())));
-
-        match info.cgroup_version {
-            Some(SystemInfoCgroupVersionEnum::_2) => Ok(()),
-            other => Err(Error::Refused(format!(
-                "this host reports cgroup version {other:?}, and the Runner requires v2. \
-                 The limits are enforced on v1, but peak memory and CPU time cannot be \
-                 measured honestly, and a number shown to a participant beside their \
-                 verdict has to be right",
-            ))),
+        // **Version first, and the order is not arbitrary.** On a v1 host the
+        // root is a tmpfs of controller directories, so `create_dir_all` there
+        // frequently *succeeds* — a writability check run first would pass and
+        // the refusal below would then have to explain a second-order symptom
+        // rather than the cause.
+        if info.cgroup_version != Some(SystemInfoCgroupVersionEnum::_2) {
+            return Err(Error::Refused(format!(
+                "this host reports cgroup version {:?}, and the Runner requires v2. \
+                 The limits are enforced on v1, but a time limit is decided on processor \
+                 time read from cpu.stat, which is a v2 interface — so what cannot be done \
+                 here is reach a verdict at all",
+                info.cgroup_version
+            )));
         }
+
+        // **Refused rather than degraded, since 2026-09-02.** This used to give
+        // up with one `info` line and judge anyway, which was defensible while
+        // the reading was only reported beside a verdict. It is what the verdict
+        // is now made of, so a Runner that cannot take it cannot judge, and the
+        // honest thing is to say so at start rather than to fail every job it
+        // later claims.
+        //
+        // Cached because it needs the daemon's answer and cannot change while
+        // the daemon is the same one.
+        let resolved = self.resolve_cgroup_root(info.cgroup_driver.map(|d| d.to_string()));
+        let _ = self.cgroup_root.set(resolved.as_ref().ok().cloned());
+        resolved.map(|_| ())
     }
 
     async fn run(&self, profile: &Profile) -> Result<Outcome> {

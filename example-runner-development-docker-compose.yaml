@@ -147,16 +147,28 @@ services:
       # produces an empty directory rather than an error.
       AJ_Work__Path: /var/lib/algojudge-runner/work
       AJ_Work__HostPath: ${PWD}/.runner-work
-      # Docker Desktop may still report cgroup v1, and the Runner refuses it:
-      # the limits hold there, but peak memory and CPU time cannot be measured
-      # honestly, and those numbers are shown to a participant. Set here so a
-      # development stack starts; it has no business in a deployment, and the
-      # Runner says so at the top of every log.
-      AJ_Sandbox__AllowCgroupV1: "1"
+      # **No `AJ_Sandbox__AllowUnmeasured` here, deliberately.** It used to set
+      # the old spelling of it so a development stack would start on a Docker
+      # Desktop reporting cgroup v1. Starting is no longer the interesting part:
+      # a time limit is decided on processor time read from the run's own
+      # cgroup, so a Runner that starts without one fails every job it claims.
+      # The mount below is what makes this stack judge; the flag would only make
+      # it come up and then refuse work, one job at a time.
     volumes:
       - algojudge_runner_dev_identity:/var/lib/algojudge-runner
       - algojudge_runner_dev_cache:/var/cache/algojudge-runner
       - ${PWD}/.runner-work:/var/lib/algojudge-runner/work
+      # **Writable, and judging needs it.** The Runner makes a cgroup of its
+      # own, starts each job container under it, and reads `memory.peak` and
+      # `cpu.stat` back once the child is gone — a container's own cgroup does
+      # not outlive it, and the runtime API reports no peak on v2. A time limit
+      # is compared against the processor time that read produces.
+      #
+      # `cgroup: host` below matters as much as the mount: without it this
+      # container sees its own cgroup as the root, and the path it creates is
+      # not the path the daemon resolves `--cgroup-parent` against, so the
+      # measurement would read an empty directory rather than fail.
+      - /sys/fs/cgroup:/sys/fs/cgroup
       # The Runner is trusted and holds the socket; **nothing it starts ever
       # does**. Mounting it read-only would restrict nothing that matters — the
       # flag applies to the socket file, not to the API spoken over it — so the
@@ -164,6 +176,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     # No ports. The Runner opens every connection itself, which is what lets a
     # real one live behind NAT with no inbound access at all.
+
+    # == `--cgroupns=host`. See the volume above.
+    cgroup: host
 
 volumes:
   algojudge_runner_dev_db:

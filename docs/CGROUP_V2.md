@@ -232,11 +232,16 @@ AJ_Sandbox__CgroupRoot      # defaults to /sys/fs/cgroup
 ```
 
 **And a third requirement, unstated here until 2026-08-31: the daemon's cgroup
-driver must be `cgroupfs`.** `resolve_cgroup_root` gives up on any other driver
-and logs it at `info` — so with `systemd`, the default on RHEL 9+, Fedora and
-Ubuntu, an operator can satisfy every row of the table above, mount the hierarchy
-writable, pass `--cgroupns=host`, and still get no peak memory, with one `info`
-line to say so.
+driver must be `cgroupfs`.** With `systemd`, the default on RHEL 9+, Fedora and
+Ubuntu, a cgroup parent is not a path at all.
+
+**All three are refusals since 2026-09-02, not degradations.** This used to give
+up with one `info` line and judge anyway, so an operator could satisfy every row
+of the table above, mount the hierarchy writable, pass `--cgroupns=host`, and
+still get nothing — with a single line to say so. That was defensible while the
+reading was only printed beside a verdict. A time limit is now decided on
+processor time read from `cpu.stat`, so a Runner that cannot read one cannot
+judge, and says so at start rather than failing every job it later claims.
 
 ```
 docker info --format '{{.CgroupDriver}}'       # must print cgroupfs
@@ -251,8 +256,9 @@ the author never used.
 mounted cgroup2 needs neither `CAP_SYS_ADMIN` nor privilege — which is the whole
 reason D-13 could decline `isolate` and keep the numbers.
 
-Where the mount is absent the Runner says so once at start and reports **no**
-peak memory. That is a supported configuration, not a broken one.
+Where the mount is absent the Runner **refuses to start**. It was a supported
+configuration until 2026-09-02, when the reading stopped being a number beside a
+verdict and became the thing the verdict is made of.
 
 ### The rule this implies for calibration
 
@@ -275,11 +281,12 @@ memory limit is OOM-killed and `OOMKilled` is reported, and the whole adversaria
 suite passed. The sandbox holds on v1.
 
 **v1 cannot measure.** `memory.peak` and `cpu.stat` are v2 interfaces. The
-refusal is about the number shown to a participant beside their verdict, not
-about whether the sandbox contains them.
+refusal is about reaching a verdict at all — a time limit is processor time —
+and not about whether the sandbox contains a program. It contains one either
+way.
 
-`AJ_Sandbox__AllowCgroupV1` starts anyway, for a development machine whose Docker
-still reports v1. It is off by default, shouts at `ERROR` on every start, and is
+`AJ_Sandbox__AllowUnmeasured` starts anyway — and only starts; such a Runner
+fails every job it claims. It is off by default, shouts at `ERROR` on every start, and is
 **consulted only when preflight fails** — so a CI job that merely brings the
 stack up would pass while measuring nothing. That is why CI asserts the version
 itself before anything else runs.

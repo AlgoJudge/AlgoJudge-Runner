@@ -48,14 +48,20 @@ pub struct Config {
 
     pub images: aj_standard_io::Images,
 
-    /// Starts anyway on a host that reports cgroup v1.
+    /// Starts anyway on a host this Runner cannot measure on.
     ///
-    /// **Off by default, and loud when on.** The limits are enforced on v1, but
-    /// peak memory and CPU time cannot be measured honestly there — and those
-    /// numbers are shown to a participant beside their verdict. This exists
-    /// because a developer machine is often Docker Desktop, which may still
-    /// report v1, and the alternative is a development stack that cannot start.
-    pub allow_cgroup_v1: bool,
+    /// **Off by default, and loud when on. It does not make judging work — it
+    /// makes starting work.** A time limit is decided on processor time read
+    /// from the run's own cgroup, so a Runner that cannot read one fails every
+    /// job it claims with an infrastructure error. What this buys is a process
+    /// that registers, answers the protocol and can be talked to, which is what
+    /// the conformance suite needs and all it needs.
+    ///
+    /// **Renamed from `AJ_Sandbox__AllowCgroupV1` on 2026-09-02**, which is
+    /// still honoured: cgroup v1 was one of three conditions even then, and
+    /// after the refusal became about the verdict rather than about a number
+    /// beside it, the old name described none of them.
+    pub allow_unmeasured: bool,
 }
 
 impl Config {
@@ -112,7 +118,12 @@ impl Config {
             work_path: work.clone().into(),
             work_host_path: var("Work__HostPath").unwrap_or(work).into(),
 
-            allow_cgroup_v1: var("Sandbox__AllowCgroupV1").is_some(),
+            // Either name. The old one is not deprecated so much as narrower
+            // than what it always did, and a development `.env` that has it
+            // should keep working.
+            allow_unmeasured: var("Sandbox__AllowUnmeasured")
+                .or_else(|| var("Sandbox__AllowCgroupV1"))
+                .is_some(),
 
             // **Four images, eighteen toolchains.** Named one at a time, and
             // anything not named keeps the compiled-in default — so an

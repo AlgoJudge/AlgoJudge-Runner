@@ -417,56 +417,75 @@ impl<S: Sandbox> Pipeline<S> {
                     .pids(16)
                     .cpuset(self.core())
                     .max_output_bytes(64 * 1024 * 1024)
-                    // **The limit plus a grace.** A program stuck in an
-                    // uninterruptible syscall has to be reaped from
-                    // outside, and the verdict comes from the measurement
-                    // rather than from this deadline.
-                    .wall_clock(Duration::from_millis(limits.time_ms) + Duration::from_secs(1))
+                    .wall_clock(reaping_deadline(limits.time_ms))
                     .mount(Mount::read_only(&artefacts.on_host, PROGRAM))
                     .mount(input_mount(&job.package.on_host, &test.name)),
                 )
                 .await
                 .map_err(|e| format!("a test could not be run: {e}"))?;
 
-            let time_ms = run.wall_time.as_millis() as u64;
+            let measured = Measured::of(&run).map_err(|e| format!("test {}: {e}", test.name))?;
+            let time_ms = measured.time_ms;
+
+            // **The wall clock survives here and nowhere else.** It is not
+            // reported and it decides nothing, but the gap between the two is
+            // the container's own start — the one number that explains why a
+            // participant waited longer than their program ran, and the first
+            // thing anybody diagnosing a slow judge wants.
+            tracing::debug!(
+                test = %test.name,
+                cpu_ms = time_ms,
+                wall_ms = run.wall_time.as_millis() as u64,
+                limit_ms = limits.time_ms,
+                "judged a test",
+            );
 
             // What the machinery did to it comes first: none of these is the
             // program having answered wrongly.
             let stopped = match run.stopped {
-                Stopped::WallClock => Some(("Time limit exceeded", Reason::TimeLimit)),
-                Stopped::Memory => Some(("Memory limit exceeded", Reason::MemoryLimit)),
-                Stopped::Output => Some(("Output limit exceeded", Reason::OutputLimit)),
+                // **Reaped rather than over its limit, and the note says so.**
+                // The deadline is three times the limit; a program that reaches
+                // it has usually spent that time *waiting*, so the table would
+                // otherwise read "Time limit exceeded — 4 ms of 1000 ms" and
+                // teach a participant nothing. The verdict and the `reason` are
+                // deliberately the same: the vocabulary is shared with the
+                // Client, the documentation and every package on disk, and a
+                // program stopped here has failed a time limit whether it spent
+                // the time computing or not.
+                Stopped::WallClock => Some((
+                    format!(
+                        "Time limit exceeded: still running after {:.1} s",
+                        reaping_deadline(limits.time_ms).as_secs_f64()
+                    ),
+                    Reason::TimeLimit,
+                )),
+                Stopped::Memory => Some(("Memory limit exceeded".to_owned(), Reason::MemoryLimit)),
+                Stopped::Output => Some(("Output limit exceeded".to_owned(), Reason::OutputLimit)),
 
-                // **The limit is decided here, on the measurement, and until
-                // 2026-08-22 it was decided nowhere.** The deadline above is the
-                // limit plus a second of grace, because a program wedged in an
-                // uninterruptible syscall has to be reaped from outside — and
-                // the comment beside it has always said the verdict comes from
-                // the measurement rather than from that deadline. No such
-                // comparison existed. A solution that overran its limit by
-                // anything less than the grace finished on its own, was never
-                // reaped, and was marked correct: at a one-second limit, a
-                // program taking 1.9 s was `Accepted`.
+                // **The limit is processor time**, decided here, on the
+                // measurement (2026-09-02). It was the wall clock until then,
+                // which charged the participant for the container's own start
+                // and was the one arrangement no other judge in this space
+                // uses; `docs/audits/TIME_LIMIT_QUANTITY_2026-09-02.md` in the
+                // workspace is the whole of that history.
                 //
-                // The wall clock is what decides it, deliberately —
-                // `Outcome::cpu_time` says so where it is declared, because a
-                // limit is stated in what a participant waits through. It
-                // includes the container's start, and so do the numbers a trial
-                // measures, which is what keeps a calibrated limit honest
-                // against the thing it is compared with.
+                // The comparison is against `Measured::time_ms`, which is
+                // rounded up, so the number a participant reads is exactly the
+                // number this compared — with truncation the two could disagree
+                // at the boundary and the table would look like a lie.
                 Stopped::OnItsOwn if time_ms > limits.time_ms => {
-                    Some(("Time limit exceeded", Reason::TimeLimit))
+                    Some(("Time limit exceeded".to_owned(), Reason::TimeLimit))
                 }
                 Stopped::OnItsOwn => None,
             };
             if let Some((note, reason)) = stopped {
-                outcomes.push(failed(test, time_ms, note, reason));
+                outcomes.push(failed(test, Some(measured), &note, reason));
                 continue;
             }
             if run.exit_code != 0 {
                 outcomes.push(failed(
                     test,
-                    time_ms,
+                    Some(measured),
                     &how_it_died(run.exit_code),
                     Reason::RuntimeError,
                 ));
@@ -522,10 +541,7 @@ impl<S: Sandbox> Pipeline<S> {
                 // participant's run has the same floor, so subtracting it would
                 // make every calibrated limit too tight for the sake of a
                 // number nobody meets.
-                memory_bytes: run.peak_memory_bytes,
-                // Read from the same cgroup as the peak, so it is absent on the
-                // same hosts and for the same reason.
-                cpu_ms: run.cpu_time.map(|d| d.as_millis() as u64),
+                memory_bytes: measured.memory_bytes,
                 note,
                 // Everything the machinery could do to it was handled above, so
                 // a failure this far down is the answer itself.
@@ -705,18 +721,79 @@ fn how_it_died(exit_code: i64) -> String {
     format!("Runtime error: {signal} (exit code {exit_code})")
 }
 
-fn failed(test: &aj_package::Test, time_ms: u64, note: &str, reason: Reason) -> TestOutcome {
+/// The deadline a test container is killed at — **not the limit**.
+///
+/// **Three times the limit and a second.** A limit is processor time, and the
+/// only thing this deadline exists for is reaping something that is not
+/// spending any: a program wedged in an uninterruptible syscall, or one that
+/// waits rather than computes. A program that *is* computing may legitimately
+/// spend rather more wall clock than processor time before it has used its
+/// limit — the container's own start alone is a few hundred milliseconds — so a
+/// deadline near the limit would reap correct solutions.
+///
+/// `saturating_mul` because nothing bounds `timeMs` above: `Config::validated`
+/// refuses zero and nothing else, so three times a large one wraps.
+fn reaping_deadline(time_ms: u64) -> Duration {
+    Duration::from_millis(time_ms.saturating_mul(3)) + Duration::from_secs(1)
+}
+
+/// What one test cost, where anything was run at all.
+///
+/// **One value for both numbers, because they are one reading.** They come out
+/// of one cgroup, after one run, or they come out of nothing — a signature that
+/// took them apart would let a caller pass a time from a run beside a memory
+/// from nowhere, which is how `failed` came to discard a measurement it had.
+#[derive(Debug, Clone, Copy)]
+struct Measured {
+    /// Processor time, user plus system, **rounded up to the millisecond**.
+    time_ms: u64,
+    memory_bytes: Option<u64>,
+}
+
+impl Measured {
+    /// **The one place a run becomes a number.**
+    ///
+    /// A run with no processor time is a machine fault rather than a
+    /// measurement: `Sandbox::preflight` refuses a host that cannot read
+    /// `cpu.stat` at all, so an absence here means the cgroup went away under
+    /// us. There is nothing to compare against a limit, and inventing one would
+    /// be a verdict about a participant made out of a broken judge.
+    fn of(run: &aj_sandbox::Outcome) -> Result<Self, String> {
+        let cpu = run.cpu_time.ok_or(
+            "produced no processor time. The cgroup this Runner started it under could \
+             not be read, and a time limit is decided on processor time",
+        )?;
+        Ok(Self {
+            // **Up, not down.** A run that did any work must not report none:
+            // zero is what a calibration then multiplies by three, and a
+            // `limits.timeMs` of zero is a limit the format refuses — so
+            // truncation would make calibration die on a fast model solution.
+            // It also keeps the number a participant reads identical to the one
+            // the verdict was made on.
+            time_ms: cpu.as_micros().div_ceil(1000) as u64,
+            memory_bytes: run.peak_memory_bytes,
+        })
+    }
+}
+
+/// **`None` only where nothing ran.** A test that was reaped, or that crashed,
+/// still has a reading — the cgroup is read after the container is gone and
+/// whatever stopped it — and this used to throw it away on the belief that
+/// nobody had measured it. A compilation error and a policy violation are the
+/// two callers for which that belief is true.
+fn failed(
+    test: &aj_package::Test,
+    measured: Option<Measured>,
+    note: &str,
+    reason: Reason,
+) -> TestOutcome {
     TestOutcome {
         name: test.name.clone(),
         group: test.group,
         status: Status::Error,
         percentage: 0,
-        time_ms,
-        // **Absent, not zero.** A test that was stopped, or never started,
-        // spent an amount of processor time nobody measured — and zero is a
-        // measurement rather than an absence.
-        memory_bytes: None,
-        cpu_ms: None,
+        time_ms: measured.map_or(0, |m| m.time_ms),
+        memory_bytes: measured.and_then(|m| m.memory_bytes),
         note: note.to_owned(),
         reason: Some(reason),
     }
@@ -752,7 +829,7 @@ fn policy_violation(job: &Job<'_>, language: &language::Language, listed: &[Stri
     let outcomes: Vec<TestOutcome> = job
         .tests
         .iter()
-        .map(|test| failed(test, 0, "Policy violation", Reason::PolicyViolation))
+        .map(|test| failed(test, None, "Policy violation", Reason::PolicyViolation))
         .collect();
 
     let judgement = judge(job.config, job.tests, &outcomes);
@@ -782,7 +859,7 @@ fn compilation_failed(job: &Job<'_>, language: &language::Language, log: &str) -
     let outcomes: Vec<TestOutcome> = job
         .tests
         .iter()
-        .map(|test| failed(test, 0, "Compilation error", Reason::CompilationError))
+        .map(|test| failed(test, None, "Compilation error", Reason::CompilationError))
         .collect();
 
     let judgement = judge(job.config, job.tests, &outcomes);
@@ -922,5 +999,97 @@ mod tests {
             inner.on_host.to_string_lossy().contains("repo"),
             "the daemon's view must not be replaced by this process's",
         );
+    }
+
+    /// **The deadline is not the limit, and nothing asserted that before.** It
+    /// was an inline expression at one call site, so a change to it would have
+    /// been caught by no test at all.
+    #[test]
+    fn the_reaping_deadline_is_three_times_the_limit_and_a_second() {
+        assert_eq!(reaping_deadline(1000), Duration::from_millis(4000));
+        assert_eq!(reaping_deadline(1), Duration::from_millis(1003));
+
+        // Nothing bounds `timeMs` above: `Config::validated` refuses zero and
+        // nothing else. Three times a large one has to saturate rather than
+        // wrap, because wrapping would produce a deadline of a few milliseconds
+        // and reap every correct solution to that problem.
+        assert!(reaping_deadline(u64::MAX) > Duration::from_secs(86_400));
+    }
+
+    /// **A run that did work must not report none.** Truncating would: a
+    /// program under a millisecond of processor time is ordinary for a test
+    /// that reads two integers, and zero is what a calibration then multiplies
+    /// by three to produce `limits.timeMs: 0` — which the format refuses. So
+    /// calibration would die on a fast model solution, which is exactly the
+    /// solution a package is calibrated from.
+    #[test]
+    fn a_run_that_did_work_never_reports_no_time() {
+        let measured = |micros: u64| {
+            Measured::of(&outcome_with(Some(Duration::from_micros(micros))))
+                .unwrap()
+                .time_ms
+        };
+
+        assert_eq!(measured(0), 0, "nothing spent is honestly nothing");
+        assert_eq!(measured(1), 1, "a microsecond of work is not no work");
+        assert_eq!(measured(1000), 1);
+        assert_eq!(measured(1001), 2);
+        assert_eq!(measured(4_056_000), 4056);
+    }
+
+    /// A verdict cannot be made without the number it is compared against, and
+    /// inventing one would be a judgement about a participant made out of a
+    /// broken judge.
+    #[test]
+    fn a_run_with_no_processor_time_is_not_a_verdict() {
+        let refused = Measured::of(&outcome_with(None)).unwrap_err();
+        assert!(
+            refused.contains("processor time"),
+            "the reason has to name what is missing: {refused}"
+        );
+    }
+
+    /// **The defect this signature exists to prevent.** `failed` used to
+    /// hard-code both numbers to nothing, on the stated belief that a stopped
+    /// test spent time nobody measured — false for the two callers that had a
+    /// run in hand, and true only for the two that never started one.
+    #[test]
+    fn a_test_that_ran_reports_what_it_cost_and_one_that_did_not_reports_nothing() {
+        let test = aj_package::Test {
+            name: "1a".into(),
+            group: 1,
+            letter: "a".into(),
+            input: PathBuf::from("1a.in"),
+            expected: PathBuf::from("1a.out"),
+        };
+
+        let ran = failed(
+            &test,
+            Some(Measured {
+                time_ms: 4056,
+                memory_bytes: Some(7_655_424),
+            }),
+            "Time limit exceeded",
+            Reason::TimeLimit,
+        );
+        assert_eq!(ran.time_ms, 4056);
+        assert_eq!(ran.memory_bytes, Some(7_655_424));
+
+        let never_ran = failed(&test, None, "Compilation error", Reason::CompilationError);
+        assert_eq!(never_ran.time_ms, 0, "nothing ran, so nothing was spent");
+        assert_eq!(never_ran.memory_bytes, None);
+    }
+
+    fn outcome_with(cpu_time: Option<Duration>) -> aj_sandbox::Outcome {
+        aj_sandbox::Outcome {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            wall_time: Duration::from_millis(1),
+            stopped: Stopped::OnItsOwn,
+            peak_memory_bytes: None,
+            cpu_time,
+            collected: None,
+        }
     }
 }

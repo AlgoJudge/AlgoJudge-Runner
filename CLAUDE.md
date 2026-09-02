@@ -267,9 +267,13 @@ introduced under the word "both" until 2026-08-31:
   bind mount is resolved by the daemon, so a path that is real to a
   containerised Runner and meaningless to the daemon produces an **empty
   directory** rather than an error — and tests then run against nothing.
-- `AJ_Sandbox__AllowCgroupV1` starts on a host the Runner would otherwise
-  refuse. Development only, and it says so at `ERROR` on every start; a quiet
-  override is a production setting waiting to happen.
+- `AJ_Sandbox__AllowUnmeasured` starts on a host the Runner would otherwise
+  refuse — cgroup v1, a driver that is not `cgroupfs`, or a cgroup tree it cannot
+  write to. **It does not make judging work.** A time limit is processor time
+  read from the run's own cgroup, so such a Runner registers, answers the
+  protocol and fails every job it claims; that is exactly what the conformance
+  suite needs. Development only, and it says so at `ERROR` on every start.
+  `AJ_Sandbox__AllowCgroupV1` is the old name, still honoured.
 
 Two things about the socket, both learned the hard way. Docker Desktop's socket
 is `root:root` mode **755** — writable only by root — so a non-root container

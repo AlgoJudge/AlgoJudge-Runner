@@ -68,12 +68,16 @@ async fn pipeline() -> Pipeline<Docker> {
     // Runner's that happens to be judging on the same host. Fixed rather than
     // per-run, so a previous run's leftovers are still swept.
     let docker = Docker::connect("test-judging").expect("a container runtime");
-    if let Err(e) = docker.preflight().await {
-        assert!(
-            std::env::var("AJ_SANDBOX_ALLOW_CGROUP_V1").is_ok(),
-            "{e}\n\nSet AJ_SANDBOX_ALLOW_CGROUP_V1=1 to judge on this host anyway.",
-        );
-    }
+    // **No override here, and there used to be one.** This suite judges, and a
+    // verdict is made of processor time read from the run's own cgroup — so
+    // continuing past a refused preflight would make every case below an
+    // infrastructure failure, and each would report that the evaluation failed
+    // rather than that the host cannot measure. Fail here, where the reason is.
+    docker.preflight().await.expect(
+        "this suite judges, and judging needs a host that can measure processor time: \
+         cgroup v2, the cgroupfs driver, and a writable cgroup tree. See \
+         docs/CGROUP_V2.md — ./x mounts it only with AJ_DOCKER_SOCKET=1",
+    );
     let images = Images::default();
     for image in images.all() {
         docker
@@ -411,9 +415,14 @@ async fn a_correct_cpp_solution_is_accepted_with_full_marks() {
     assert_eq!(document["type"], "standard-io@1");
     assert_eq!(document["compilation"]["status"], "OK");
     assert_eq!(document["tests"].as_array().unwrap().len(), 3);
+    // **Tightened when the quantity changed.** Under the wall clock this had to
+    // allow for the container's own start, some 374 ms on the machine it was
+    // written on, so it could only say "not the whole limit" and mean it. The
+    // number is processor time now, and an adding program spends milliseconds
+    // of it.
     assert!(
-        document["tests"][0]["timeMs"].as_u64().unwrap() < 2000,
-        "a trivial program should not have taken the whole limit",
+        document["tests"][0]["timeMs"].as_u64().unwrap() < 200,
+        "an adding program spends milliseconds of processor time: {document}",
     );
 }
 
@@ -440,10 +449,13 @@ async fn a_judged_solution_reports_what_memory_it_used() {
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
 
     // Bytes, like every memory figure in the product since 2026-08-09.
-    let Some(memory) = document["tests"][0]["memoryBytes"].as_u64() else {
-        eprintln!("memory was not measured: no writable cgroup root. Skipping.");
-        return;
-    };
+    // **No skip any more.** It used to return quietly where the host gave the
+    // Runner nowhere to measure from; `preflight` refuses such a host outright
+    // since 2026-09-02, so an absence here is the reporting having been dropped
+    // rather than the machine, and skipping would be a green test over nothing.
+    let memory = document["tests"][0]["memoryBytes"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("preflight passed, so the cgroup is readable: {document}"));
 
     // A container floor of roughly 2 MiB, plus whatever the program did. Bounds
     // rather than a value, because the point is that it is a real measurement
@@ -454,56 +466,112 @@ async fn a_judged_solution_reports_what_memory_it_used() {
     );
 }
 
-/// The processor time a solution spent reaches the result document too.
+/// **The one test that could not pass before 2026-09-02, in either direction.**
 ///
-/// **The wall clock is still what a limit is compared against**, and this is
-/// beside it rather than instead of it: the difference between the two is the
-/// container's own start and any waiting, which is exactly what a person
-/// looking at a tight limit wants to see separated.
+/// A limit is processor time. This program spends two seconds and burns none of
+/// it, so it is now well inside a one-second limit — and under the wall clock it
+/// reported about 2.4 s, the sleep plus the container's own start, and came back
+/// `Time limit exceeded`. The same source, the same limit, the opposite verdict.
 ///
-/// Read from the same `cpu.stat` as the peak, so it is absent on the same
-/// hosts — and this skips there rather than failing, as the memory test above
-/// does and for the same reason.
+/// **It also documents a real behaviour change rather than only proving one.**
+/// Waiting is free up to the reaping deadline, which is three times the limit
+/// and a second. Every judge that limits processor time works this way, and
+/// Codeforces gives it a verdict of its own — *Idleness limit exceeded* —
+/// precisely because it surprises people.
+///
+/// **How it waits is load-bearing.** `unistd.h` is a denied header, `<thread>`
+/// is denied and `std::this_thread` is a denied pattern, so `sleep`, `usleep`
+/// and `sleep_for` would all come back `PolicyViolation` and this test would
+/// pass on entirely the wrong thing. `nanosleep` is in `<ctime>`, which is not
+/// denied, and appears in no list at all. If the dictionary ever gains it the
+/// verdict becomes `PolicyViolation` and the assertion below fails loudly,
+/// which is the outcome to want.
 #[tokio::test]
 #[ignore = "needs a container runtime and the language images"]
-async fn a_judged_solution_reports_what_processor_time_it_used() {
-    let judged = verdict(judge("cpp-cpu", "cpp", CORRECT_CPP).await);
-    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+async fn a_program_that_waits_without_computing_is_inside_its_limit() {
+    let document = waited_for("waiting-inside", 1000, 2).await;
 
-    let wall = document["tests"][0]["timeMs"]
-        .as_u64()
-        .expect("the wall clock is always measured");
-
-    // **The skip is guarded by the other number from the same read.** Both come
-    // out of one `cpu.stat`/`memory.peak` pair in the run's own cgroup, so a
-    // host with nowhere to measure from reports neither. Memory present and
-    // processor time absent cannot be the host: it is the reporting having been
-    // dropped, and skipping there would be a green test over nothing.
-    let memory = document["tests"][0]["memoryBytes"].as_u64();
-    let cpu = match (memory, document["tests"][0]["cpuMs"].as_u64()) {
-        (None, None) => {
-            eprintln!("nothing was measured: no writable cgroup root. Skipping.");
-            return;
-        }
-        (Some(memory), None) => panic!(
-            "memory was measured ({memory} bytes) and processor time was not;              they are read from the same cgroup, so this is the field no longer              being reported rather than a host that cannot measure",
-        ),
-        (_, Some(cpu)) => cpu,
-    };
-
-    // **Bounded against the wall clock rather than against a constant.** A
-    // single-threaded program cannot spend more processor time than it spent
-    // waiting, and the gap between the two is the container's start — so this
-    // fails both on a fabricated number and on the wall clock being copied into
-    // the field by mistake.
+    assert_eq!(
+        document["score"], document["maxScore"],
+        "two seconds of waiting is no processor time, so this is a correct \
+         solution under a limit stated in processor time: {document}",
+    );
+    let spent = document["tests"][0]["timeMs"].as_u64().expect("a time");
     assert!(
-        cpu <= wall,
-        "one thread cannot burn more processor time than wall clock: {cpu} ms of {wall} ms",
+        spent < 200,
+        "the wall clock would have been about 2400 ms here — the sleep plus the \
+         container's start. {spent} ms says this is still measuring the wrong \
+         quantity: {document}",
+    );
+}
+
+/// The other side of the same rule, so neither half can drift alone.
+///
+/// Five seconds of waiting against a 300 ms limit passes the reaping deadline of
+/// 1.9 s, and a reaped program is `Time limit exceeded` — **the same verdict and
+/// the same `reason` as one that computed too long**, deliberately. The
+/// vocabulary is shared with the Client, the documentation and every package on
+/// disk, and a new word for this would be a cross-repository change to say
+/// something a participant does not need told apart.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_program_that_waits_past_the_backstop_is_still_a_time_limit() {
+    let document = waited_for("waiting-past", 300, 5).await;
+
+    assert_ne!(document["score"], document["maxScore"], "{document}");
+    assert_eq!(
+        document["tests"][0]["reason"], "timeLimit",
+        "reaped at the backstop, and it is a time limit like any other: {document}",
     );
     assert!(
-        cpu < wall,
-        "the container's own start is in the wall clock and not in the processor          time, so the two should differ: {cpu} ms of {wall} ms",
+        document["tests"][0]["note"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Time limit exceeded"),
+        "the note leads with the same words, and says which kind after: {document}",
     );
+}
+
+/// One package, one program, two limits — so the pair above differ in exactly
+/// the number under test.
+async fn waited_for(name: &str, limit_ms: u64, seconds: u64) -> serde_json::Value {
+    let config_yml = format!(
+        "type: \"standard-io@1\"\nlimits:\n  timeMs: {limit_ms}\n  memoryBytes: 268435456\n\
+         groups:\n  - group: 1\n    points: 100\n"
+    );
+
+    let pipeline = pipeline().await;
+    let (here, on_host) = fixture(name);
+    std::fs::create_dir_all(here.join("tests")).unwrap();
+    std::fs::write(here.join("config.yml"), &config_yml).unwrap();
+    std::fs::write(here.join("tests/1a.in"), "1 2\n").unwrap();
+    std::fs::write(here.join("tests/1a.out"), "3\n").unwrap();
+
+    let config = Config::parse(&config_yml).unwrap();
+    let tests = TestSet::read(&here, &config).unwrap();
+
+    let waiting = format!(
+        "#include <cstdio>\n#include <ctime>\nint main(){{long long a,b;\
+         if(scanf(\"%lld %lld\",&a,&b)!=2)return 1;\
+         timespec t{{{seconds},0}};nanosleep(&t,nullptr);\
+         printf(\"%lld\\n\",a+b);}}\n"
+    );
+
+    let judged = verdict(
+        pipeline
+            .evaluate(&Job {
+                config: &config,
+                tests: &tests,
+                language: "cpp",
+                file_name: "main.cpp",
+                source: waiting.as_bytes(),
+                package: Places { here, on_host },
+                work: work(name),
+            })
+            .await,
+    );
+
+    serde_json::from_slice(&judged.details.to_bytes()).unwrap()
 }
 
 // ── Every other outcome a participant can get ───────────────────────────────
@@ -867,6 +935,12 @@ async fn a_trial_measures_every_model_solution_per_group() {
 
     // A measurement of nothing is not a measurement. Every group that has tests
     // reports a time, and time is never zero for a program that actually ran.
+    //
+    // **This holds because the conversion rounds up.** Processor time is finer
+    // than a millisecond and a program that adds two numbers can spend less than
+    // one; truncating would put a zero here, and a zero is what the calibration
+    // rule then multiplies by three to produce `limits.timeMs: 0` — which the
+    // format refuses. So this assertion is also the guard on that.
     assert!(
         measured.measured.iter().all(|m| m.time_ms > 0),
         "a measured group with no time did not run: {:?}",
@@ -985,12 +1059,15 @@ groups:
 /// grace stopped on its own, was never reaped, and was marked correct: at a
 /// one-second limit, a program taking 1.9 s was `Accepted`.
 ///
-/// This one is given half a second and takes about eight tenths: comfortably
-/// over the limit, comfortably inside the grace, which is the window that used
-/// to be free.
+/// This one is given half a second of processor time and **spins** for about
+/// eight tenths — spinning rather than waiting, deliberately, because since
+/// 2026-09-02 the limit is processor time and waiting would not reach it. It is
+/// comfortably over the limit and comfortably inside the reaping deadline,
+/// which is 2.5 s here, so it stops on its own and the comparison is what
+/// catches it. That window is the one that used to be free.
 #[tokio::test]
 #[ignore = "needs a container runtime and the language images"]
-async fn overrunning_the_limit_inside_the_grace_is_still_a_time_limit() {
+async fn overrunning_the_limit_inside_the_backstop_is_still_a_time_limit() {
     const TIGHT: &str = r#"
 type: "standard-io@1"
 limits:
