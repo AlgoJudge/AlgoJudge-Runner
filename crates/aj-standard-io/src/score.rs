@@ -69,6 +69,13 @@ pub struct TestOutcome {
     pub percentage: u32,
     pub time_ms: u64,
     pub memory_bytes: Option<u64>,
+    /// Processor time, user plus system, from the same cgroup the peak comes
+    /// from. **Absent for the same reasons and never a substitute for
+    /// `time_ms`**: a limit is stated in what a participant waits through, and
+    /// this is what the machine spent. Shown beside the wall clock so the
+    /// difference between the two — the container's own start, and any waiting
+    /// — is visible rather than folded into one number.
+    pub cpu_ms: Option<u64>,
     /// Reaches the participant, and originates beside untrusted code.
     pub note: String,
     /// Absent on a test that passed. See [`Reason`].
@@ -270,6 +277,7 @@ groups:
             percentage,
             time_ms: 10,
             memory_bytes: None,
+            cpu_ms: None,
             note: String::new(),
             reason: (!status.passed()).then_some(Reason::WrongAnswer),
         }

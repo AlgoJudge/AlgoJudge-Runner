@@ -454,6 +454,58 @@ async fn a_judged_solution_reports_what_memory_it_used() {
     );
 }
 
+/// The processor time a solution spent reaches the result document too.
+///
+/// **The wall clock is still what a limit is compared against**, and this is
+/// beside it rather than instead of it: the difference between the two is the
+/// container's own start and any waiting, which is exactly what a person
+/// looking at a tight limit wants to see separated.
+///
+/// Read from the same `cpu.stat` as the peak, so it is absent on the same
+/// hosts — and this skips there rather than failing, as the memory test above
+/// does and for the same reason.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_judged_solution_reports_what_processor_time_it_used() {
+    let judged = verdict(judge("cpp-cpu", "cpp", CORRECT_CPP).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+
+    let wall = document["tests"][0]["timeMs"]
+        .as_u64()
+        .expect("the wall clock is always measured");
+
+    // **The skip is guarded by the other number from the same read.** Both come
+    // out of one `cpu.stat`/`memory.peak` pair in the run's own cgroup, so a
+    // host with nowhere to measure from reports neither. Memory present and
+    // processor time absent cannot be the host: it is the reporting having been
+    // dropped, and skipping there would be a green test over nothing.
+    let memory = document["tests"][0]["memoryBytes"].as_u64();
+    let cpu = match (memory, document["tests"][0]["cpuMs"].as_u64()) {
+        (None, None) => {
+            eprintln!("nothing was measured: no writable cgroup root. Skipping.");
+            return;
+        }
+        (Some(memory), None) => panic!(
+            "memory was measured ({memory} bytes) and processor time was not;              they are read from the same cgroup, so this is the field no longer              being reported rather than a host that cannot measure",
+        ),
+        (_, Some(cpu)) => cpu,
+    };
+
+    // **Bounded against the wall clock rather than against a constant.** A
+    // single-threaded program cannot spend more processor time than it spent
+    // waiting, and the gap between the two is the container's start — so this
+    // fails both on a fabricated number and on the wall clock being copied into
+    // the field by mistake.
+    assert!(
+        cpu <= wall,
+        "one thread cannot burn more processor time than wall clock: {cpu} ms of {wall} ms",
+    );
+    assert!(
+        cpu < wall,
+        "the container's own start is in the wall clock and not in the processor          time, so the two should differ: {cpu} ms of {wall} ms",
+    );
+}
+
 // ── Every other outcome a participant can get ───────────────────────────────
 
 /// Wrong on one test of one group. The group rule then takes that group to

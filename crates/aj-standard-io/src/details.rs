@@ -75,6 +75,10 @@ pub struct TestReport {
     pub time_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_bytes: Option<u64>,
+    /// Processor time, where the host let it be measured. **Absent rather than
+    /// zero**, as `memoryBytes` is and for the same reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_ms: Option<u64>,
     pub score: f64,
     pub max_score: f64,
     /// **Reaches the participant and originates beside untrusted code** — a
@@ -115,6 +119,7 @@ impl Details {
                     status: t.outcome.status,
                     time_ms: t.outcome.time_ms,
                     memory_bytes: t.outcome.memory_bytes,
+                    cpu_ms: t.outcome.cpu_ms,
                     score: t.score,
                     max_score: t.max_score,
                     note: t.outcome.note.clone(),
@@ -169,6 +174,7 @@ mod tests {
                     percentage: 100,
                     time_ms: 20,
                     memory_bytes: Some(12 * 1024 * 1024),
+                    cpu_ms: Some(18),
                     note: String::new(),
                     reason: None,
                 },
@@ -210,6 +216,14 @@ mod tests {
         );
         assert_eq!(json["tests"][0]["status"], "OK");
         assert_eq!(json["tests"][0]["note"], "");
+        assert_eq!(
+            json["tests"][0]["cpuMs"], 18,
+            "processor time is reported beside the wall clock, not instead of it"
+        );
+        assert_eq!(
+            json["tests"][0]["timeMs"], 20,
+            "and the wall clock is still what a limit is compared against"
+        );
     }
 
     #[test]
@@ -241,6 +255,32 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&details.to_bytes()).unwrap();
 
         assert!(json["tests"][0].get("memoryBytes").is_none());
+    }
+
+    /// **The same rule as memory, and it has the same reason.** A test that was
+    /// stopped, or that never started, spent an amount of processor time nobody
+    /// measured -- and a host with no writable cgroup measures none at all.
+    /// Zero would be a claim about a machine rather than a reading from one.
+    #[test]
+    fn processor_time_that_was_not_measured_is_absent() {
+        let mut judgement = judged();
+        judgement.tests[0].outcome.cpu_ms = None;
+
+        let details = Details::of(
+            &judgement,
+            Limits {
+                time_ms: 1,
+                memory_bytes: 1,
+            },
+            compiled(),
+        );
+        let json: serde_json::Value = serde_json::from_slice(&details.to_bytes()).unwrap();
+
+        assert!(json["tests"][0].get("cpuMs").is_none());
+        assert!(
+            json["tests"][0].get("timeMs").is_some(),
+            "the wall clock is always there; only the cgroup's numbers come and go"
+        );
     }
 
     #[test]
