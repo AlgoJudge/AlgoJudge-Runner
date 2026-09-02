@@ -67,15 +67,16 @@ pub struct TestOutcome {
     pub status: Status,
     /// 0–100. A checker's, or 100/0 where there is none.
     pub percentage: u32,
+    /// **Processor time**, user plus system, from the run's own cgroup, rounded
+    /// up to the millisecond — and the quantity a limit is compared against
+    /// since 2026-09-02.
+    ///
+    /// It was the wall clock until then, which charged a participant for the
+    /// container's own start and made a verdict a property of the host as much
+    /// as of the submission. The wall clock survives as a reaping deadline and
+    /// in the Runner's log; it is not reported and decides nothing.
     pub time_ms: u64,
     pub memory_bytes: Option<u64>,
-    /// Processor time, user plus system, from the same cgroup the peak comes
-    /// from. **Absent for the same reasons and never a substitute for
-    /// `time_ms`**: a limit is stated in what a participant waits through, and
-    /// this is what the machine spent. Shown beside the wall clock so the
-    /// difference between the two — the container's own start, and any waiting
-    /// — is visible rather than folded into one number.
-    pub cpu_ms: Option<u64>,
     /// Reaches the participant, and originates beside untrusted code.
     pub note: String,
     /// Absent on a test that passed. See [`Reason`].
@@ -277,7 +278,6 @@ groups:
             percentage,
             time_ms: 10,
             memory_bytes: None,
-            cpu_ms: None,
             note: String::new(),
             reason: (!status.passed()).then_some(Reason::WrongAnswer),
         }

@@ -47,12 +47,15 @@ services:
       RUST_LOG: info,aj_protocol=debug
       AJ_Work__Path: /var/lib/algojudge-runner/work
       AJ_Work__HostPath: ${PWD}/.runner-work-2
-      AJ_Sandbox__AllowCgroupV1: "1"
     volumes:
       - algojudge_runner_dev_identity_2:/var/lib/algojudge-runner
       - algojudge_runner_dev_cache:/var/cache/algojudge-runner
       - ${PWD}/.runner-work-2:/var/lib/algojudge-runner/work
       - /var/run/docker.sock:/var/run/docker.sock
+      # The same as the first Runner's, and for the same reason: a time limit is
+      # decided on processor time read from a cgroup this Runner makes.
+      - /sys/fs/cgroup:/sys/fs/cgroup
+    cgroup: host
 
 volumes:
   algojudge_runner_dev_identity_2:

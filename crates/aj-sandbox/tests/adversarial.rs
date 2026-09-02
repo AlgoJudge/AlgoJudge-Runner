@@ -117,6 +117,47 @@ async fn an_infinite_loop_is_killed_at_the_wall_clock() {
     assert_eq!(leftovers(&docker).await, 0);
 }
 
+/// **Waiting is not processor time, and the sandbox is where that is cheapest
+/// to prove.**
+///
+/// The pipeline decides a time limit on `cpu_time` and keeps `wall_clock` only
+/// as a deadline to reap something that is not computing. That rests on the two
+/// numbers being different things — obvious, and asserted nowhere until this.
+///
+/// Skipped rather than failed where there is nothing to read: this suite runs
+/// without a cgroup mount by design, because what it asserts is *enforcement*,
+/// which holds either way.
+#[tokio::test]
+#[ignore = "needs a container runtime and a writable cgroup mount"]
+async fn waiting_is_not_processor_time() {
+    let docker = sandbox().await;
+
+    let outcome = docker
+        .run(&shell("sleep 3").wall_clock(Duration::from_secs(10)))
+        .await
+        .expect("the run");
+
+    assert_eq!(
+        outcome.stopped,
+        Stopped::OnItsOwn,
+        "it slept and then stopped"
+    );
+    assert!(
+        outcome.wall_time >= Duration::from_secs(3),
+        "three seconds of sleeping took {:?} of wall clock",
+        outcome.wall_time,
+    );
+
+    let Some(cpu) = outcome.cpu_time else {
+        eprintln!("processor time was not measured: no writable cgroup root. Skipping.");
+        return;
+    };
+    assert!(
+        cpu < Duration::from_millis(500),
+        "sleeping spends no processor time, and this spent {cpu:?} of it",
+    );
+}
+
 // ── A2 — it multiplies ──────────────────────────────────────────────────────
 
 /// The pids limit, asserted directly rather than through a proxy.

@@ -49,10 +49,14 @@ pub struct Profile {
     /// wall-clock time that a single-threaded rule says they may not have.
     pub cpus: f64,
 
-    /// **The limit plus a grace, not the limit.** A program stuck in an
-    /// uninterruptible syscall has to be reaped by something outside it, and the
-    /// verdict a participant reads comes from the measured time rather than from
-    /// this deadline.
+    /// **A deadline to reap by, and not a limit anybody is judged against.**
+    ///
+    /// A time limit is processor time (2026-09-02), so nothing here decides a
+    /// verdict. What this catches is a program that is not *spending* processor
+    /// time — one wedged in an uninterruptible syscall, or one that waits rather
+    /// than computes — which a limit on the processor would never reach. The
+    /// pipeline sets it to three times the limit and a second; a computing
+    /// program stops long before it.
     pub wall_clock: Duration,
 
     pub max_output_bytes: u64,
@@ -75,10 +79,15 @@ pub struct Profile {
     ///
     /// **Capping CPU is not the same as pinning it.** `--cpus=1` limits how much
     /// CPU time a program may use per second; it does not stop two threads
-    /// running on two cores and finishing in half the wall-clock time. A problem
-    /// that states a one-second limit means one second of one core, and the
-    /// verdict a participant reads comes from the wall clock — so without this,
-    /// threads buy time the single-thread rule says they may not have.
+    /// running on two cores and finishing in half the wall-clock time.
+    ///
+    /// The threading hole this was introduced to close is now closed by the
+    /// accounting instead: `cpu.stat` sums the whole subtree, so two threads
+    /// spend twice the processor time and reach the limit twice as fast. **The
+    /// pin is kept for two other reasons.** It keeps a run reproducible rather
+    /// than a function of what else the host was doing; and it keeps processor
+    /// time close to wall clock, which is what makes a reaping deadline set as a
+    /// multiple of the limit mean anything.
     pub cpuset: Option<String>,
 
     /// Lets the container write to its **own** layer — never to the host.
@@ -211,7 +220,9 @@ impl Profile {
 pub enum Stopped {
     /// It finished on its own.
     OnItsOwn,
-    /// The wall-clock deadline passed.
+    /// The reaping deadline passed — see [`Profile::wall_clock`]. It is not the
+    /// time limit, and a program reaching it has usually spent the time waiting
+    /// rather than computing.
     WallClock,
     /// The kernel killed it at the memory limit.
     Memory,
@@ -242,9 +253,17 @@ pub struct Outcome {
     /// From `cpu.stat` in the same cgroup: user plus system, for the whole
     /// subtree.
     ///
-    /// **Not what decides a time limit.** That is still the wall clock, which
-    /// is what a participant experiences and what a limit is stated in. This is
-    /// for reporting and for calibration.
+    /// **What decides a time limit, since 2026-09-02.** It was the wall clock
+    /// until then — which charged a participant for the container's own start
+    /// and made a verdict as much a property of the host as of the submission,
+    /// and which was the one arrangement no other judge in this space used.
+    ///
+    /// **Still `Option` here, deliberately.** This layer measures and stays
+    /// honest about a host that gave it nowhere to measure from; it is
+    /// `aj-standard-io` that refuses to make a verdict without one, and
+    /// `Sandbox::preflight` that refuses to start such a Runner at all. Making
+    /// it required here would fail the adversarial suite, which runs without a
+    /// cgroup mount because what it asserts is enforcement.
     pub cpu_time: Option<Duration>,
 
     /// A tar archive of whatever `Profile::collect` named, if anything did.

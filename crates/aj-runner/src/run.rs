@@ -1178,7 +1178,7 @@ mod tests {
             work_path: "/dev/null".into(),
             work_host_path: "/dev/null".into(),
             images: aj_standard_io::Images::default(),
-            allow_cgroup_v1: false,
+            allow_unmeasured: false,
         }
     }
 

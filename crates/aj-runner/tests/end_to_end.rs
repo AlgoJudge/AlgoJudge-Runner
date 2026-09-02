@@ -1062,7 +1062,7 @@ fn probe_config() -> Config {
         work_host_path: scratch.join("work"),
         // Never used: nothing here evaluates anything.
         images: aj_standard_io::Images::default(),
-        allow_cgroup_v1: false,
+        allow_unmeasured: false,
     }
 }
 

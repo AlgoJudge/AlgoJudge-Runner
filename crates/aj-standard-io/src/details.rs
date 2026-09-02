@@ -72,13 +72,12 @@ pub struct TestReport {
     pub no: String,
     pub group: u32,
     pub status: Status,
+    /// **Processor time**, rounded up to the millisecond — the quantity a
+    /// limit is compared against. Always present: a run that produced none is
+    /// an infrastructure failure and never reaches this document.
     pub time_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_bytes: Option<u64>,
-    /// Processor time, where the host let it be measured. **Absent rather than
-    /// zero**, as `memoryBytes` is and for the same reason.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu_ms: Option<u64>,
     pub score: f64,
     pub max_score: f64,
     /// **Reaches the participant and originates beside untrusted code** — a
@@ -119,7 +118,6 @@ impl Details {
                     status: t.outcome.status,
                     time_ms: t.outcome.time_ms,
                     memory_bytes: t.outcome.memory_bytes,
-                    cpu_ms: t.outcome.cpu_ms,
                     score: t.score,
                     max_score: t.max_score,
                     note: t.outcome.note.clone(),
@@ -174,7 +172,6 @@ mod tests {
                     percentage: 100,
                     time_ms: 20,
                     memory_bytes: Some(12 * 1024 * 1024),
-                    cpu_ms: Some(18),
                     note: String::new(),
                     reason: None,
                 },
@@ -217,13 +214,19 @@ mod tests {
         assert_eq!(json["tests"][0]["status"], "OK");
         assert_eq!(json["tests"][0]["note"], "");
         assert_eq!(
-            json["tests"][0]["cpuMs"], 18,
-            "processor time is reported beside the wall clock, not instead of it"
-        );
-        assert_eq!(
             json["tests"][0]["timeMs"], 20,
-            "and the wall clock is still what a limit is compared against"
+            "processor time, and it is what a limit is compared against"
         );
+        // **Both directions.** `cpuMs` was a second field carrying the same
+        // quantity and is gone; `wallMs` was considered and deliberately never
+        // added, because the wall clock decides nothing and belongs in the
+        // Runner's log rather than in a participant's table. Either reappearing
+        // is a document that says two things about one number.
+        assert!(
+            json["tests"][0].get("cpuMs").is_none(),
+            "one time is reported, and timeMs is it"
+        );
+        assert!(json["tests"][0].get("wallMs").is_none());
     }
 
     #[test]
@@ -257,14 +260,17 @@ mod tests {
         assert!(json["tests"][0].get("memoryBytes").is_none());
     }
 
-    /// **The same rule as memory, and it has the same reason.** A test that was
-    /// stopped, or that never started, spent an amount of processor time nobody
-    /// measured -- and a host with no writable cgroup measures none at all.
-    /// Zero would be a claim about a machine rather than a reading from one.
+    /// **A time is always there, and memory still is not.**
+    ///
+    /// They used to come and go together, both out of one cgroup read. Since
+    /// 2026-09-02 a Runner that cannot read that cgroup refuses to start and a
+    /// run it somehow cannot measure is an infrastructure failure rather than a
+    /// verdict -- so a document that exists at all has a time in every row.
+    /// Memory keeps the old rule: it is absent on a test that never ran.
     #[test]
-    fn processor_time_that_was_not_measured_is_absent() {
+    fn every_test_reports_a_time_and_memory_still_comes_and_goes() {
         let mut judgement = judged();
-        judgement.tests[0].outcome.cpu_ms = None;
+        judgement.tests[0].outcome.memory_bytes = None;
 
         let details = Details::of(
             &judgement,
@@ -276,10 +282,10 @@ mod tests {
         );
         let json: serde_json::Value = serde_json::from_slice(&details.to_bytes()).unwrap();
 
-        assert!(json["tests"][0].get("cpuMs").is_none());
+        assert!(json["tests"][0].get("memoryBytes").is_none());
         assert!(
             json["tests"][0].get("timeMs").is_some(),
-            "the wall clock is always there; only the cgroup's numbers come and go"
+            "processor time decides the verdict, so a row without one is not a row"
         );
     }
 
