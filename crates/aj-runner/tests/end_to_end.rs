@@ -516,6 +516,71 @@ async fn a_runner_judges_every_outcome_a_participant_can_get() {
     assert_eq!(judged["score"], 0.0, "{judged}");
 }
 
+/// Two Runners on one cache volume judge a problem correctly, end to end.
+///
+/// **What this proves, and it is worth being exact.** The arrangement works: two
+/// containers, one cache volume, separate identities and work directories, a
+/// cold cache, six submissions of one problem — every one accepted. That is a
+/// regression test for the deployment shape, and it is the only test here that
+/// runs two real Runner processes at all.
+///
+/// **What it does not prove is the race.** Measured 2026-09-02: it passes just
+/// as happily with the temporary-name fix reverted. The committed package is
+/// **3309 bytes**, written in a single pass, so two writers never overlap on it
+/// — there is no window to lose. Both Runners did claim work and both did read
+/// the shared volume; the collision simply cannot happen at that size.
+///
+/// The race is proved in `aj_protocol::cache::tests`, by
+/// `two_runners_fetching_one_entry_leave_it_whole`, which forces the window by
+/// serving a body in halves and fails without the fix. Two processes were never
+/// what the race needed: `File::create` hands every caller its own descriptor
+/// with its own offset.
+#[tokio::test]
+#[ignore = "needs the development stack with two Runners sharing one cache"]
+async fn two_runners_sharing_one_cache_judge_the_same_problem_at_once() {
+    let admin = Session::as_("admin", "admin-development-only").await;
+    approve_the_runner(&admin).await;
+
+    // Otherwise this is the single-Runner test wearing a different name.
+    let listed = admin.get("/runners").await;
+    let approved = listed["items"]
+        .as_array()
+        .map(|items| items.iter().filter(|r| r["state"] == "approved").count())
+        .unwrap_or(0);
+    assert!(
+        approved >= 2,
+        "this test needs two approved Runners on one cache volume; saw {approved}",
+    );
+
+    let activity = publish(&admin, fixture("sum.zip")).await;
+
+    let participant = Session::as_("student", "student-development-only").await;
+    participant
+        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .await;
+    wait_until_open(&participant, &activity).await;
+
+    // Sent before any is settled, so both Runners claim while the entry is
+    // still missing from the volume they share.
+    const CORRECT: &str = "#include <iostream>
+int main(){long long a,b;std::cin>>a>>b;std::cout<<a+b;}
+";
+    let mut sent = Vec::new();
+    for _ in 0..6 {
+        sent.push(participant.submit(&activity, CORRECT, "cpp").await);
+    }
+
+    for submission in sent {
+        let judged = settled(&participant, &activity, &submission).await;
+        assert_eq!(
+            judged["state"], "completed",
+            "a submission did not complete; a `failed` here is the package the              cache handed over, not the program: {judged}",
+        );
+        assert_eq!(judged["verdict"], "Accepted", "{judged}");
+        assert_eq!(judged["score"], 100.0, "{judged}");
+    }
+}
+
 /// The sixth outcome, and the only one that is **not a verdict**.
 ///
 /// A package the Runner cannot open says nothing about the solution. The
