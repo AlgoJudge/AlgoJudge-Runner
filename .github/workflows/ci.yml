@@ -62,15 +62,26 @@ jobs:
           repository: AlgoJudge/AlgoJudge-Server
           path: algojudge-server
 
-      # The development compose sets `AJ_Sandbox__AllowCgroupV1`, which is only
-      # consulted when preflight fails — so on a v1 host the stack would start
-      # below specification and this job would pass while measuring nothing.
-      # Asserted rather than trusted.
+      # **The driver, not only the version — and this host has the wrong one.**
+      # A cgroup parent is a path under `cgroupfs`; under `systemd`, which is
+      # what a GitHub runner ships, it must be a slice, and `resolve_cgroup_root`
+      # gives up. So every run of this job so far has judged without measuring,
+      # and the two cases that assert a measurement have been taking their skip
+      # — invisibly, because a passing test's output is captured.
+      #
+      # Changing the driver is cheap and reversible: it is one daemon option and
+      # a restart, on a machine that is thrown away after the job.
+      - name: Make the daemon one this Runner can measure on
+        run: |
+          echo '{"exec-opts":["native.cgroupdriver=cgroupfs"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker info --format 'cgroup {{.CgroupVersion}} / {{.CgroupDriver}}, kernel {{.KernelVersion}}'
+
+      # Asserted rather than trusted, and both halves of it: the version has
+      # always been checked here, the driver never was.
       - name: Refuse to judge on a host that cannot measure
         run: |
-          version=$(docker info --format '{{.CgroupVersion}}')
-          echo "cgroup version $version"
-          test "$version" = "2"
+          test "$(docker info --format '{{.CgroupVersion}}/{{.CgroupDriver}}')" = "2/cgroupfs"
 
       - name: Bring up PostgreSQL, the Server and the Runner
         env:
@@ -158,8 +169,19 @@ jobs:
       - name: Check out
         uses: actions/checkout@v7
 
+      # Same reason as in `integration`, and here it is what the suite is for:
+      # `peak_memory_is_measured_and_is_the_programs_own` returns early where
+      # there is no reading, so under the `systemd` driver it has been passing
+      # while asserting nothing at all.
+      - name: Make the daemon one this Runner can measure on
+        run: |
+          echo '{"exec-opts":["native.cgroupdriver=cgroupfs"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+
       - name: Show what this host can enforce
-        run: docker info --format 'cgroup {{.CgroupVersion}} / {{.CgroupDriver}}, kernel {{.KernelVersion}}'
+        run: |
+          docker info --format 'cgroup {{.CgroupVersion}} / {{.CgroupDriver}}, kernel {{.KernelVersion}}'
+          test "$(docker info --format '{{.CgroupVersion}}/{{.CgroupDriver}}')" = "2/cgroupfs"
 
       - name: Run the adversarial suite
         env:
