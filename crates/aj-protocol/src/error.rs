@@ -61,6 +61,19 @@ pub enum Error {
     #[error("{0}")]
     Io(#[from] std::io::Error),
 
+    /// A cache entry was there when it was decided on and gone when it was
+    /// used.
+    ///
+    /// **Retryable, and that is the whole reason it exists.** Eviction runs on
+    /// every download and several Runners may share one cache volume, so an
+    /// entry can be decided on by one and evicted by another between the two
+    /// steps. Fetching it again is the correct and complete answer; the same
+    /// bytes are still on the Server. Reported as `Io` this was terminal — the
+    /// job landed in `Failed`, which needs a person and a rejudge to undo, for
+    /// a race that heals itself.
+    #[error("{what} was gone when it was used; it can be fetched again")]
+    Vanished { what: String },
+
     /// An I/O failure that names what it was touching.
     ///
     /// Added after a bare `Permission denied (os error 13)` sent somebody
@@ -172,6 +185,10 @@ impl Error {
             // falling through to the terminal arm exited the process into a
             // `restart: unless-stopped` loop that asked harder each time.
             Error::Refused { status, .. } => *status >= 500 || *status == 429,
+            // An entry that went away is the one filesystem outcome worth
+            // trying again: the bytes are still on the Server, and the Runner
+            // reached this point precisely because it wanted them.
+            Error::Vanished { .. } => true,
             _ => false,
         }
     }
@@ -230,6 +247,17 @@ mod tests {
         };
         assert!(!corrupt.unavailable());
         assert!(!corrupt.retryable());
+    }
+
+    #[test]
+    fn an_entry_that_went_away_is_worth_fetching_again() {
+        let vanished = Error::Vanished {
+            what: "the download of file f".into(),
+        };
+        assert!(
+            vanished.retryable(),
+            "this race heals itself; as `Io` it ended the job instead",
+        );
     }
 
     #[test]

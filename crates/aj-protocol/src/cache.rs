@@ -25,6 +25,14 @@ use crate::error::{Error, Result};
 /// Where a Runner says, on disk, which entries it is reading.
 const HOLDING: &str = "holding";
 
+/// What a download in progress is called, until `rename` publishes it.
+///
+/// The whole suffix is `.<instance>.partial`: the instance is in it so that two
+/// Runners sharing this volume never write to one file, and it is **appended**
+/// rather than substituted so that a file id containing a dot — which
+/// [`a_name`] allows — cannot produce the name of a different entry.
+const PARTIAL: &str = ".partial";
+
 pub struct Cache {
     root: PathBuf,
     max_bytes: u64,
@@ -114,6 +122,26 @@ impl Cache {
                 "cache entries held by a previous run were released"
             );
         }
+
+        // **Only this Runner's own.** A partial carrying another instance's name
+        // may be a download happening right now; ours cannot be, because we are
+        // starting. Eviction never removes these, so without this a Runner that
+        // was killed mid-download would leave the bytes occupying the budget
+        // until somebody noticed them.
+        let mine = format!(".{}{PARTIAL}", self.instance);
+        let mut abandoned = 0;
+        for (path, _, _) in self.entries() {
+            let ours = path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(&mine));
+            if ours && std::fs::remove_file(&path).is_ok() {
+                abandoned += 1;
+            }
+        }
+        if abandoned > 0 {
+            tracing::warn!(abandoned, "downloads left unfinished by a previous run were removed");
+        }
+
         cleared
     }
 
@@ -134,6 +162,27 @@ impl Cache {
     /// A download goes to a temporary name and is renamed into place **only
     /// after the checksum verifies**, so an entry is either complete and
     /// correct or absent. There is no third state for a later run to trip over.
+    /// Where this Runner writes an entry it is still downloading.
+    ///
+    /// **One name per Runner, appended, never substituted.** Two Runners sharing
+    /// a cache volume miss the same entry at the start of a contest and both
+    /// fetch it; under one name they wrote to one file through two truncating
+    /// descriptors. Nothing caught it: the checksum is computed from the stream
+    /// rather than read back (`Server::download_to`), so each verified its own
+    /// bytes while the file held both, and `rename` published the interleaved
+    /// result as a correct entry — which a later hit never re-checks.
+    ///
+    /// `with_extension` was the other half of it. [`a_name`] allows dots, so a
+    /// file id of `a.b` became `a.partial`, which is where the entry named `a`
+    /// would put its own.
+    fn partial_for(&self, path: &Path) -> PathBuf {
+        path.with_file_name(format!(
+            "{}.{}{PARTIAL}",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            self.instance,
+        ))
+    }
+
     pub async fn fetch(
         self: &Arc<Self>,
         server: &Server,
@@ -159,7 +208,7 @@ impl Cache {
             return Ok(entry);
         }
 
-        let temporary = path.with_extension("partial");
+        let temporary = self.partial_for(&path);
         let actual = server.download_to(file_id, &temporary).await?;
 
         if !actual.eq_ignore_ascii_case(sha256) {
@@ -173,7 +222,17 @@ impl Cache {
             });
         }
 
-        tokio::fs::rename(&temporary, &path).await?;
+        // Gone means the entry can be fetched again, not that this evaluation
+        // is over. See [`Error::Vanished`].
+        tokio::fs::rename(&temporary, &path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::Vanished {
+                    what: format!("the download of file {file_id}"),
+                }
+            } else {
+                Error::Io(e)
+            }
+        })?;
         // Wanted **now**, not at the first later hit. An entry with no marker
         // sorts as the epoch, so without this the package downloaded a moment
         // ago is the first thing evicted and every entry older than it survives
@@ -294,6 +353,22 @@ impl Cache {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            // **A download in progress cannot say it is being used.** Its
+            // holder took the hold under the file id, and this file is named
+            // for the id *and* the instance, so `held_by_anybody` looks in a
+            // directory that will never exist and answers no. Its size is
+            // already in `total` above — it is counted, just never chosen.
+            //
+            // Left in, it sorted *first*: `touch` runs only after `rename`, so
+            // a partial has no marker and `entries` dates it to the epoch. The
+            // least recently used entry out first meant the one being written
+            // right now.
+            //
+            // A partial nobody is writing is reclaimed by `sweep` at the next
+            // start of the Runner that left it.
+            if name.ends_with(PARTIAL) {
+                continue;
+            }
             if self.held_by_anybody(&name) {
                 continue;
             }
@@ -589,5 +664,76 @@ mod tests {
             paths[2].1.exists(),
             "an entry a job is reading is never evicted"
         );
+    }
+
+    #[test]
+    fn two_runners_do_not_write_to_one_temporary_file() {
+        let root = scratch("partial-name");
+        let ours = Cache::new(&root, 1 << 30, "runner-a");
+        let theirs = Cache::new(&root, 1 << 30, "runner-b");
+        let entry = ours.path_for(SHA, "a-file-id");
+
+        assert_ne!(
+            ours.partial_for(&entry),
+            theirs.partial_for(&entry),
+            "one temporary name between two Runners is one file between two writers",
+        );
+    }
+
+    #[test]
+    fn a_dotted_file_id_does_not_borrow_another_entrys_name() {
+        let cache = Cache::new(scratch("dotted"), 1 << 30, "test");
+
+        // `a_name` allows dots, so this is a file id the Server may send.
+        // Substituting the extension turned it into the neighbour's name.
+        let dotted = cache.partial_for(&cache.path_for(SHA, "a.b"));
+
+        assert_ne!(dotted, cache.path_for(SHA, "a"));
+        assert!(dotted.to_string_lossy().contains("a.b"));
+    }
+
+    #[test]
+    fn a_download_in_progress_is_not_evicted() {
+        let root = scratch("evict-partial");
+        let cache = Cache::new(&root, 150, "test");
+
+        let old = lying_there(&cache, "old", 100);
+        cache.touch(&old);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // The one being written right now, and the worst case: `touch` runs
+        // only after `rename`, so it carries no marker and `entries` dates it
+        // to the epoch — least recently used, first out.
+        let arriving = cache.partial_for(&cache.path_for(SHA, "arriving"));
+        std::fs::create_dir_all(arriving.parent().unwrap()).unwrap();
+        std::fs::write(&arriving, vec![0u8; 100]).unwrap();
+
+        cache.evict_to_fit();
+
+        assert!(
+            arriving.exists(),
+            "a download in progress is never a candidate",
+        );
+        assert!(!old.exists(), "and the eviction it was skipped by still ran");
+    }
+
+    #[test]
+    fn a_sweep_removes_this_runners_abandoned_download_and_leaves_another_runners() {
+        let root = scratch("sweep-partial");
+        let ours = Cache::new(&root, 1 << 30, "runner-a");
+        let theirs = Cache::new(&root, 1 << 30, "runner-b");
+
+        let entry = ours.path_for(SHA, "interrupted");
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        let mine = ours.partial_for(&entry);
+        let yours = theirs.partial_for(&entry);
+        std::fs::write(&mine, b"the first half").unwrap();
+        std::fs::write(&yours, b"the first half").unwrap();
+
+        // The restart.
+        Cache::new(&root, 1 << 30, "runner-a").sweep();
+
+        assert!(!mine.exists(), "its own unfinished download is cleared");
+        assert!(yours.exists(), "another Runner may be writing that one now");
     }
 }
