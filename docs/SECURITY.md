@@ -43,8 +43,8 @@ correctly.
 | `--user 65534:65534` | never root, even inside |
 | `--memory` **with `--memory-swap` equal** | without the second the limit means nothing: the process swaps instead of being killed |
 | `--pids-limit` | a fork bomb hits a wall |
-| `--cpus` **and `--cpuset-cpus`** | capping CPU is not pinning it; without a pinned core, threads buy wall-clock time the single-thread rule does not give them |
-| wall clock = the problem's limit **plus one second** | something outside the process has to reap one stuck in an uninterruptible syscall |
+| `--cpus` **and `--cpuset-cpus`** | capping CPU is not pinning it. The threading hole is closed by the accounting — `cpu.stat` sums the subtree — and the pin keeps a run reproducible and keeps processor time close to wall clock, which is what makes the deadline below mean anything |
+| wall clock = **three times the limit plus one second** | not a limit anybody is judged against: a time limit is processor time, so this reaps what is *not* spending any — one stuck in an uninterruptible syscall, or one that waits rather than computes |
 | an output cap enforced **while it runs** | read afterwards, a flooding program fills the host's disk first |
 
 **The tmpfs row was in this table until 2026-08-31 and did not belong**: no step
@@ -180,14 +180,22 @@ minimum a host has to satisfy** and how to check it; this section is the reason.
 
 **The limits are enforced on v1** — measured, not assumed: a container over its
 memory limit is OOM-killed there and `OOMKilled` is reported. What v1 cannot do
-is **measure honestly**: `memory.peak` and `cpu.stat` are v2 interfaces, and
-`isolate` 2.x dropped v1 outright. Those numbers are shown to a participant
-beside their verdict, and a number that is sometimes wrong is worse than no
-number.
+is **measure**: `memory.peak` and `cpu.stat` are v2 interfaces, and `isolate`
+2.x dropped v1 outright.
 
-`AJ_Sandbox__AllowCgroupV1` starts anyway, for a development machine whose
-Docker still reports v1. It is off by default and shouts at `ERROR` on every
-start, because a quiet override is a production setting waiting to happen.
+**Since 2026-09-02 that is a refusal to judge, not a missing number.** A time
+limit is decided on processor time read from `cpu.stat`, so the refusal now
+covers three conditions rather than one — cgroup v1, a daemon whose cgroup
+driver is not `cgroupfs`, and a cgroup tree the Runner cannot write to. The
+second and third used to give up with a single `info` line and judge anyway,
+which was defensible while the reading was only printed beside a verdict.
+
+`AJ_Sandbox__AllowUnmeasured` starts anyway — **and only starts**. Such a Runner
+registers and answers the protocol and then fails every job it claims with an
+infrastructure error, which is what a conformance suite needs and all it needs.
+It is off by default and shouts at `ERROR` on every start, because a quiet
+override is a production setting waiting to happen. `AJ_Sandbox__AllowCgroupV1`
+is the old name and is still honoured.
 
 ## 6. What is not here yet
 

@@ -147,11 +147,14 @@ this: what contains a submission, where the boundary is, and what the evaluation
 host is therefore assumed to be — no secrets on it, reproducible, nothing else
 running.
 
-**cgroup v2 is required and is checked at start.** The limits are enforced on v1
-too, but peak memory and CPU time cannot be read honestly there, and those
-numbers are shown to a participant beside their verdict.
-`AJ_Sandbox__AllowCgroupV1` starts anyway, for a development machine whose
-Docker still reports v1, and says so at `ERROR` on every start.
+**A host the Runner cannot measure on is refused at start**, and there are three
+ways to be one: cgroup v1, a daemon whose cgroup driver is not `cgroupfs`, and a
+cgroup tree the Runner cannot write to. The limits are enforced on all three —
+what is missing is the reading, and **a time limit is decided on processor time**
+read from `cpu.stat` in a cgroup the Runner makes for each run.
+
+`AJ_Sandbox__AllowUnmeasured` starts anyway and says so at `ERROR` on every
+start. It makes the process come up; it does not make it judge.
 
 ## Security requirements
 
