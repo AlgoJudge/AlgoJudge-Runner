@@ -1,0 +1,58 @@
+# A second Runner on the **same cache volume** as the first.
+#
+#     docker compose -f example-runner-development-docker-compose.yaml \
+#                    -f example-shared-cache-overlay.yaml up -d --build --wait
+#
+# **This is the arrangement `crates/aj-protocol/src/cache.rs` says it supports**
+# — several Runners on one host, one cache volume between them, which is the
+# saving an operator reaches for first. Nothing else in the suite can exercise
+# it: every unit test builds two `Cache` values inside one process, and one
+# process cannot produce two independent descriptors writing through each other.
+#
+# **The cache must be cold before a run that means anything.** A warm one turns
+# the exercise into "two Runners can read", which nobody doubted:
+#
+#     docker volume rm algojudge-runner-dev_algojudge_runner_dev_cache
+#
+# What is shared and what is not:
+#
+#   - `algojudge_runner_dev_cache`  — **shared**, the point of this file.
+#   - identity — **never**. The fingerprint of the identity key is the name in
+#     `holding/<fileId>/<instance>` and in the `algojudge.instance` label that
+#     `Docker::sweep()` kills containers by, so one key between two processes
+#     means each start releases the other's cache holds and kills its running
+#     compilations.
+#   - the work directory — **never**. An expired lease may be re-issued to the
+#     other Runner while the first is still working, and `Scratch::new` begins
+#     by removing `job-<that id>`.
+
+services:
+  runner-2:
+    build:
+      context: .
+    restart: unless-stopped
+    user: "0:0"
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      AJ_Server__BaseUrl: http://server:8080/api/v1
+      # Not unique in the Server's model — `Name` has no unique index and work
+      # is never routed by it — but two rows called the same thing in the panel
+      # is a person's problem, not the Server's.
+      AJ_Runner__Name: runner-dev-2
+      AJ_Runner__ProblemTypes: standard-io@1,output-only@1
+      AJ_Poll__MinSeconds: "1"
+      AJ_Poll__MaxSeconds: "5"
+      RUST_LOG: info,aj_protocol=debug
+      AJ_Work__Path: /var/lib/algojudge-runner/work
+      AJ_Work__HostPath: ${PWD}/.runner-work-2
+      AJ_Sandbox__AllowCgroupV1: "1"
+    volumes:
+      - algojudge_runner_dev_identity_2:/var/lib/algojudge-runner
+      - algojudge_runner_dev_cache:/var/cache/algojudge-runner
+      - ${PWD}/.runner-work-2:/var/lib/algojudge-runner/work
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  algojudge_runner_dev_identity_2:

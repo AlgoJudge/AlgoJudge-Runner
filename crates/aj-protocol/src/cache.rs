@@ -678,6 +678,107 @@ mod tests {
         );
     }
 
+    /// The same body to **two** callers, each in two halves with a pause between
+    /// them.
+    ///
+    /// The pause is the whole point: a three-kilobyte package is written in one
+    /// go, and two writers never overlap on it. A real package is not three
+    /// kilobytes, and the window this leaves is the one an operator's contest
+    /// leaves at nine in the morning.
+    async fn serving_twice_slowly(body: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = tokio::spawn(async move {
+            let mut served = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                served.push(tokio::spawn(async move {
+                    let mut request = [0u8; 2048];
+                    let _ = socket.read(&mut request).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
+                         Content-Type: application/octet-stream\r\n\r\n",
+                        body.len(),
+                    );
+                    // Write errors are ignored on purpose: whichever caller
+                    // finishes first may hang up while this half is still going
+                    // out, and a broken pipe here says nothing about the bytes
+                    // that did arrive. What the test judges is the file.
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let (first, second) = body.split_at(body.len() / 2);
+                    let _ = socket.write_all(first).await;
+                    let _ = socket.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let _ = socket.write_all(second).await;
+                    let _ = socket.flush().await;
+                }));
+            }
+            for one in served {
+                let _ = one.await;
+            }
+        });
+
+        (format!("http://127.0.0.1:{port}/api/v1"), handle)
+    }
+
+    /// Two Runners wanting one entry at the same moment leave it correct.
+    ///
+    /// **This is the race the arrangement exists to survive**, and the only test
+    /// that reproduces it. Two processes are not needed and never were:
+    /// `File::create` hands each caller its own descriptor with its own offset,
+    /// so two of them writing one path is the same mechanism whether they sit in
+    /// two containers or two tasks.
+    ///
+    /// Under one temporary name the second `create` truncates the file the first
+    /// is still writing, and the first then writes its tail at the offset it had
+    /// reached — leaving a hole where the head used to be. Neither notices: the
+    /// checksum is computed from the stream each of them received, not from the
+    /// bytes on disk, so both verify and `rename` publishes whichever finishes
+    /// last as a correct entry. Nothing re-reads it afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_runners_fetching_one_entry_leave_it_whole() {
+        use sha2::Digest as _;
+
+        static BODY: &[u8] = &[7u8; 64 * 1024];
+        let sha256 = hex::encode(sha2::Sha256::digest(BODY));
+
+        let root = scratch("interleave");
+        let (base, handle) = serving_twice_slowly(BODY).await;
+
+        let ours = Arc::new(Cache::new(&root, 1 << 30, "runner-a"));
+        let theirs = Arc::new(Cache::new(&root, 1 << 30, "runner-b"));
+        let to_us = Server::new(&base).unwrap();
+        let to_them = Server::new(&base).unwrap();
+
+        let (mine, yours) = tokio::join!(
+            ours.fetch(&to_us, "one-package", &sha256),
+            theirs.fetch(&to_them, "one-package", &sha256),
+        );
+        handle.abort();
+
+        let mine = mine.expect("this Runner's fetch");
+        let yours = yours.expect("the other Runner's fetch");
+
+        // The entry both of them now believe in.
+        let stored = std::fs::read(mine.path()).expect("the cached entry");
+        assert_eq!(
+            stored.len(),
+            BODY.len(),
+            "the entry is not the size of what was served",
+        );
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(&stored)),
+            sha256,
+            "the entry does not hash to the checksum it is filed under — two              writers went through one file and nothing re-reads a hit",
+        );
+
+        drop(mine);
+        drop(yours);
+    }
+
     #[test]
     fn two_runners_do_not_write_to_one_temporary_file() {
         let root = scratch("partial-name");
