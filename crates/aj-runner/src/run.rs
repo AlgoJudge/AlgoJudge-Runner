@@ -277,7 +277,7 @@ async fn run_trial(
                 trial = %trial.trial_id,
                 %e,
                 maintenance = e.in_maintenance(),
-                "the Server went away mid-trial; leaving it to the lease",
+                "left to the lease rather than failed; nothing was lost",
             );
             return;
         }
@@ -470,7 +470,7 @@ async fn evaluate(
                 submission = %job.submission_id,
                 %e,
                 maintenance = e.in_maintenance(),
-                "the Server went away mid-job; leaving it to the lease rather than failing it",
+                "left to the lease rather than failed; nothing was lost",
             );
             Finished::Abandon
         }

@@ -52,7 +52,10 @@ pub struct Cache {
     in_use: Mutex<HashMap<String, usize>>,
 }
 
-/// A cached file, held open for as long as somebody is using it.
+/// A cached file, held against eviction for as long as somebody is using it.
+///
+/// Against eviction, not open: this carries a path, so a reader that has not
+/// opened it yet is still racing anybody's `evict_to_fit`.
 ///
 /// The refcount is released by dropping this, so it is released on every path
 /// out of an evaluation including a panic — which is the only way to get that
@@ -139,14 +142,23 @@ impl Cache {
             }
         }
         if abandoned > 0 {
-            tracing::warn!(abandoned, "downloads left unfinished by a previous run were removed");
+            tracing::warn!(
+                abandoned,
+                "downloads left unfinished by a previous run were removed"
+            );
         }
 
         cleared
     }
 
-    /// `cache/ch/ec/ks/<fileId>` — the checksum decides the path, the id
-    /// decides the name, and **both must match** for an entry to be used.
+    /// `cache/ch/ec/ks/<fileId>` — the checksum chooses the shard, the id names
+    /// the entry.
+    ///
+    /// **Three bytes of the checksum, and the rest is not kept anywhere.** A hit
+    /// is `path.exists()` and nothing re-reads the bytes, so what an entry is
+    /// trusted on is the Server's promise that the bytes under one file id never
+    /// change — a corrected file is a new upload with a new id. Said plainly
+    /// here because it is a promise this Runner relies on and never checks.
     fn path_for(&self, sha256: &str, file_id: &str) -> PathBuf {
         let key = sha256.to_ascii_lowercase();
         let pair = |n: usize| key.get(n * 2..n * 2 + 2).unwrap_or("__");
@@ -714,7 +726,10 @@ mod tests {
             arriving.exists(),
             "a download in progress is never a candidate",
         );
-        assert!(!old.exists(), "and the eviction it was skipped by still ran");
+        assert!(
+            !old.exists(),
+            "and the eviction it was skipped by still ran"
+        );
     }
 
     #[test]
