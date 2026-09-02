@@ -133,6 +133,7 @@ pub fn mark(package: &Path, config: &Config, tests: &TestSet, answers: &Answers)
             // in a way it would not be for a program.
             time_ms: 0,
             memory_bytes: None,
+            cpu_ms: None,
             note: found.note(),
             // Nothing was run, so the only way to fail is the answer itself.
             reason: (!found.equal()).then_some(Reason::WrongAnswer),
@@ -152,6 +153,7 @@ fn missing(test: &aj_package::Test, why: &str) -> TestOutcome {
         percentage: 0,
         time_ms: 0,
         memory_bytes: None,
+        cpu_ms: None,
         note: why.to_owned(),
         // An answer that was never uploaded is an answer that is not right.
         // There is no run to have gone wrong in.

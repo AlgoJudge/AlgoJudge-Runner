@@ -523,6 +523,9 @@ impl<S: Sandbox> Pipeline<S> {
                 // make every calibrated limit too tight for the sake of a
                 // number nobody meets.
                 memory_bytes: run.peak_memory_bytes,
+                // Read from the same cgroup as the peak, so it is absent on the
+                // same hosts and for the same reason.
+                cpu_ms: run.cpu_time.map(|d| d.as_millis() as u64),
                 note,
                 // Everything the machinery could do to it was handled above, so
                 // a failure this far down is the answer itself.
@@ -709,7 +712,11 @@ fn failed(test: &aj_package::Test, time_ms: u64, note: &str, reason: Reason) -> 
         status: Status::Error,
         percentage: 0,
         time_ms,
+        // **Absent, not zero.** A test that was stopped, or never started,
+        // spent an amount of processor time nobody measured — and zero is a
+        // measurement rather than an absence.
         memory_bytes: None,
+        cpu_ms: None,
         note: note.to_owned(),
         reason: Some(reason),
     }
