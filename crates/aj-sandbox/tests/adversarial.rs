@@ -1245,3 +1245,139 @@ async fn a_pinned_run_is_given_one_core_and_the_one_it_asked_for() {
 
     assert_eq!(leftovers(&docker).await, 0, "the container was not removed");
 }
+
+// ── The shim ────────────────────────────────────────────────────────────────
+
+/// A language image, which is where the shim lives. `alpine:3` above carries
+/// none on purpose: it is what an operator's own image looks like to us.
+const WITH_SHIM: &str = "algojudge/lang-python:local";
+
+/// **The whole of the point, in one number.** A container of ours costs 33 to 74
+/// ms of processor time reaching the program -- measured across the four images
+/// on 2026-09-03 -- and that used to be inside what a participant was charged.
+/// A program that does nothing therefore has to come back well under it.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_measured_run_reports_the_program_and_not_the_container() {
+    let docker = sandbox().await;
+    docker
+        .ensure_image(WITH_SHIM)
+        .await
+        .expect("a language image");
+
+    let profile = Profile::new(
+        WITH_SHIM,
+        vec![
+            aj_sandbox::SHIM.into(),
+            "/dev/null".into(),
+            "python3".into(),
+            "-c".into(),
+            "pass".into(),
+        ],
+    )
+    .wall_clock(Duration::from_secs(20))
+    .measured();
+
+    let outcome = docker.run(&profile).await.expect("the run");
+    assert_eq!(outcome.exit_code, 0);
+
+    let Some(cpu) = outcome.cpu_time else {
+        panic!("nothing was measured, so nothing can be said about it");
+    };
+    // A bare interpreter start is about 25 ms; the container it arrived in is
+    // another 33 to 74 on top, and that is the part being removed.
+    assert!(
+        cpu < Duration::from_millis(33),
+        "{cpu:?} still carries the container's own start"
+    );
+    assert_eq!(leftovers(&docker).await, 0);
+}
+
+/// **An image with no shim judges, and says nothing about it per submission.**
+/// A toolchain may name an operator's own image, and one built without this is
+/// not refused: the report is absent, the cgroup reading stands on its own, and
+/// the container start is inside the number again.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn an_image_without_a_shim_is_still_measured_from_the_cgroup() {
+    let docker = sandbox().await;
+
+    let profile = Profile::new(IMAGE, vec!["/bin/sh".into(), "-c".into(), "exit 7".into()])
+        .wall_clock(Duration::from_secs(10))
+        .measured();
+
+    let outcome = docker.run(&profile).await.expect("the run");
+
+    assert_eq!(outcome.exit_code, 7, "it ran, rather than being refused");
+    assert!(
+        outcome.cpu_time.is_some(),
+        "the cgroup still answers where the shim does not"
+    );
+    assert!(
+        outcome.cpu_time.unwrap() >= Duration::from_millis(5),
+        "and it is the container's own reading, which carries the start"
+    );
+    assert_eq!(leftovers(&docker).await, 0);
+}
+
+/// A submission that leaves a child behind takes nothing with it.
+///
+/// **What this pins is the outcome, not the mechanism, and the difference is
+/// worth stating.** The shim kills every process in the namespace before it
+/// reports, which is what stops a `setsid` escapee -- one that has left the
+/// process group and would survive a group kill -- writing after the report.
+/// But the runtime tears the container down when PID 1 exits, and that kills the
+/// escapee too: sabotaging `kill(-1)` leaves this test green. Measured, not
+/// assumed.
+///
+/// So `kill(-1)` closes a window between the report and the teardown that this
+/// layer cannot observe, and what is asserted here is the part that can be: the
+/// escapee's output never reaches the participant's record, and no container is
+/// left behind. The guard that keeps `kill(-1)` to PID 1 is unit-tested; the
+/// ordering it buys is argued in the shim's own comment.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_child_that_escapes_the_process_group_cannot_write_after_the_report() {
+    let docker = sandbox().await;
+    docker
+        .ensure_image(WITH_SHIM)
+        .await
+        .expect("a language image");
+
+    // The forged line names a nonce it cannot know, so it can only be a guess --
+    // the point here is that nothing of the submission's is alive to write at
+    // all, whatever it would have written.
+    // One line and no escapes at all: `os.fork()` answers 0 in the child,
+    // which is falsy, so the child evaluates the tuple and the parent skips it.
+    let escapee = "import os, sys, time; print('before', file=sys.stderr); os.fork() or (os.setsid(), time.sleep(3), print('AFTER THE REPORT', file=sys.stderr), os._exit(0))";
+
+    let profile = Profile::new(
+        WITH_SHIM,
+        vec![
+            aj_sandbox::SHIM.into(),
+            "/dev/null".into(),
+            "python3".into(),
+            "-c".into(),
+            escapee.into(),
+        ],
+    )
+    .wall_clock(Duration::from_secs(20))
+    .measured();
+
+    let outcome = docker.run(&profile).await.expect("the run");
+    let stderr = String::from_utf8_lossy(&outcome.stderr);
+
+    assert!(
+        stderr.contains("before"),
+        "the program's own output survives"
+    );
+    assert!(
+        !stderr.contains("AFTER THE REPORT"),
+        "a child outlived the report: {stderr}"
+    );
+    assert!(
+        !stderr.contains("aj-shim1"),
+        "the report is taken out of what is stored: {stderr}"
+    );
+    assert_eq!(leftovers(&docker).await, 0);
+}

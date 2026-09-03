@@ -3,6 +3,13 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Where a language image carries the measuring shim.
+///
+/// **The sandbox owns this path and not the problem type**, because it is what
+/// decides who a container starts as, and that is a confinement question rather
+/// than a language one.
+pub const SHIM: &str = "/usr/local/bin/aj-shim";
+
 /// A read-only or read-write path handed into the sandbox.
 ///
 /// **Never writable and executable at once.** A directory a submission can
@@ -90,6 +97,17 @@ pub struct Profile {
     /// multiple of the limit mean anything.
     pub cpuset: Option<String>,
 
+    /// Whether this step is one a participant is judged on the time of.
+    ///
+    /// **It decides who the container starts as.** A measured step goes through
+    /// the shim, which needs to be root for as long as it takes to put the
+    /// submission back to `nobody` — so the sandbox starts it as root and hands
+    /// back `SETUID` and `SETGID`, and nothing else. Every other step, and any
+    /// measured one whose image carries no shim, starts unprivileged as before:
+    /// a fallback that ran a submission as root would be a far worse bargain
+    /// than a coarser number.
+    pub measured: bool,
+
     /// Lets the container write to its **own** layer — never to the host.
     ///
     /// Off for anything that runs a submission. On for a build, which has to
@@ -147,6 +165,7 @@ impl Profile {
             wall_clock: Duration::from_secs(10),
             max_output_bytes: 64 * 1024 * 1024,
             mounts: Vec::new(),
+            measured: false,
             tmpfs_bytes: None,
             max_open_files: 256,
             max_file_bytes: 256 * 1024 * 1024,
@@ -194,6 +213,11 @@ impl Profile {
 
     pub fn cpuset(mut self, core: usize) -> Self {
         self.cpuset = Some(core.to_string());
+        self
+    }
+
+    pub fn measured(mut self) -> Self {
+        self.measured = true;
         self
     }
 

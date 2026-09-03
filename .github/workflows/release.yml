@@ -95,10 +95,10 @@ jobs:
           )
 
           docker build "${labels[@]}" -t algojudge-runner:release .
-          docker build "${labels[@]}" -t lang-gcc:release    images/gcc
-          docker build "${labels[@]}" -t lang-clang:release  images/clang
-          docker build "${labels[@]}" -t lang-python:release images/python
-          docker build "${labels[@]}" -t lang-pypy:release   images/pypy
+          docker build "${labels[@]}" -t lang-gcc:release    -f images/gcc/Dockerfile images/
+          docker build "${labels[@]}" -t lang-clang:release  -f images/clang/Dockerfile images/
+          docker build "${labels[@]}" -t lang-python:release -f images/python/Dockerfile images/
+          docker build "${labels[@]}" -t lang-pypy:release   -f images/pypy/Dockerfile images/
 
       # **The Runner's image has no shell**, so there is exactly one thing that
       # can be run in it: the Runner. Started with no configuration it refuses

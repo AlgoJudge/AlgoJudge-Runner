@@ -416,6 +416,9 @@ impl<S: Sandbox> Pipeline<S> {
                     .memory_bytes(limits.memory_bytes)
                     .pids(16)
                     .cpuset(self.core())
+                    // The one step a participant is judged on the time of, and
+                    // so the one that goes through the shim.
+                    .measured()
                     .max_output_bytes(64 * 1024 * 1024)
                     .wall_clock(reaping_deadline(limits.time_ms))
                     .mount(Mount::read_only(&artefacts.on_host, PROGRAM))
@@ -931,6 +934,28 @@ mod tests {
     /// document *and* into the uploaded log. Both are documents somebody
     /// stores, and how long they are was chosen by whoever wrote the
     /// submission.
+    /// **One step is measured, and a test says which.** `Profile::measured` is
+    /// what makes a container start as root so the shim can drop out of it, so a
+    /// second one would hand privilege to a step nobody meant to -- a build,
+    /// which runs a compiler over a participant's source, or a checker. Neither
+    /// is judged on its processor time and neither has any business starting as
+    /// root.
+    ///
+    /// Read out of this file rather than asserted against a built profile,
+    /// because the profiles are assembled inline where they are used. The
+    /// `.env.example` guard in `aj-runner` reads its sources the same way.
+    #[test]
+    fn exactly_one_step_is_measured() {
+        let source = include_str!("pipeline.rs");
+        // Split so that this line is not itself one of the occurrences.
+        let marked = source.matches(concat!(".measu", "red()")).count();
+
+        assert_eq!(
+            marked, 1,
+            "{marked} steps are marked measured; each one starts as root where              the image has a shim, so a second needs a reason"
+        );
+    }
+
     #[test]
     fn a_participant_is_told_the_first_rules_and_how_many_were_left() {
         let shown = listed(&violations(250), 100);
