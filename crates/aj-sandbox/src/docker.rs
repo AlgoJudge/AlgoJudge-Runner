@@ -30,6 +30,7 @@ use bollard::query_parameters::{
 };
 use futures_util::StreamExt as _;
 
+use crate::cgroups::{self, Cgroups};
 use crate::profile::{Outcome, Profile, Stopped};
 use crate::{Error, Result, Sandbox};
 
@@ -50,35 +51,25 @@ pub struct Docker {
     /// Runner passes its key fingerprint, which is on disk and which the
     /// product already requires to be one Runner's alone.
     instance: String,
-    /// Where this Runner may create a cgroup of its own, if anywhere.
+    /// How this Runner measures processor time and peak memory here.
     ///
-    /// **This is how peak memory is measured, and there is no other way.**
-    /// Measured 2026-08-09: the runtime API does not report a peak on cgroup v2
-    /// — `memory_stats` carries `limit`, `usage` and the contents of
-    /// `memory.stat`, none of which is a maximum — and **a container's own
-    /// cgroup is destroyed the moment it exits**, so reading it afterwards
-    /// finds nothing.
+    /// **There is no other way to take either.** Measured 2026-08-09: the
+    /// runtime API does not report a peak on cgroup v2 — `memory_stats` carries
+    /// `limit`, `usage` and the contents of `memory.stat`, none of which is a
+    /// maximum — and **a container's own cgroup is destroyed the moment it
+    /// exits**, so reading it afterwards finds nothing.
     ///
-    /// So the Runner makes a cgroup, starts the container *under* it with
-    /// `--cgroup-parent`, and reads the parent after the child is gone. The
-    /// parent survives because it belongs to the Runner. One container per
-    /// test and a fresh parent per run mean the parent's peak is that
-    /// program's peak.
+    /// So the sandbox is started *under* a cgroup that outlives it, and that
+    /// cgroup is read once the child is gone. What it is depends on the
+    /// daemon's cgroup driver; [`crate::cgroups`] is both arrangements and the
+    /// reasons they differ.
     ///
-    /// `None` disables it, and **absent is the honest answer** rather than a
-    /// guess: `PACKAGE_FORMAT.md` says a Runner that cannot measure peak memory
-    /// reports nothing, and a number that is sometimes wrong is worse than no
-    /// number.
+    /// `None` means measurement is off, and **that must never stop a container
+    /// from starting**: the limits are applied by the runtime and hold either
+    /// way. Absent is then the honest answer rather than a guess.
     ///
-    /// Creating a directory in a mounted cgroup2 needs **write permission, not
-    /// a capability** — which is why this costs far less than the
-    /// `CAP_SYS_ADMIN` that `isolate` wanted for the same numbers (D-13).
-    ///
-    /// Resolved by [`Self::preflight`], because deciding it needs the daemon
-    /// (see there). Unset means measurement is off, and **that must never stop
-    /// a container from starting**: the limits are applied by the runtime and
-    /// hold either way.
-    cgroup_root: std::sync::OnceLock<Option<std::path::PathBuf>>,
+    /// Resolved by [`Self::preflight`], because deciding it needs the daemon.
+    cgroups: std::sync::OnceLock<Option<Cgroups>>,
 }
 
 impl Docker {
@@ -87,109 +78,14 @@ impl Docker {
         Ok(Self {
             client: bollard::Docker::connect_with_local_defaults()?,
             instance: instance.into(),
-            cgroup_root: std::sync::OnceLock::new(),
+            cgroups: std::sync::OnceLock::new(),
         })
     }
 
-    /// Where this Runner may make a cgroup — **and only under the `cgroupfs`
-    /// driver.**
-    ///
-    /// Under the `systemd` driver a cgroup parent is not a path: the daemon
-    /// refuses anything that is not a slice, with
-    /// `cgroup-parent for systemd cgroup should be a valid slice named as
-    /// "xxx.slice"`, and slices belong to systemd rather than to whoever calls
-    /// `mkdir`. Passing a path there does not degrade the measurement — it
-    /// **refuses the container**, which is why this is decided once, from what
-    /// the daemon reports, rather than assumed.
-    ///
-    /// Found by CI and not locally: this workstation runs `cgroupfs` and the
-    /// runner runs `systemd`, so every container in the adversarial suite failed
-    /// to start on a host the author never used.
-    fn resolve_cgroup_root(&self, driver: Option<String>) -> Result<std::path::PathBuf> {
-        let driver = driver.unwrap_or_default();
-        if driver != "cgroupfs" {
-            return Err(Error::Refused(format!(
-                "this host's cgroup driver is {driver:?}, and the Runner requires cgroupfs. \
-                 A cgroup parent is only a path under cgroupfs; under systemd it has to be a \
-                 slice, which belongs to systemd rather than to whoever calls mkdir. Without \
-                 a cgroup of its own this Runner cannot read cpu.stat, and a time limit is \
-                 decided on processor time. Set native.cgroupdriver=cgroupfs in \
-                 /etc/docker/daemon.json and restart the daemon"
-            )));
-        }
-
-        // **Empty is unset, and the trap this closes is not hypothetical.** This
-        // reads the variable directly rather than through `Config`, so it never
-        // had that filter: an empty value became `PathBuf::from("")`, joined to
-        // the relative path `algojudge`, which `create_dir_all` may well succeed
-        // at in the working directory — handing back a path the daemon resolves
-        // somewhere else entirely. The measurement then reads an empty directory
-        // rather than failing, which was survivable while it was optional and is
-        // not now that a verdict depends on it.
-        let root = std::env::var("AJ_Sandbox__CgroupRoot")
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "/sys/fs/cgroup".to_owned());
-        let root = std::path::PathBuf::from(root);
-        if !root.is_absolute() {
-            return Err(Error::Refused(format!(
-                "AJ_Sandbox__CgroupRoot is {}, which is not an absolute path. This Runner \
-                 writes through this path while the daemon resolves --cgroup-parent against \
-                 its own root, so a relative one names a directory the daemon has never \
-                 heard of, and the measurement would read an empty directory rather than fail",
-                root.display()
-            )));
-        }
-
-        let ours = root.join("algojudge");
-        std::fs::create_dir_all(&ours).map(|()| ours).map_err(|e| {
-            Error::Refused(format!(
-                "this Runner cannot create a cgroup under {}: {e}. A time limit is decided on \
-                 processor time, read from cpu.stat in a cgroup this Runner makes for each \
-                 run, so it cannot judge without one. Mount the host's cgroup tree writable \
-                 and share its namespace: --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup, \
-                 or in Compose `cgroup: host` on the service plus the same volume",
-                root.display()
-            ))
-        })
-    }
-
-    /// A cgroup for one run, and the path the daemon knows it by.
-    ///
-    /// Two views of one directory, for the same reason `Places` exists: the
-    /// daemon resolves `--cgroup-parent` against **its own** cgroup root, and
-    /// the Runner reads the file through whatever mount it was given. They
-    /// coincide when the host's hierarchy is mounted as-is, which is the
-    /// documented arrangement.
-    fn cgroup_for(&self, name: &str) -> Option<(std::path::PathBuf, String)> {
-        let root = self.cgroup_root.get()?.as_ref()?;
-        let ours = root.join(name);
-        std::fs::create_dir(&ours).ok()?;
-        Some((ours, format!("/algojudge/{name}")))
-    }
-
-    /// What the run cost, read from the cgroup the child has now left.
-    ///
-    /// Every field is optional and stays absent on anything unexpected. This is
-    /// measurement, not enforcement — the limits were applied by the runtime and
-    /// hold whether or not this succeeds.
-    fn measure(path: &std::path::Path) -> (Option<u64>, Option<std::time::Duration>) {
-        let peak = std::fs::read_to_string(path.join("memory.peak"))
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok());
-
-        // `usage_usec` is the whole subtree's CPU time, user plus system.
-        let cpu = std::fs::read_to_string(path.join("cpu.stat"))
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find_map(|line| line.strip_prefix("usage_usec "))
-                    .and_then(|v| v.trim().parse::<u64>().ok())
-            })
-            .map(std::time::Duration::from_micros);
-
-        (peak, cpu)
+    /// What [`Self::preflight`] decided, for a log and for a suite that has to
+    /// know which host it is on before it can assert anything about a number.
+    pub fn cgroups(&self) -> Option<&Cgroups> {
+        self.cgroups.get()?.as_ref()
     }
 
     /// Two labels: one saying a container is ours at all, one saying **whose**.
@@ -397,11 +293,8 @@ impl Sandbox for Docker {
         // the refusal below would then have to explain a second-order symptom
         // rather than the cause.
         if info.cgroup_version != Some(SystemInfoCgroupVersionEnum::_2) {
-            return Err(Error::Refused(format!(
-                "this host reports cgroup version {:?}, and the Runner requires v2. \
-                 The limits are enforced on v1, but a time limit is decided on processor \
-                 time read from cpu.stat, which is a v2 interface — so what cannot be done \
-                 here is reach a verdict at all",
+            return Err(cgroups::unsupported_version(&format!(
+                "{:?}",
                 info.cgroup_version
             )));
         }
@@ -413,11 +306,36 @@ impl Sandbox for Docker {
         // honest thing is to say so at start rather than to fail every job it
         // later claims.
         //
+        // **The driver chooses a backend rather than deciding this**, since
+        // 2026-09-03. Requiring `cgroupfs` meant requiring every systemd host to
+        // reconfigure its daemon before it could judge anything.
+        //
         // Cached because it needs the daemon's answer and cannot change while
         // the daemon is the same one.
-        let resolved = self.resolve_cgroup_root(info.cgroup_driver.map(|d| d.to_string()));
-        let _ = self.cgroup_root.set(resolved.as_ref().ok().cloned());
-        resolved.map(|_| ())
+        let driver = info
+            .cgroup_driver
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+        let decided = cgroups::root_from_environment()
+            .and_then(|root| Cgroups::resolve(&driver, root, &self.instance))
+            .and_then(|chosen| chosen.prepare().map(|()| chosen));
+
+        if let Ok(chosen) = &decided {
+            tracing::info!(
+                driver = chosen.driver(),
+                home = %chosen.home().display(),
+                "processor time and peak memory are read from here",
+            );
+            // Not a refusal: a verdict is made of processor time, which is
+            // unaffected. Said once, at start, because the alternative is a
+            // participant wondering why one installation prints a number and
+            // another does not.
+            if let Some(why) = chosen.without_peak_memory() {
+                tracing::warn!("peak memory will not be reported: {why}");
+            }
+        }
+        let _ = self.cgroups.set(decided.as_ref().ok().cloned());
+        decided.map(|_| ())
     }
 
     async fn run(&self, profile: &Profile) -> Result<Outcome> {
@@ -427,9 +345,14 @@ impl Sandbox for Docker {
             Instant::now().elapsed().as_nanos() as u64 ^ rand_suffix(),
         );
 
-        // Made before the container, because the container is started *into*
-        // it. Failure here is not an error: the run proceeds unmeasured.
-        let cgroup = self.cgroup_for(&name);
+        // Opened before the container, because the container is started *into*
+        // it and because under the systemd backend the reading is a difference
+        // that has to have a beginning. Failure here is not an error: the run
+        // proceeds unmeasured.
+        let cgroup = match self.cgroups() {
+            Some(cgroups) => cgroups.begin(&name).await,
+            None => None,
+        };
 
         let config = ContainerCreateBody {
             image: Some(profile.image.clone()),
@@ -443,32 +366,39 @@ impl Sandbox for Docker {
             attach_stderr: Some(true),
             network_disabled: Some(true),
             host_config: Some(
-                self.host_config(profile, cgroup.as_ref().map(|(_, daemon)| daemon.as_str())),
+                self.host_config(profile, cgroup.as_ref().map(|(_, parent)| parent.as_str())),
             ),
             ..Default::default()
         };
 
-        self.client
+        if let Err(e) = self
+            .client
             .create_container(
                 Some(CreateContainerOptionsBuilder::default().name(&name).build()),
                 config,
             )
-            .await?;
+            .await
+        {
+            // No container was made, so nothing will remove the cgroup that was
+            // opened for it — and under systemd nothing would release the gate.
+            if let Some((measuring, _)) = cgroup {
+                measuring.finish();
+            }
+            return Err(e.into());
+        }
 
         // From here on the container exists, so every path out removes it.
         let mut outcome = self.supervise(&name, profile).await;
         self.remove(&name).await;
 
-        // Read after the container is gone and before the directory is: the
-        // child's own cgroup must be removed before the parent can be, and the
-        // parent's peak is final the moment the child stops.
-        if let Some((here, _)) = &cgroup {
+        // Read after the container is gone: the child's own cgroup goes with it,
+        // and the numbers are final the moment the child stops.
+        if let Some((measuring, _)) = cgroup {
+            let (peak, cpu) = measuring.finish();
             if let Ok(outcome) = outcome.as_mut() {
-                let (peak, cpu) = Self::measure(here);
                 outcome.peak_memory_bytes = peak;
                 outcome.cpu_time = cpu;
             }
-            let _ = std::fs::remove_dir(here);
         }
         outcome
     }

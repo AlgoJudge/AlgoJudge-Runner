@@ -184,11 +184,26 @@ is **measure**: `memory.peak` and `cpu.stat` are v2 interfaces, and `isolate`
 2.x dropped v1 outright.
 
 **Since 2026-09-02 that is a refusal to judge, not a missing number.** A time
-limit is decided on processor time read from `cpu.stat`, so the refusal now
-covers three conditions rather than one — cgroup v1, a daemon whose cgroup
-driver is not `cgroupfs`, and a cgroup tree the Runner cannot write to. The
-second and third used to give up with a single `info` line and judge anyway,
-which was defensible while the reading was only printed beside a verdict.
+limit is decided on processor time read from `cpu.stat`, so the refusal covers
+three conditions rather than one — cgroup v1, a cgroup driver this Runner knows
+neither of, and a cgroup tree it cannot use. The second and third used to give
+up with a single `info` line and judge anyway, which was defensible while the
+reading was only printed beside a verdict.
+
+**The middle one narrowed on 2026-09-03**, when the Runner learned to measure
+under the `systemd` driver as well as `cgroupfs`. It had refused every systemd
+host, which is virtually every Linux server, and the cost of that was an
+operator editing `/etc/docker/daemon.json` and restarting the daemon before the
+product would judge anything.
+
+**Measuring at all needs the Runner's own container to run as root under
+`cgroupfs`, and only the peak-memory number needs it under `systemd`** — the
+tree's directories are root's, and `cgroupfs` is the backend that creates one.
+Running as root is a decision rather than a slip: the
+Runner holds the container runtime's socket, which is root-equivalent on the
+host by §1 of this document, so the uid inside its container was never the
+boundary. Nothing it *starts* gains anything by it — a job container still runs
+as `65534:65534` with every capability dropped.
 
 `AJ_Sandbox__AllowUnmeasured` starts anyway — **and only starts**. Such a Runner
 registers and answers the protocol and then fails every job it claims with an

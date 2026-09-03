@@ -75,8 +75,8 @@ async fn pipeline() -> Pipeline<Docker> {
     // rather than that the host cannot measure. Fail here, where the reason is.
     docker.preflight().await.expect(
         "this suite judges, and judging needs a host that can measure processor time: \
-         cgroup v2, the cgroupfs driver, and a writable cgroup tree. See \
-         docs/CGROUP_V2.md — ./x mounts it only with AJ_DOCKER_SOCKET=1",
+         cgroup v2, a cgroup driver this Runner knows — cgroupfs or systemd — and a tree it \
+         can use. See docs/CGROUP_V2.md — ./x mounts it only with AJ_DOCKER_SOCKET=1",
     );
     let images = Images::default();
     for image in images.all() {

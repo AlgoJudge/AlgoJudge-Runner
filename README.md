@@ -148,10 +148,18 @@ host is therefore assumed to be — no secrets on it, reproducible, nothing else
 running.
 
 **A host the Runner cannot measure on is refused at start**, and there are three
-ways to be one: cgroup v1, a daemon whose cgroup driver is not `cgroupfs`, and a
-cgroup tree the Runner cannot write to. The limits are enforced on all three —
-what is missing is the reading, and **a time limit is decided on processor time**
-read from `cpu.stat` in a cgroup the Runner makes for each run.
+ways to be one: cgroup v1, a cgroup driver the Runner knows neither of, and a
+cgroup tree it cannot use. The limits are enforced on all three — what is
+missing is the reading, and **a time limit is decided on processor time** read
+from `cpu.stat` in a cgroup the sandbox is started under.
+
+**Both cgroup drivers are supported**, `cgroupfs` and `systemd`, and the Runner
+chooses from what the daemon reports. Under `cgroupfs` it makes a cgroup per run
+and removes it; under `systemd` — the default on virtually every Linux server —
+systemd owns the cgroup, so the Runner keeps one slice for its whole life and
+takes each run's numbers as the change across it. Either way the container needs
+the host's cgroup tree mounted writable, `--cgroupns=host`, and to run as root.
+`docs/CGROUP_V2.md` compares them.
 
 `AJ_Sandbox__AllowUnmeasured` starts anyway and says so at `ERROR` on every
 start. It makes the process come up; it does not make it judge.

@@ -53,7 +53,11 @@ services:
       - ${PWD}/.runner-work-2:/var/lib/algojudge-runner/work
       - /var/run/docker.sock:/var/run/docker.sock
       # The same as the first Runner's, and for the same reason: a time limit is
-      # decided on processor time read from a cgroup this Runner makes.
+      # decided on processor time read from a cgroup. **Two Runners do not share
+      # one** — each measures under a cgroup named after its own key
+      # fingerprint, which matters most under the systemd driver, where the
+      # numbers are differences across one slice rather than readings of a fresh
+      # directory.
       - /sys/fs/cgroup:/sys/fs/cgroup
     cgroup: host
 
