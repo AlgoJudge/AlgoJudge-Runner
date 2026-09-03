@@ -502,7 +502,7 @@ impl Sandbox for Docker {
                 // charged more than it spent was charged by exactly one of them
                 // and the gap says which. The report is the program alone; the
                 // reading is the program plus the container it started in; and
-                // [`SHIM_ALLOWANCE`] is the constant standing in for that
+                // [`UNEXPLAINED_GAP`] is what a container may honestly cost
                 // container, measured on a host with nothing else to do. On a
                 // loaded one that constant is the likeliest thing to be wrong,
                 // and this line is how anybody would find out.
@@ -510,12 +510,26 @@ impl Sandbox for Docker {
                     container = name,
                     reported_us = said.cpu.as_micros() as u64,
                     cgroup_us = whole.map(|whole| whole.as_micros() as u64),
-                    allowance_us = SHIM_ALLOWANCE.as_micros() as u64,
+                    unexplained_gap_us = UNEXPLAINED_GAP.as_micros() as u64,
                     charged_us = charged.as_micros() as u64,
                     floored = charged > said.cpu,
                     "reconciled the program's own time with the container's",
                 );
 
+                if charged != said.cpu {
+                    // **Loud, because it is one of two things and both matter.**
+                    // Either this host's containers cost more than any measured
+                    // -- and correct programs are now being charged for them --
+                    // or a report was forged, which takes getting past the
+                    // nonce. Neither is a thing to find out from a verdict.
+                    tracing::warn!(
+                        container = name,
+                        reported_us = said.cpu.as_micros() as u64,
+                        cgroup_us = whole.map(|whole| whole.as_micros() as u64),
+                        charged_us = charged.as_micros() as u64,
+                        "the container's reading is too far above the program's own time to believe it",
+                    );
+                }
                 outcome.cpu_time = Some(charged);
                 // Memory needs no floor: understating it buys nothing, because
                 // the kernel and not this number decides the memory verdict. The
@@ -866,34 +880,50 @@ fn container_user(measured: bool, shim: bool) -> &'static str {
     }
 }
 
-/// A run's processor time, from the precise instrument and the trusted one.
+/// A run's processor time, from the precise instrument and the coarse one.
 ///
-/// **The cgroup is a floor and the report may only lift it.** The reading covers
-/// the whole container, so it is never less than the program's own cost; the
-/// report is the program alone but arrives through a channel the submission
-/// shares. Allowing the report to explain away at most [`SHIM_ALLOWANCE`] gives
-/// an honest run its exact figure -- the floor sits well below what it really
-/// spent -- and bounds what a forged one is worth to that same constant.
+/// **The report is charged, and the reading is used to disbelieve it.** The two
+/// measure different things: the report is the program alone, the reading is the
+/// program plus the container it started in. Their difference is therefore the
+/// container's own cost, and a rule that charges the larger of the two charges
+/// the participant for that difference whenever it exceeds whatever constant
+/// stands in for it.
+///
+/// **Measured, and that is why this is the way round it is.** Across 7077 runs
+/// under load, 2026-09-04, the difference ran to a median of 77 ms and a
+/// maximum of 619 ms -- so a 120 ms allowance charged 5% of honest runs for work
+/// they did not do, by up to half a second, and six correct submissions in a
+/// hundred and fifty were failed for it. Above [`UNEXPLAINED_GAP`] the reading
+/// is no longer explicable as a container start and the report is not believed;
+/// below it, the precise instrument wins outright.
 fn measured_time(reported: Duration, whole: Option<Duration>) -> Duration {
     match whole {
-        Some(whole) => reported.max(whole.saturating_sub(SHIM_ALLOWANCE)),
         None => reported,
+        Some(whole) if whole.saturating_sub(reported) <= UNEXPLAINED_GAP => reported,
+        // Not the report and not the reading: the reading less everything a
+        // container could honestly have cost, which is the least this run can
+        // be shown to have spent.
+        Some(whole) => whole.saturating_sub(UNEXPLAINED_GAP),
     }
 }
 
-/// The most a shim's report may take off the cgroup's reading.
+/// How far the container's reading may stand above the program's own report
+/// before the report stops being believable.
 ///
-/// **The report is precise and untrusted; the cgroup is coarse and cannot be
-/// reached from inside a container.** So the second is kept as a floor under the
-/// first: an honest run is corrected exactly, because the floor sits below what
-/// it really cost, and a forged one cannot claim less than the cgroup's total
-/// less this. The most a lie is worth is therefore this constant, which is what
-/// subtracting a blanket average would have given away in every direction at
-/// once.
+/// **What it costs and what it buys, both stated.** A submission that could
+/// forge a report may understate by up to this much and be believed. What that
+/// takes is the nonce, which is scrubbed from the environment before the fork
+/// and sits in a process owned by root while the submission runs as nobody --
+/// so a forgery is downstream of a privilege escalation inside the container,
+/// and this bounds the damage rather than being the defence.
 ///
-/// Above the worst container start measured on any of the four images -- 74 ms,
-/// 2026-09-03, under load -- with room for a slower host.
-const SHIM_ALLOWANCE: Duration = Duration::from_millis(120);
+/// Against that: **every value below the measured maximum fails honest runs.**
+/// The largest difference across 7077 runs under load was 619 ms, so anything
+/// tighter than that charges correct programs for their container. A second is
+/// above it with room for a host slower than the one measured, and still
+/// catches the cheating worth doing -- a program spending seconds past its
+/// limit, which is what a limit of 100 to 600 ms makes worth attempting.
+const UNEXPLAINED_GAP: Duration = Duration::from_secs(1);
 
 /// How often a run's processor time is looked at while it runs.
 ///
@@ -911,7 +941,7 @@ const REAP_POLL: Duration = Duration::from_millis(250);
 /// far outside anything a program inside its budget produces, and still stops a
 /// runaway in a fraction of the wall clock it used to take.
 fn cpu_ceiling(limit: Duration) -> Duration {
-    limit * 2 + SHIM_ALLOWANCE
+    limit * 2 + UNEXPLAINED_GAP
 }
 
 /// The longest a run may take however little processor time it spends.
@@ -1075,26 +1105,63 @@ mod tests {
         assert_eq!(time, Duration::from_micros(221_812));
     }
 
-    /// **The bound is the point.** Whatever a forged report claims, the answer
-    /// cannot fall below the cgroup's own reading less the allowance -- which is
-    /// the same amount subtracting a blanket average would have given away, and
-    /// no more.
+    /// **A gap no container could have cost is not believed.** Whatever the
+    /// report claims, the answer cannot then fall below the reading less
+    /// everything a container start could honestly account for.
     #[test]
-    fn a_forged_report_cannot_buy_more_than_the_allowance() {
-        let whole = Duration::from_millis(500);
+    fn a_report_the_reading_cannot_explain_is_not_believed() {
+        let whole = Duration::from_secs(5);
         for claimed in [0, 1, 10, 379] {
             let time = measured_time(Duration::from_millis(claimed), Some(whole));
-            assert_eq!(time, whole - SHIM_ALLOWANCE, "claiming {claimed} ms");
+            assert_eq!(time, whole - UNEXPLAINED_GAP, "claiming {claimed} ms");
         }
-        assert!(measured_time(Duration::ZERO, Some(whole)) >= whole - SHIM_ALLOWANCE);
     }
 
-    /// A run shorter than the allowance has nothing to subtract from, and a
-    /// floor below zero is zero rather than a panic.
+    /// **And the cost of that, said out loud rather than left to be discovered.**
+    /// A forged report inside the gap is charged as it stands. Nothing here
+    /// stops it; what stops it is the nonce, and this bounds what getting past
+    /// the nonce is worth.
     #[test]
-    fn a_run_shorter_than_the_allowance_keeps_what_the_shim_said() {
+    fn a_lie_smaller_than_a_containers_own_cost_is_charged_as_it_stands() {
+        let time = measured_time(Duration::ZERO, Some(Duration::from_millis(900)));
+        assert_eq!(time, Duration::ZERO);
+    }
+
+    /// A run shorter than the gap has nothing to subtract from, and a floor
+    /// below zero is zero rather than a panic.
+    #[test]
+    fn a_run_shorter_than_the_gap_keeps_what_the_shim_said() {
         let time = measured_time(Duration::from_millis(5), Some(Duration::from_millis(60)));
         assert_eq!(time, Duration::from_millis(5));
+    }
+
+    /// **The measured population, and none of it moves the charge.** These are
+    /// the percentiles of the difference between the two instruments across
+    /// 7077 runs under load, 2026-09-04: what a container cost on top of the
+    /// program, from the median to the worst single run. Every one of them is
+    /// explicable, so every one of them leaves the program charged with its own
+    /// time -- which under the previous rule it was not, for the 5% above
+    /// 120 ms.
+    #[test]
+    fn no_container_cost_ever_measured_moves_what_the_program_is_charged() {
+        let reported = Duration::from_millis(150);
+        for gap in [77u64, 98, 120, 219, 275, 476, 619] {
+            let whole = reported + Duration::from_millis(gap);
+            assert_eq!(
+                measured_time(reported, Some(whole)),
+                reported,
+                "a container costing {gap} ms",
+            );
+        }
+    }
+
+    /// The worst difference in the measured population, still believed. Below
+    /// this the constant would be failing honest runs again.
+    #[test]
+    fn the_largest_container_cost_ever_measured_is_still_explicable() {
+        let reported = Duration::from_millis(100);
+        let whole = reported + Duration::from_millis(619);
+        assert_eq!(measured_time(reported, Some(whole)), reported);
     }
 
     /// Nothing to floor it with: a host the Runner could not read a cgroup on
@@ -1324,13 +1391,25 @@ mod tests {
     }
 
     /// Plainly past its budget is stopped rather than left to run.
+    ///
+    /// **The ceiling carries the container's own cost too**, because the
+    /// reading it is compared against is the cgroup's: twice the limit plus
+    /// [`UNEXPLAINED_GAP`], so 1.4 s for a 200 ms limit. Anything tighter would
+    /// stop a correct program whose container was expensive -- the same mistake
+    /// the reconciliation above exists to avoid, made at the other end.
     #[test]
     fn a_runaway_is_stopped_well_past_its_limit() {
-        // Twice the limit and the shim's allowance: 520 ms for a 200 ms limit.
         assert_eq!(
-            timed().tick(ms(250), ms(250), Some(ms(521))),
+            timed().tick(ms(250), ms(250), Some(ms(1401))),
             Some(Stopped::TimeLimit)
         );
+    }
+
+    /// And the case that makes the ceiling generous: a program inside its limit
+    /// whose container cost the worst ever measured is nowhere near it.
+    #[test]
+    fn a_correct_program_in_an_expensive_container_is_not_stopped() {
+        assert_eq!(timed().tick(ms(250), ms(250), Some(ms(180 + 619))), None);
     }
 
     /// **And a program inside its budget is not**, which is the mistake that

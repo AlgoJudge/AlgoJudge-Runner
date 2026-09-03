@@ -8,12 +8,14 @@
  * instead, forks the submission, and reports `wait4`'s accounting for that one
  * child -- which is the program and nothing else, at microsecond resolution.
  *
- * **It is the precise instrument, not the trusted one.** The report travels out
- * on stderr, through a container the submission also lives in, so the Runner
- * treats it as untrusted and keeps the host-side cgroup reading as a floor
- * under whatever arrives. Three things nonetheless make a forged report hard:
- * the line carries a nonce the submission cannot read, this process kills every
- * other process in the namespace before writing, and it writes last.
+ * **It is the precise instrument, and it is what a participant is charged.**
+ * The report travels out on stderr, through a container the submission also
+ * lives in, so three things are what make a forged one hard: the line carries a
+ * nonce the submission cannot read, this process kills every other process in
+ * the namespace before writing, and it writes last. The Runner's cgroup reading
+ * is kept beside it to *disbelieve* a report the reading cannot account for --
+ * a container costs a program nothing it can be charged for, and measurement
+ * showed that charging the larger of the two failed correct submissions.
  *
  *   aj-shim <input-file> <program> [args...]
  *
