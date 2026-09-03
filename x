@@ -86,15 +86,19 @@ fi
 # take that privilege.
 if [ -n "${AJ_DOCKER_SOCKET:-}" ]; then
     SOCKET='-v /var/run/docker.sock:/var/run/docker.sock'
-    # And the cgroup hierarchy, **writable**, which is how peak memory is
-    # measured: the Runner makes a cgroup, starts the sandbox under it, and
-    # reads the parent after the child is gone — a container's own cgroup does
-    # not outlive it, and the runtime API reports no peak on v2.
+    # And the cgroup hierarchy, **writable**, which is how processor time and
+    # peak memory are measured: the sandbox is started under a cgroup that
+    # outlives it, and that cgroup is read after the child is gone — a
+    # container's own does not outlive it, and the runtime API reports no peak
+    # on v2. Writable serves both backends: under `cgroupfs` for the `mkdir`,
+    # under `systemd` for the `memory.peak` reset that makes a peak per-run.
+    #
+    # This container already runs as root, which both backends need for the same
+    # reason: the tree's directories are root's.
     #
     # `--cgroupns=host` matters as much as the mount. Without it this process
-    # sees its own cgroup as the root, and the path it creates is not the path
-    # the daemon resolves `--cgroup-parent` against — so the measurement would
-    # read an empty directory rather than fail.
+    # sees its own cgroup as the root, and the path it reads is not the path
+    # the daemon resolved `--cgroup-parent` against.
     #
     # Far cheaper than it looks: creating a directory in a mounted cgroup2 needs
     # write permission, not a capability.

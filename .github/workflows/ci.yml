@@ -47,8 +47,19 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # **Both cgroup drivers, because there are two measurement backends and no
+  # host can be both.** A cgroup parent is a path under `cgroupfs` and a slice
+  # under `systemd`; the Runner chooses from what the daemon reports, so a job
+  # pinned to one leaves the other unproven. Set explicitly on both legs rather
+  # than inherited, so a change to the image's default cannot silently drop one.
   integration:
+    name: integration (${{ matrix.driver }})
     runs-on: ubuntu-latest
+    strategy:
+      # One driver failing is exactly what the other leg cannot tell you.
+      fail-fast: false
+      matrix:
+        driver: [cgroupfs, systemd]
     steps:
       - name: Check out
         uses: actions/checkout@v7
@@ -62,26 +73,19 @@ jobs:
           repository: AlgoJudge/AlgoJudge-Server
           path: algojudge-server
 
-      # **The driver, not only the version — and this host has the wrong one.**
-      # A cgroup parent is a path under `cgroupfs`; under `systemd`, which is
-      # what a GitHub runner ships, it must be a slice, and `resolve_cgroup_root`
-      # gives up. So every run of this job so far has judged without measuring,
-      # and the two cases that assert a measurement have been taking their skip
-      # — invisibly, because a passing test's output is captured.
-      #
-      # Changing the driver is cheap and reversible: it is one daemon option and
-      # a restart, on a machine that is thrown away after the job.
-      - name: Make the daemon one this Runner can measure on
+      # One daemon option and a restart, on a machine thrown away after the job.
+      - name: Give the daemon the ${{ matrix.driver }} cgroup driver
         run: |
-          echo '{"exec-opts":["native.cgroupdriver=cgroupfs"]}' | sudo tee /etc/docker/daemon.json
+          echo '{"exec-opts":["native.cgroupdriver=${{ matrix.driver }}"]}' | sudo tee /etc/docker/daemon.json
           sudo systemctl restart docker
           docker info --format 'cgroup {{.CgroupVersion}} / {{.CgroupDriver}}, kernel {{.KernelVersion}}'
 
-      # Asserted rather than trusted, and both halves of it: the version has
-      # always been checked here, the driver never was.
-      - name: Refuse to judge on a host that cannot measure
+      # Asserted rather than trusted. A daemon that ignored the option above
+      # would leave this matrix testing one driver twice and reporting two
+      # passes — which is how the `systemd` backend went unexercised for a day.
+      - name: This host is the one this leg is about
         run: |
-          test "$(docker info --format '{{.CgroupVersion}}/{{.CgroupDriver}}')" = "2/cgroupfs"
+          test "$(docker info --format '{{.CgroupVersion}}/{{.CgroupDriver}}')" = "2/${{ matrix.driver }}"
 
       - name: Bring up PostgreSQL, the Server and the Runner
         env:
@@ -144,6 +148,30 @@ jobs:
           test -z "$(git status --porcelain)" || { git status --short; exit 1; }
           echo "the Server checkout is unchanged"
 
+      # **Asserted on the host, because a test cannot see what it left.** The
+      # Runner in this stack has judged a dozen submissions by now, and neither
+      # backend may have kept a cgroup for any of them.
+      #
+      # The shapes differ, and so does what is allowed to remain. Under
+      # `cgroupfs` the Runner's own directory stays and every run's is removed,
+      # so `algojudge/` must be empty. Under `systemd` one slice per Runner
+      # stays — that is the whole design, since a slice per run would be a
+      # systemd unit per run and nothing collects those — so the assertion is
+      # that no slice has anything *inside* it.
+      - name: No per-run cgroup was left behind
+        if: always()
+        run: |
+          case "${{ matrix.driver }}" in
+            cgroupfs) home=/sys/fs/cgroup/algojudge ;;
+            systemd)  home=/sys/fs/cgroup/algojudge.slice ;;
+          esac
+          if [ ! -d "$home" ]; then echo "$home was never created"; exit 0; fi
+          sudo find "$home" -mindepth 1 -maxdepth 2 -type d
+          test -z "$(sudo find "$home" -mindepth 2 -type d)"
+          case "${{ matrix.driver }}" in
+            cgroupfs) test -z "$(sudo find "$home" -mindepth 1 -maxdepth 1 -type d)" ;;
+          esac
+
       - name: What the Runner said
         if: always()
         run: >
@@ -162,26 +190,33 @@ jobs:
   # It runs here rather than only on a developer's machine because this host has
   # **cgroup v2**, which the Runner requires and which Docker Desktop may not
   # provide — the memory case is skipped without it, and skipping it locally is
-  # exactly why it has to be asserted somewhere.
+  # exactly why it has to be asserted somewhere. Since 2026-09-03 it also runs
+  # here because this host can be given **either** cgroup driver, which a
+  # workstation on Docker Desktop cannot: that Linux VM does not run systemd, so
+  # only one of the two measurement backends is reachable there.
   adversarial:
+    name: adversarial (${{ matrix.driver }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        driver: [cgroupfs, systemd]
     steps:
       - name: Check out
         uses: actions/checkout@v7
 
-      # Same reason as in `integration`, and here it is what the suite is for:
-      # `peak_memory_is_measured_and_is_the_programs_own` returns early where
-      # there is no reading, so under the `systemd` driver it has been passing
-      # while asserting nothing at all.
-      - name: Make the daemon one this Runner can measure on
+      - name: Give the daemon the ${{ matrix.driver }} cgroup driver
         run: |
-          echo '{"exec-opts":["native.cgroupdriver=cgroupfs"]}' | sudo tee /etc/docker/daemon.json
+          echo '{"exec-opts":["native.cgroupdriver=${{ matrix.driver }}"]}' | sudo tee /etc/docker/daemon.json
           sudo systemctl restart docker
 
+      # Both halves, because the measurement cases return early where there is
+      # nothing to read — so a leg on the wrong driver would pass while
+      # asserting nothing at all.
       - name: Show what this host can enforce
         run: |
           docker info --format 'cgroup {{.CgroupVersion}} / {{.CgroupDriver}}, kernel {{.KernelVersion}}'
-          test "$(docker info --format '{{.CgroupVersion}}/{{.CgroupDriver}}')" = "2/cgroupfs"
+          test "$(docker info --format '{{.CgroupVersion}}/{{.CgroupDriver}}')" = "2/${{ matrix.driver }}"
 
       - name: Run the adversarial suite
         env:
@@ -205,6 +240,22 @@ jobs:
         run: >
           ./x test -p aj-standard-io --test judging
           -- --include-ignored --test-threads=1
+
+      # The same assertion as in `integration`, and here the suite that judges
+      # has just run some fifty containers through one backend.
+      - name: No per-run cgroup was left behind
+        if: always()
+        run: |
+          case "${{ matrix.driver }}" in
+            cgroupfs) home=/sys/fs/cgroup/algojudge ;;
+            systemd)  home=/sys/fs/cgroup/algojudge.slice ;;
+          esac
+          if [ ! -d "$home" ]; then echo "$home was never created"; exit 0; fi
+          sudo find "$home" -mindepth 1 -maxdepth 2 -type d
+          test -z "$(sudo find "$home" -mindepth 2 -type d)"
+          case "${{ matrix.driver }}" in
+            cgroupfs) test -z "$(sudo find "$home" -mindepth 1 -maxdepth 1 -type d)" ;;
+          esac
 
       - name: Leave no sandboxes behind
         if: always()

@@ -102,13 +102,16 @@ services:
     build:
       context: .
     restart: unless-stopped
-    # Root **in its own container**, and only here.
+    # Root **in its own container**, and it is not only a development
+    # convenience any more.
     #
-    # The image runs as `nonroot`. Docker Desktop's socket is `root:root` mode
-    # 755 — world-readable, not world-writable — so there is no group to join
-    # and a non-root process simply cannot use it. On a Linux host the socket is
-    # `root:docker` mode 660 and the right answer is `group_add: [<docker gid>]`,
-    # which keeps the process unprivileged; **do that in production.**
+    # The image runs as `nonroot`. Two things need root here. Docker Desktop's
+    # socket is `root:root` mode 755 — world-readable, not world-writable — so
+    # there is no group to join and a non-root process simply cannot use it;
+    # `group_add: [<docker gid>]` is the answer on a Linux host. And **the
+    # cgroup tree's directories are root's**, so measuring needs it whichever
+    # backend is chosen: `mkdir` under `cgroupfs`, the `memory.peak` reset under
+    # `systemd`. `AlgoJudge-Ops` sets the same for the same reason.
     #
     # What this costs is smaller than it looks, and worth stating rather than
     # hiding: **anything that can reach that socket is root on the host**, so the
@@ -158,16 +161,17 @@ services:
       - algojudge_runner_dev_identity:/var/lib/algojudge-runner
       - algojudge_runner_dev_cache:/var/cache/algojudge-runner
       - ${PWD}/.runner-work:/var/lib/algojudge-runner/work
-      # **Writable, and judging needs it.** The Runner makes a cgroup of its
-      # own, starts each job container under it, and reads `memory.peak` and
-      # `cpu.stat` back once the child is gone — a container's own cgroup does
-      # not outlive it, and the runtime API reports no peak on v2. A time limit
-      # is compared against the processor time that read produces.
+      # **Writable, and judging needs it.** Each job container is started under
+      # a cgroup that outlives it, and `memory.peak` and `cpu.stat` are read
+      # back once the child is gone — a container's own cgroup does not outlive
+      # it, and the runtime API reports no peak on v2. A time limit is compared
+      # against the processor time that read produces.
       #
-      # `cgroup: host` below matters as much as the mount: without it this
-      # container sees its own cgroup as the root, and the path it creates is
-      # not the path the daemon resolves `--cgroup-parent` against, so the
-      # measurement would read an empty directory rather than fail.
+      # Which cgroup depends on the daemon's driver and the Runner decides it at
+      # start; writable serves both. `cgroup: host` below matters as much as the
+      # mount: without it this container sees its own cgroup as the root, and
+      # the path it reads is not the path the daemon resolved `--cgroup-parent`
+      # against.
       - /sys/fs/cgroup:/sys/fs/cgroup
       # The Runner is trusted and holds the socket; **nothing it starts ever
       # does**. Mounting it read-only would restrict nothing that matters — the

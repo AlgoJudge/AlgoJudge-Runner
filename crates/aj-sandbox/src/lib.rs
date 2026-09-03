@@ -14,9 +14,11 @@
 //! Nothing here understands a problem, a test or a verdict. It is handed a
 //! command and limits, and reports what happened.
 
+pub mod cgroups;
 pub mod docker;
 pub mod profile;
 
+pub use cgroups::Cgroups;
 pub use docker::Docker;
 pub use profile::{Mount, Outcome, Profile, Stopped};
 

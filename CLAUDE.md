@@ -268,12 +268,27 @@ introduced under the word "both" until 2026-08-31:
   containerised Runner and meaningless to the daemon produces an **empty
   directory** rather than an error — and tests then run against nothing.
 - `AJ_Sandbox__AllowUnmeasured` starts on a host the Runner would otherwise
-  refuse — cgroup v1, a driver that is not `cgroupfs`, or a cgroup tree it cannot
-  write to. **It does not make judging work.** A time limit is processor time
-  read from the run's own cgroup, so such a Runner registers, answers the
-  protocol and fails every job it claims; that is exactly what the conformance
-  suite needs. Development only, and it says so at `ERROR` on every start.
+  refuse — cgroup v1, a cgroup driver it knows neither of, or a cgroup tree it
+  cannot use. **It does not make judging work.** A time limit is processor time
+  read from a cgroup, so such a Runner registers, answers the protocol and fails
+  every job it claims; that is exactly what the conformance suite needs.
+  Development only, and it says so at `ERROR` on every start.
   `AJ_Sandbox__AllowCgroupV1` is the old name, still honoured.
+
+**Two measurement backends, chosen from the daemon's cgroup driver** (2026-09-03,
+`crates/aj-sandbox/src/cgroups.rs`). Under `cgroupfs` a cgroup parent is a path
+the Runner makes per run and removes; under `systemd` it is a **slice**, which
+belongs to systemd — so the Runner keeps **one** slice for its whole life and
+takes each run as the change across it, because a slice per run is a systemd
+unit per run and nothing ever collects those. Two consequences worth knowing
+before touching this:
+
+- **The container must run as root** under both, because the cgroup tree's
+  directories are root's. `docs/SECURITY.md` §5 has the argument.
+- **Peak memory under `systemd` needs Linux 6.8**, where `memory.peak` became
+  resettable — and the reset is *per file descriptor*, so the file is opened
+  before the run and read back through the same descriptor. Without it the
+  Runner still judges and says at start that the number is absent.
 
 Two things about the socket, both learned the hard way. Docker Desktop's socket
 is `root:root` mode **755** — writable only by root — so a non-root container

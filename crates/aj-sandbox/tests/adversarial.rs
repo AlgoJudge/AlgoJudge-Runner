@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use aj_sandbox::{Docker, Error, Mount, Profile, Sandbox, Stopped};
+use aj_sandbox::{Cgroups, Docker, Error, Mount, Profile, Sandbox, Stopped};
 
 const IMAGE: &str = "alpine:3";
 
@@ -43,15 +43,16 @@ async fn sandbox() -> Docker {
     // containers it found.
     let docker = Docker::connect(SUITE).expect("a container runtime");
 
-    // The Runner requires cgroup v2 and `preflight` refuses without it. That is
-    // the right behaviour and is **not relaxed here** — the escape hatch is in
-    // this harness, is opt-in, and says so on every run.
+    // The Runner refuses a host it cannot measure on — cgroup v1, a driver it
+    // knows neither of, or a tree it cannot use. That is the right behaviour and
+    // is **not relaxed here**: the escape hatch is in this harness, is opt-in,
+    // and says so on every run.
     //
     // It exists because a developer machine is often Docker Desktop, which may
     // still report v1, and the alternative is that the isolation suite is never
     // run outside CI. **Every case here passes on v1**, memory included — what
-    // v1 lacks is honest measurement of peak memory and CPU time, which is what
-    // the Runner refuses over and which nothing in this file asserts.
+    // v1 lacks is honest measurement, and the cases that assert one say below
+    // exactly when they may skip.
     if let Err(e) = docker.preflight().await {
         assert!(
             std::env::var("AJ_SANDBOX_ALLOW_CGROUP_V1").is_ok(),
@@ -124,9 +125,10 @@ async fn an_infinite_loop_is_killed_at_the_wall_clock() {
 /// as a deadline to reap something that is not computing. That rests on the two
 /// numbers being different things — obvious, and asserted nowhere until this.
 ///
-/// Skipped rather than failed where there is nothing to read: this suite runs
-/// without a cgroup mount by design, because what it asserts is *enforcement*,
-/// which holds either way.
+/// Skipped rather than failed only where preflight chose no backend: this suite
+/// runs without a cgroup mount by design, because what it asserts is
+/// *enforcement*, which holds either way. Where it chose one, an absent reading
+/// is this Runner failing to read a cgroup it was given.
 #[tokio::test]
 #[ignore = "needs a container runtime and a writable cgroup mount"]
 async fn waiting_is_not_processor_time() {
@@ -149,7 +151,13 @@ async fn waiting_is_not_processor_time() {
     );
 
     let Some(cpu) = outcome.cpu_time else {
-        eprintln!("processor time was not measured: no writable cgroup root. Skipping.");
+        assert!(
+            docker.cgroups().is_none(),
+            "preflight chose the {} backend, so a run that produced no processor time is this \
+             Runner failing to read a cgroup it was given — not a host without one",
+            docker.cgroups().map_or("?", aj_sandbox::Cgroups::driver),
+        );
+        eprintln!("processor time was not measured: nothing to read it from. Skipping.");
         return;
     };
     assert!(
@@ -207,9 +215,11 @@ async fn a_fork_bomb_cannot_outgrow_its_process_limit() {
 /// expected and it does not scale, so a generous ceiling still catches an error
 /// of kind rather than of degree.
 ///
-/// Skipped rather than failed where the Runner was given nowhere to measure
-/// from: `AJ_DOCKER_SOCKET=1` mounts the cgroup hierarchy, and without it the
-/// honest answer is `None` by design.
+/// Skipped rather than failed in exactly two cases, both of which say so at
+/// start: the Runner was given nowhere to measure from — `AJ_DOCKER_SOCKET=1`
+/// mounts the hierarchy, and without it `None` is the honest answer — or the
+/// host cannot reset `memory.peak`, which is the one thing the systemd backend
+/// can lose. Anywhere else an absent peak is a defect.
 #[tokio::test]
 #[ignore = "needs a container runtime and a writable cgroup mount"]
 async fn peak_memory_is_measured_and_is_the_programs_own() {
@@ -227,7 +237,19 @@ async fn peak_memory_is_measured_and_is_the_programs_own() {
         .expect("the run");
 
     let Some(peak) = outcome.peak_memory_bytes else {
-        eprintln!("peak memory was not measured: no writable cgroup root. Skipping.");
+        let why = docker
+            .cgroups()
+            .map(|c| c.without_peak_memory().unwrap_or_default());
+        assert!(
+            why.as_deref().is_none_or(|why| !why.is_empty()),
+            "preflight chose the {} backend and said peak memory was available, so an absent \
+             one here is this Runner failing to read a cgroup it was given",
+            docker.cgroups().map_or("?", aj_sandbox::Cgroups::driver),
+        );
+        eprintln!(
+            "peak memory was not measured: {}. Skipping.",
+            why.unwrap_or_default()
+        );
         return;
     };
 
@@ -245,6 +267,188 @@ async fn peak_memory_is_measured_and_is_the_programs_own() {
         "cpu.stat sits beside memory.peak in the same cgroup",
     );
     assert_eq!(leftovers(&docker).await, 0);
+}
+
+/// **A peak belongs to the run that set it**, and nothing older.
+///
+/// The memory case above proves a large allocation is seen; it cannot tell that
+/// apart from a mark left by an earlier run, because both are large. So this
+/// runs a small program straight after a large one and asserts the small number.
+///
+/// **Two ways the systemd backend can report somebody else's memory, and this
+/// catches both.** One slice serves every run there, so `memory.peak` is reset
+/// when a run begins — a write whose effect is invisible to a fresh reader, and
+/// removing it leaves every other measurement case passing. And a reset does
+/// not zero the mark: it sets it to the usage of the moment, which on a slice
+/// that has judged for a while is far from zero, because page cache charged to
+/// a container is **reparented to its parent** when that container dies. So the
+/// slice keeps file cache from every run it has hosted — 326 MB of it after 48
+/// submissions, measured 2026-09-03 with no processes left in the slice, which
+/// charged a program 106 MiB for using 7.6.
+///
+/// **The large run dirties a file on the daemon's own `/tmp`**, and every part
+/// of that is load-bearing. A tmpfs dies with the container and a writable
+/// layer is deleted with it, so both free their pages and neither reproduces
+/// anything. Reading a file the *test* wrote reproduces nothing either — a page
+/// is charged to whichever cgroup first brings it in, and those already belong
+/// to this process. And the workspace is no good as a target on a Windows
+/// workstation, where it is a `drvfs` mount that caches nothing this way. The
+/// daemon's own `/tmp` is native wherever the daemon is, which is the point:
+/// this path is resolved by the daemon and never by this process.
+///
+/// All three dead ends were measured rather than reasoned about, on 2026-09-03,
+/// by watching the slice's `memory.current` after each.
+#[tokio::test]
+#[ignore = "needs a container runtime and a writable cgroup mount"]
+async fn a_small_run_after_a_large_one_reports_its_own_peak() {
+    let docker = sandbox().await;
+    const SCRATCH: &str = "/tmp/algojudge-peak-residue";
+
+    docker
+        .run(
+            &shell("dd if=/dev/zero of=/out/block bs=1M count=64 2>/dev/null")
+                .memory_bytes(512 * 1024 * 1024)
+                .mount(Mount::writable(SCRATCH, "/out")),
+        )
+        .await
+        .expect("the large run");
+
+    let outcome = docker
+        .run(&shell("echo small").memory_bytes(512 * 1024 * 1024))
+        .await
+        .expect("the small run");
+
+    // Its own run, because a `Mount` is the only way this suite can reach the
+    // daemon's filesystem and the file must not outlive the case that made it.
+    docker
+        .run(&shell("rm -f /out/block").mount(Mount::writable(SCRATCH, "/out")))
+        .await
+        .expect("the tidying run");
+
+    let Some(peak) = outcome.peak_memory_bytes else {
+        eprintln!("peak memory is not measured on this host. Skipping.");
+        return;
+    };
+    assert!(
+        peak < 32 * 1024 * 1024,
+        "`echo` does not use {peak} bytes; that is the previous run's 64 MiB, either because          the mark was never reset or because the reset baselined on what the cgroup already held",
+    );
+    assert_eq!(leftovers(&docker).await, 0);
+}
+
+/// **A run adds no cgroup that outlives it**, whichever backend measured.
+///
+/// Under `cgroupfs` the run's directory is this Runner's from `mkdir` to
+/// `rmdir`. Under `systemd` a run creates no cgroup at all, and that is the
+/// point: a slice per run would be a systemd **unit** per run, and nothing
+/// collects those — two hundred cost 49 MB in pid 1, measured 2026-09-03.
+///
+/// **Before and after, and over the whole family rather than the home.** A
+/// return to one slice per run leaks *beside* the Runner's slice rather than
+/// inside it, which the first version of this test failed to notice when it was
+/// sabotaged into exactly that.
+#[tokio::test]
+#[ignore = "needs a container runtime and a writable cgroup mount"]
+async fn a_measured_run_leaves_no_cgroup_behind() {
+    let docker = sandbox().await;
+    let Some(cgroups) = docker.cgroups() else {
+        eprintln!("nothing to measure from on this host. Skipping.");
+        return;
+    };
+    let family = cgroups.family();
+    let before = cgroups_under(&family);
+
+    let outcome = docker.run(&shell("echo hi")).await.expect("the run");
+    assert!(
+        outcome.cpu_time.is_some(),
+        "the {} backend measured nothing",
+        cgroups.driver(),
+    );
+
+    let added: Vec<String> = cgroups_under(&family)
+        .into_iter()
+        .filter(|path| !before.contains(path))
+        .collect();
+    assert_eq!(
+        added,
+        Vec::<String>::new(),
+        "the run added these under {}, and nothing takes them away",
+        family.display()
+    );
+    assert_eq!(leftovers(&docker).await, 0);
+}
+
+/// The systemd backend end to end: **systemd made the slice this Runner named,
+/// and both numbers came out of it.**
+///
+/// Skipped where the daemon is not a systemd-driver one, and it says so rather
+/// than passing quietly. A workstation on Docker Desktop cannot be one — its
+/// Linux VM does not run systemd — so CI is the gate, and runs both drivers.
+#[tokio::test]
+#[ignore = "needs a container runtime with the systemd cgroup driver"]
+async fn the_systemd_backend_measures_from_a_slice_systemd_made() {
+    let docker = sandbox().await;
+    let Some(cgroups @ Cgroups::Systemd { .. }) = docker.cgroups() else {
+        eprintln!("this daemon does not use the systemd cgroup driver. Skipping — CI runs it.");
+        return;
+    };
+    let home = cgroups.home();
+
+    let outcome = docker
+        .run(
+            &shell("dd if=/dev/zero of=/tmp/block bs=1M count=64 2>/dev/null")
+                .memory_bytes(512 * 1024 * 1024)
+                .tmpfs_bytes(128 * 1024 * 1024),
+        )
+        .await
+        .expect("the run");
+
+    // This Runner creates nothing under systemd, so the slice being there at
+    // all is systemd having been asked for it and having made one.
+    assert!(
+        home.is_dir(),
+        "{} was never created, so no slice was ever started",
+        home.display(),
+    );
+    assert!(
+        outcome.cpu_time.is_some_and(|cpu| cpu > Duration::ZERO),
+        "writing 64 MiB spends processor time, and the slice reported {:?}",
+        outcome.cpu_time,
+    );
+    match (outcome.peak_memory_bytes, cgroups.without_peak_memory()) {
+        (Some(peak), _) => assert!(
+            (64 * 1024 * 1024..128 * 1024 * 1024).contains(&peak),
+            "64 MiB was written and the slice reports {peak} bytes",
+        ),
+        (None, Some(_)) => eprintln!("peak memory is not available on this host, as it said"),
+        (None, None) => panic!("the host can reset memory.peak and still reported no peak"),
+    }
+    assert_eq!(
+        cgroups_under(&home),
+        Vec::<String>::new(),
+        "the run left something inside {}",
+        home.display()
+    );
+    assert_eq!(leftovers(&docker).await, 0);
+}
+
+/// Every cgroup directory under one, at any depth.
+///
+/// Paths rather than a count, so a failure says what was left.
+fn cgroups_under(root: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut queue = vec![root.to_path_buf()];
+    while let Some(dir) = queue.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.push(path.to_string_lossy().into_owned());
+                queue.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 // ── A3 — it eats memory ─────────────────────────────────────────────────────

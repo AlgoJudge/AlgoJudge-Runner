@@ -243,12 +243,25 @@ mod tests {
             .filter(|piece| a_key(piece))
             .map(|piece| format!("AJ_{piece}"))
             .collect();
-        read.extend(
-            include_str!("../../aj-sandbox/src/docker.rs")
-                .split('"')
-                .filter(|piece| piece.starts_with("AJ_") && a_key(&piece[3..]))
-                .map(|piece| piece.to_owned()),
-        );
+        // **Every source file in the sandbox, found rather than listed.** It
+        // named `docker.rs` alone until 2026-09-03, when `AJ_Sandbox__CgroupRoot`
+        // moved into `cgroups.rs` and the scan reported it as listed in
+        // `.env.example` and read by nothing — a red gate on a variable nobody
+        // had touched.
+        let sandbox = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aj-sandbox/src");
+        for entry in std::fs::read_dir(&sandbox).expect("the sandbox crate's source") {
+            let file = entry.expect("a source file").path();
+            if file.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            read.extend(
+                std::fs::read_to_string(&file)
+                    .expect("a source file")
+                    .split('"')
+                    .filter(|piece| piece.starts_with("AJ_") && a_key(&piece[3..]))
+                    .map(str::to_owned),
+            );
+        }
 
         let listed: std::collections::BTreeSet<String> = include_str!("../../../.env.example")
             .lines()

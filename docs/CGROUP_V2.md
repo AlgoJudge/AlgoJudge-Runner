@@ -5,8 +5,10 @@
 > mark anybody's work.
 >
 > Measured 2026-08-09 on the development host described in
-> `../../docs/DEVELOPMENT_HOST.md`. `docs/SECURITY.md` §5 states the security
-> side of the same requirement; this document is the operational one.
+> `../../docs/DEVELOPMENT_HOST.md`, and again on 2026-09-03 for §5, where a
+> second measurement backend arrived and the numbers behind it are dated in
+> place. `docs/SECURITY.md` §5 states the security side of the same requirement;
+> this document is the operational one.
 
 ---
 
@@ -215,50 +217,112 @@ Two facts make the obvious approaches impossible, both measured on 2026-08-09:
 - **A container's own cgroup is destroyed when it exits.** After `docker wait`
   the directory is already gone, so there is no window to read it in.
 
-So the Runner **makes a cgroup of its own**, starts the sandbox under it with
-`--cgroup-parent`, and reads the parent once the child is gone. The parent
-survives because it belongs to the Runner; one container per test and a fresh
-parent per run mean the parent's peak is that program's peak.
+So the sandbox is started **under a cgroup that outlives it**, with
+`--cgroup-parent`, and that cgroup is read once the child is gone.
 
-**What this asks of a deployment**: the Runner needs the cgroup hierarchy
-mounted **writable**, and — when the Runner is itself in a container —
-`--cgroupns=host`, so that the path it creates is the path the daemon resolves
-`--cgroup-parent` against. Without the host namespace the Runner sees its own
-cgroup as the root and would read an empty directory rather than fail.
+**What that parent is depends on the daemon's cgroup driver, and the two
+arrangements are not variations of one.** The Runner reads the driver at start
+and chooses; `crates/aj-sandbox/src/cgroups.rs` is both, with the measurements
+that decided their shape.
+
+```
+docker info --format '{{.CgroupDriver}}'    # cgroupfs or systemd; both are supported
+```
+
+| | `cgroupfs` | `systemd` |
+|---|---|---|
+| Where it is the default | Docker Desktop | virtually every systemd Linux host — Docker's rule is `systemd` wherever cgroup v2 and systemd are both present |
+| Daemon reconfiguration | none | none |
+| What the daemon is told | a path, `/algojudge/<run>` | a slice name, `algojudge-<instance>.slice` |
+| Who creates the cgroup | the Runner, `mkdir` | systemd, when the daemon asks it |
+| How many | **one per run**, removed afterwards | **one per Runner**, for its whole life |
+| A run's processor time | `cpu.stat`'s `usage_usec`, read | the same, as the **difference** across the run |
+| A run's peak memory | `memory.peak`, read | `memory.peak` **reset** at the start of the run, **minus what the slice already held** |
+| To start and judge | a writable mount **and** root, to `mkdir` | a readable mount; nothing else |
+| To report a peak as well | the same | a writable mount, root, and **Linux 6.8** |
+| Without those | **refuses to start** | starts, judges, and says at `ERROR` that peak memory is absent |
+
+**Why one slice and not one per run.** Measured 2026-09-03 on WSL2, kernel 6.18:
+a slice systemd created for a container is **never collected**. It stays `loaded
+active active` indefinitely — twenty-nine hours in the case that settled it —
+and removing its directory does not release the unit. Two hundred of them cost
+49 MB in pid 1, so a slice per test would cost some 37 MB per submission,
+permanently. Nothing the Runner can reach takes them away; not asking for them
+does.
+
+That is what makes the systemd numbers differences rather than readings, and
+what makes **one run at a time** part of the arrangement rather than an
+accident. The Runner claims one job at a time and judges one test at a time, and
+a mutex holds the invariant so that a second caller would wait rather than
+quietly spoil both readings.
+
+**`memory.peak` is reset per file descriptor**, which is why the reset is not a
+one-line write: `echo > memory.peak` resets the mark only for the descriptor
+that wrote it, and a fresh `cat` still reports the cgroup's whole history. The
+Runner opens the file before the run, writes, and reads back through the same
+descriptor. The interface arrived in Linux **6.8**; before that the file is mode
+`0444` and the open fails, which is the one thing this backend can lose. A host
+in that position still judges — the verdict is processor time — and is told at
+start that the number beside it will be missing.
+
+**And a reset does not zero the mark — it sets it to the usage of the moment,
+which on a shared slice is not zero.** Page cache charged to a container is
+**reparented to the parent** when that container dies, so the slice accumulates
+file cache from every run it has hosted. Measured 2026-09-03, after the
+demonstration bundle's forty-eight submissions: **328 MB held with
+`cgroup.procs` empty, 326 MB of it `file`.** Read as it stands, the mark charged
+a program 106 MiB for using 7.6. So a run's peak is the mark **minus
+`memory.current` at the reset** — how far above what was already there it
+climbed.
+
+*This was shipped and then found by the end-to-end run rather than by a test,
+which is the honest order to record it in. The three obvious ways of reproducing
+it in a test all fail, and `a_small_run_after_a_large_one_reports_its_own_peak`
+says why: a tmpfs dies with its container, a writable layer is deleted with it,
+and a page the test itself faulted in is already charged to the test. What
+reproduces it is the sandbox dirtying a file on the daemon's own filesystem.*
+
+**What both ask of a deployment**: the cgroup hierarchy mounted **writable**,
+`--cgroupns=host` when the Runner is itself in a container, and a container
+running as **root**, because the tree's directories are root's.
+
+**The two backends do not need them equally, and it is worth knowing which.**
+Under `cgroupfs` the Runner creates a directory, so both are required to start
+at all. Under `systemd` it creates nothing and only reads, so it starts, judges
+and reports processor time from a read-only mount as an unprivileged user —
+measured on all four combinations, 2026-09-03, against the image this repository
+builds. What root and a writable mount buy there is the **peak-memory number**,
+and only that.
 
 ```
 --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup
 AJ_Sandbox__CgroupRoot      # defaults to /sys/fs/cgroup
 ```
 
-**And a third requirement, unstated here until 2026-08-31: the daemon's cgroup
-driver must be `cgroupfs`.** With `systemd`, the default on RHEL 9+, Fedora and
-Ubuntu, a cgroup parent is not a path at all.
-
-**All three are refusals since 2026-09-02, not degradations.** This used to give
-up with one `info` line and judge anyway, so an operator could satisfy every row
-of the table above, mount the hierarchy writable, pass `--cgroupns=host`, and
-still get nothing — with a single line to say so. That was defensible while the
-reading was only printed beside a verdict. A time limit is now decided on
-processor time read from `cpu.stat`, so a Runner that cannot read one cannot
-judge, and says so at start rather than failing every job it later claims.
-
-```
-docker info --format '{{.CgroupDriver}}'       # must print cgroupfs
-```
-
-This is how it was found, and the code records it: CI caught it and the
-workstation did not, because the workstation runs `cgroupfs` and the runner runs
-`systemd`, so every container in the adversarial suite failed to start on a host
-the author never used.
+Without the host namespace the Runner sees its own cgroup as the root, and the
+path it reads is not the path the daemon resolved `--cgroup-parent` against.
+That used to be an empty read rather than a failure; preflight now refuses a
+root whose `cgroup.controllers` it cannot read.
 
 **It costs write permission, not a capability.** Creating a directory in a
 mounted cgroup2 needs neither `CAP_SYS_ADMIN` nor privilege — which is the whole
 reason D-13 could decline `isolate` and keep the numbers.
 
-Where the mount is absent the Runner **refuses to start**. It was a supported
-configuration until 2026-09-02, when the reading stopped being a number beside a
-verdict and became the thing the verdict is made of.
+**These are refusals since 2026-09-02, not degradations.** The Runner used to
+give up with one `info` line and judge anyway, so an operator could satisfy
+every row of the table above and still get nothing, with a single line to say
+so. That was defensible while the reading was only printed beside a verdict. A
+time limit is now decided on processor time read from `cpu.stat`, so a Runner
+that cannot read one cannot judge, and says so at start rather than failing
+every job it later claims.
+
+*Requiring the `cgroupfs` driver was a refusal too, from 2026-08-31 to
+2026-09-03, and it was the expensive one: it meant every systemd host on earth
+had to edit `/etc/docker/daemon.json` and restart its daemon before it could
+judge anything. **Nothing here asks for that any more.** It was found the way
+such things are: CI caught it and the workstation did not, because the
+workstation runs `cgroupfs` and a GitHub runner runs `systemd`. CI now runs
+both, as a matrix, for the same reason.*
 
 ### The rule this implies for calibration
 
