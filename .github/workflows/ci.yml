@@ -218,19 +218,19 @@ jobs:
           docker info --format 'cgroup {{.CgroupVersion}} / {{.CgroupDriver}}, kernel {{.KernelVersion}}'
           test "$(docker info --format '{{.CgroupVersion}}/{{.CgroupDriver}}')" = "2/${{ matrix.driver }}"
 
-      - name: Run the adversarial suite
-        env:
-          AJ_DOCKER_SOCKET: "1"
-        run: >
-          ./x test -p aj-sandbox --test adversarial
-          -- --include-ignored --test-threads=1
-
       - name: Build the language images
         run: |
           docker build -t algojudge/lang-gcc:local    -f images/gcc/Dockerfile images/
           docker build -t algojudge/lang-clang:local  -f images/clang/Dockerfile images/
           docker build -t algojudge/lang-python:local -f images/python/Dockerfile images/
           docker build -t algojudge/lang-pypy:local   -f images/pypy/Dockerfile images/
+
+      - name: Run the adversarial suite
+        env:
+          AJ_DOCKER_SOCKET: "1"
+        run: >
+          ./x test -p aj-sandbox --test adversarial
+          -- --include-ignored --test-threads=1
 
       # The one that proves the whole thing: a submission goes in, a mark comes
       # out, and it is the right mark.
