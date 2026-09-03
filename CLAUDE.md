@@ -285,7 +285,7 @@ before touching this:
 
 - **The container must run as root** under both, because the cgroup tree's
   directories are root's. `docs/SECURITY.md` §5 has the argument.
-- **Peak memory under `systemd` needs Linux 6.8**, where `memory.peak` became
+- **Peak memory under `systemd` needs Linux 6.12**, where `memory.peak` became
   resettable — and the reset is *per file descriptor*, so the file is opened
   before the run and read back through the same descriptor. Without it the
   Runner still judges and says at start that the number is absent.

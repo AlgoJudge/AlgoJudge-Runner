@@ -219,28 +219,32 @@ impl Cgroups {
     ///
     /// Only the `systemd` backend can lose it: one slice serves every run, so a
     /// per-run peak needs `memory.peak` reset — a write to a root-owned file,
-    /// and a kernel interface that arrived in Linux 6.8. Processor time is
-    /// unaffected, so this is said at start rather than refused: every verdict
-    /// still stands, and only the number beside it is missing.
+    /// and a kernel interface that arrived in **Linux 6.12**, commit
+    /// `c6f53ed8f213`. Processor time is unaffected, so this is said at start
+    /// rather than refused: every verdict still stands, and only the number
+    /// beside it is missing.
+    ///
+    /// **The write is attempted and not merely the open**, because an open
+    /// tests a file mode rather than the interface. Before 6.12 the file is
+    /// expected to be read-only, and a host where that expectation is wrong
+    /// would be promised a number it cannot deliver. The write costs nothing:
+    /// the reset is per descriptor, and this descriptor is dropped.
     pub fn without_peak_memory(&self) -> Option<String> {
         let Self::Systemd { root, .. } = self else {
             return None;
         };
         let peak = own_cgroup(root)?.join("memory.peak");
-        std::fs::OpenOptions::new()
+        let attempt = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&peak)
-            .err()
-            .map(|e| {
-                format!(
-                    "{} cannot be opened for writing: {e}. Under the systemd cgroup driver one \
-                     slice serves every run, so a per-run peak is taken by resetting \
-                     memory.peak, which needs Linux 6.8 or later and a cgroup tree mounted \
-                     writable in a container running as root",
-                    peak.display()
-                )
-            })
+            .and_then(|mut file| file.write_all(b"0"));
+        attempt.err().map(|e| {
+            format!(
+                "{} cannot be reset: {e}. Under the systemd cgroup driver one slice serves                  every run, so a per-run peak is taken by resetting memory.peak, which needs                  Linux 6.12 or later and a cgroup tree mounted writable in a container running                  as root",
+                peak.display()
+            )
+        })
     }
 }
 
@@ -557,8 +561,9 @@ fn read_number(path: &Path) -> Option<u64> {
 ///
 /// Writing any non-empty string resets the high-water mark **for that
 /// descriptor only** — a fresh open still reports the cgroup's whole history —
-/// so the file has to be carried to the end of the run. Linux 6.8 and later;
-/// before that it is mode 0444 and this fails, which
+/// so the file has to be carried to the end of the run. **Linux 6.12 and
+/// later** — commit `c6f53ed8f213`, *"memcg: memory.swap and memory.peak write
+/// handlers"*; before that the file is read-only and this fails, which
 /// [`Cgroups::without_peak_memory`] reports at start.
 fn reset_peak(dir: &Path) -> Option<(std::fs::File, u64)> {
     let mut file = std::fs::OpenOptions::new()

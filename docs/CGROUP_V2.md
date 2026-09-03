@@ -40,12 +40,18 @@ every host v1. Test the content.
 | | Required | Why, and how to check |
 |---|---|---|
 | **Kernel** | cgroup v2 compiled in | `grep cgroup2 /proc/filesystems` |
-| **Kernel** | **≥ 5.19** for peak memory | `memory.peak` arrived in 5.19; without it the peak has to come from `getrusage`, which is one process's resident set rather than the peak of everything the submission started |
+| **Kernel** | **≥ 5.19** for peak memory *(inherited, unverified — see below)* | `memory.peak` arrived in 5.19; without it the peak has to come from `getrusage`, which is one process's resident set rather than the peak of everything the submission started |
 | **Hierarchy** | **unified, not hybrid** | `cat /sys/fs/cgroup/cgroup.controllers` must be non-empty. A controller lives in **exactly one** hierarchy: if v1 holds it, a v2 mount is real and carries nothing |
 | **Controllers** | `cpu`, `cpuset`, `memory`, `pids` | one per limit the sandbox sets — `--cpus`, `--cpuset-cpus`, `--memory`, `--pids-limit`. A missing controller does not error; the limit is simply not applied |
 | **Delegation** | the controllers switched on for children | `cat /sys/fs/cgroup/cgroup.subtree_control` must list them. A controller present at the root and absent from `subtree_control` reaches no container |
 | **Docker** | ≥ 20.10 | earlier versions have no cgroup v2 support at all |
 | **Swap** | accounted, or absent | see §4 |
+
+*The **5.19** in the row above predates this document's checks and could not be
+confirmed against the kernel's own summaries on 2026-09-03. It is left as it was
+rather than replaced with a second guess; the command in §1 and the Runner's own
+refusal are what an operator should go by, and both are facts about the host
+rather than about a version number.*
 
 ### Distributions
 
@@ -239,7 +245,7 @@ docker info --format '{{.CgroupDriver}}'    # cgroupfs or systemd; both are supp
 | A run's processor time | `cpu.stat`'s `usage_usec`, read | the same, as the **difference** across the run |
 | A run's peak memory | `memory.peak`, read | `memory.peak` **reset** at the start of the run, **minus what the slice already held** |
 | To start and judge | a writable mount **and** root, to `mkdir` | a readable mount; nothing else |
-| To report a peak as well | the same | a writable mount, root, and **Linux 6.8** |
+| To report a peak as well | the same | a writable mount, root, and **Linux 6.12** |
 | Without those | **refuses to start** | starts, judges, and says at `ERROR` that peak memory is absent |
 
 **Why one slice and not one per run.** Measured 2026-09-03 on WSL2, kernel 6.18:
@@ -260,10 +266,19 @@ quietly spoil both readings.
 one-line write: `echo > memory.peak` resets the mark only for the descriptor
 that wrote it, and a fresh `cat` still reports the cgroup's whole history. The
 Runner opens the file before the run, writes, and reads back through the same
-descriptor. The interface arrived in Linux **6.8**; before that the file is mode
-`0444` and the open fails, which is the one thing this backend can lose. A host
-in that position still judges — the verdict is processor time — and is told at
+descriptor. The interface arrived in **Linux 6.12** — commit `c6f53ed8f213`,
+*"memcg: memory.swap and memory.peak write handlers"* — and before that the file
+is read-only, which is the one thing this backend can lose. A host in that
+position still judges, because the verdict is processor time, and is told at
 start that the number beside it will be missing.
+
+**That excludes Ubuntu 24.04, which ships 6.8**; Debian 13 ships 6.12 and does
+not. Preflight *attempts the reset* rather than merely opening the file, so what
+it reports is the interface rather than a file mode.
+
+*This said **6.8** from 2026-09-03 until it was checked against the kernel later
+the same day. The number had never been verified against anything — the reset
+was measured working on a 6.18 host and the version was asserted around it.*
 
 **And a reset does not zero the mark — it sets it to the usage of the moment,
 which on a shared slice is not zero.** Page cache charged to a container is
