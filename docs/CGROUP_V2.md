@@ -339,6 +339,37 @@ such things are: CI caught it and the workstation did not, because the
 workstation runs `cgroupfs` and a GitHub runner runs `systemd`. CI now runs
 both, as a matrix, for the same reason.*
 
+### What a Runner leaves behind, and why it stays
+
+**One cgroup, its own, and it outlives the process.** Under `cgroupfs` that is
+`<root>/algojudge`, reused by every Runner on the host; under `systemd` it is
+`algojudge-<fingerprint>.slice`, one per Runner identity. Per-run cgroups are
+removed — that is what the `cgroupfs` backend's `rmdir` does and what the
+systemd backend avoids needing by not asking for one — but the home itself is
+never taken away.
+
+**The Runner cannot take it away, and this is measured rather than assumed.**
+`rmdir` on a slice whose unit is still loaded is **undone**: systemd recreated
+the directory both times it was removed on 2026-09-03. Stopping the unit is the
+only thing that works, and that needs a D-Bus connection to systemd which this
+Runner deliberately does not hold — it holds the container runtime's socket and
+nothing else. There is also nowhere to hook it: the Runner installs no signal
+handler and is killed rather than asked to stop.
+
+**The cost is one empty slice per Runner identity that has judged something**,
+and it is one rather than many for a reason worth knowing: **the slice is
+created when a container is first started under it**, not when the Runner
+starts. A Runner that registered and waited for approval leaves nothing at all.
+Counted on the development host after a full day of this work: one, beside the
+two the test suites own.
+
+It grows only where identities are recreated — `docker compose down -v` destroys
+the identity volume, so a development host accumulates one per cycle that
+judged. **Accepted rather than solved** (2026-09-03): the alternative is a D-Bus
+dependency in a process whose whole security argument is how little it reaches
+for. `AlgoJudge-Ops/docs/OPERATIONS.md` says what an operator does about it,
+under garbage collection, and the answer is that a reboot clears them.
+
 ### A third thing read from the same cgroup
 
 `memory.events` carries two counters the Runner reads beside `memory.peak` and
