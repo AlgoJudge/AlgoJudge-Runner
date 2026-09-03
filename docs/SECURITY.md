@@ -41,7 +41,7 @@ correctly.
 | `--security-opt=no-new-privileges` | and none may be gained |
 | read-only root filesystem | writes go nowhere it covers — see `/dev/shm` below |
 | `--user 65534:65534` | never root, even inside |
-| `--memory` **with `--memory-swap` equal** | without the second the limit means nothing: the process swaps instead of being killed |
+| `--memory` **with `--memory-swap` equal** | without the second the limit means nothing: the process swaps instead of being killed. **Two sources say a kill happened** and either is enough — see below |
 | `--pids-limit` | a fork bomb hits a wall |
 | `--cpus` **and `--cpuset-cpus`** | capping CPU is not pinning it. The threading hole is closed by the accounting — `cpu.stat` sums the subtree — and the pin keeps a run reproducible and keeps processor time close to wall clock, which is what makes the deadline below mean anything |
 | wall clock = **three times the limit plus one second** | not a limit anybody is judged against: a time limit is processor time, so this reaps what is *not* spending any — one stuck in an uninterruptible syscall, or one that waits rather than computes |
@@ -53,6 +53,21 @@ the submission build and the checker build, and both ask for a writable root on
 the next line — so the two properties are mutually exclusive across the pipeline.
 A running submission's only writable path is `/dev/shm`, which the contract below
 describes as a surface nobody declared and rule 3's test names explicitly.
+
+**A memory kill is told from two places, and that is since 2026-09-03.** The
+container runtime reports `OOMKilled` on the container, and the kernel counts
+kills in the run's own cgroup — `memory.events`, read beside `memory.peak` and
+`cpu.stat`. Either saying so is enough, and neither is checked against the
+other.
+
+The second was added because the first was caught being wrong: CI reported a
+container that exited **137 after 117 ms** with `OOMKilled` false, on a
+systemd-driver host. That is not a missing number but a **wrong verdict** — a
+memory limit told to a participant as a runtime error — and there was nothing
+else in the product to catch it, because `Stopped::Memory` was the only route to
+that verdict. It did not recur in 25 local attempts, so it is a rare race in the
+runtime rather than a broken flag; a second opinion is the cheap answer to a
+rare one.
 
 Every row has a test in `crates/aj-sandbox/tests/adversarial.rs`, and each
 asserts two things: the program was stopped correctly, **and the host is

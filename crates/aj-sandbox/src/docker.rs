@@ -394,10 +394,11 @@ impl Sandbox for Docker {
         // Read after the container is gone: the child's own cgroup goes with it,
         // and the numbers are final the moment the child stops.
         if let Some((measuring, _)) = cgroup {
-            let (peak, cpu) = measuring.finish();
+            let reading = measuring.finish();
             if let Ok(outcome) = outcome.as_mut() {
-                outcome.peak_memory_bytes = peak;
-                outcome.cpu_time = cpu;
+                outcome.peak_memory_bytes = reading.peak_memory_bytes;
+                outcome.cpu_time = reading.cpu_time;
+                outcome.stopped = memory_kill(outcome.stopped, reading.oom_kills);
             }
         }
         outcome
@@ -470,9 +471,12 @@ impl Docker {
             stopped
         };
 
-        // The kernel's own answer, and the only reliable one: a container over
-        // its memory limit is OOM-killed, and asking afterwards is how the
-        // difference between "ran out of memory" and "exited non-zero" is told.
+        // How the difference between "ran out of memory" and "exited non-zero"
+        // is told. **The runtime's answer, and it is not the only one**: this
+        // said "the only reliable one" until 2026-09-03, when CI caught it
+        // reporting `false` for a container that exited 137 after 117 ms. The
+        // kernel's own counter is consulted in `run`, from the cgroup, and
+        // either of them saying so is enough.
         let details = self
             .client
             .inspect_container(name, None::<InspectContainerOptions>)
@@ -574,6 +578,29 @@ impl Docker {
 /// Refuses rather than truncates silently: the caller turns the overflow into a
 /// verdict a participant can read, and a quietly shortened output would instead
 /// look like a wrong answer.
+/// What the run was stopped by, once the kernel has been asked as well.
+///
+/// **Either answer is enough, and neither is checked against the other.** The
+/// runtime reports `OOMKilled` on the container; the kernel counts kills in
+/// `memory.events`. On 2026-09-03 CI caught the first reporting `false` for a
+/// container that exited 137 after 117 ms on a systemd-driver host — a memory
+/// limit told to a participant as a runtime error, which is a wrong verdict
+/// rather than a missing number. Once in 25 local attempts it did not recur, so
+/// this is a rare race and not a broken flag; a second opinion is the cheap
+/// answer to a rare one.
+///
+/// **Memory outranks everything**, which is what the runtime's flag already did
+/// here: a program stopped at the reaping deadline or over the output cap
+/// *while also* being OOM-killed ran out of memory, and that is the useful
+/// thing to tell somebody.
+fn memory_kill(stopped: Stopped, oom_kills: u64) -> Stopped {
+    if oom_kills > 0 {
+        Stopped::Memory
+    } else {
+        stopped
+    }
+}
+
 async fn collect(
     client: bollard::Docker,
     name: String,
@@ -644,4 +671,37 @@ async fn collect(
 fn rand_suffix() -> u64 {
     use std::hash::{BuildHasher as _, RandomState};
     RandomState::new().hash_one(std::time::SystemTime::now())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Nothing the kernel did not count changes what a run was stopped by.
+    #[test]
+    fn no_kill_leaves_the_runtimes_answer_alone() {
+        for stopped in [
+            Stopped::OnItsOwn,
+            Stopped::WallClock,
+            Stopped::Output,
+            Stopped::Memory,
+        ] {
+            assert_eq!(memory_kill(stopped, 0), stopped);
+        }
+    }
+
+    /// The case CI caught: the runtime said the container stopped on its own,
+    /// and the kernel had killed something in it for being over the limit.
+    #[test]
+    fn a_kill_the_runtime_did_not_report_is_still_a_memory_limit() {
+        assert_eq!(memory_kill(Stopped::OnItsOwn, 1), Stopped::Memory);
+    }
+
+    /// Memory outranks the deadline and the output cap, which is what the
+    /// runtime's own flag already did at this point.
+    #[test]
+    fn a_memory_kill_outranks_what_else_may_have_stopped_it() {
+        assert_eq!(memory_kill(Stopped::WallClock, 1), Stopped::Memory);
+        assert_eq!(memory_kill(Stopped::Output, 3), Stopped::Memory);
+    }
 }

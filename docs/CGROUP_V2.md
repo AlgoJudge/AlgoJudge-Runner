@@ -324,6 +324,21 @@ such things are: CI caught it and the workstation did not, because the
 workstation runs `cgroupfs` and a GitHub runner runs `systemd`. CI now runs
 both, as a matrix, for the same reason.*
 
+### A third thing read from the same cgroup
+
+`memory.events` carries `oom_kill`, a count of the processes the kernel killed
+in this cgroup and everything under it for being over the limit. Since
+2026-09-03 the Runner reads it beside `memory.peak` and `cpu.stat` and treats it
+as a second source for the `Memory limit exceeded` verdict — under `cgroupfs`
+the run's own directory, so the count is the run's; under `systemd` a difference
+across the slice, exactly as processor time is.
+
+**The runtime's `OOMKilled` was the only source until then, and it was caught
+being wrong**: a container that exited 137 after 117 ms, reported as not
+OOM-killed, on a systemd-driver host. A memory limit reaching a participant as a
+runtime error is a wrong verdict rather than a missing number, and nothing else
+in the product would have caught it. Either source saying so is now enough.
+
 ### The rule this implies for calibration
 
 **Do not subtract the overhead.** A participant's submission runs in a container
