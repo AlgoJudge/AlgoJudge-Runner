@@ -200,19 +200,28 @@ int main(int argc, char **argv) {
     long long wall_us = (long long)(ended.tv_sec - began.tv_sec) * 1000000
                       + (ended.tv_usec - began.tv_usec);
 
-    long long cpu_us = (long long)used.ru_utime.tv_sec * 1000000 + used.ru_utime.tv_usec
-                     + (long long)used.ru_stime.tv_sec * 1000000 + used.ru_stime.tv_usec;
+    long long user_us = (long long)used.ru_utime.tv_sec * 1000000 + used.ru_utime.tv_usec;
+    long long system_us = (long long)used.ru_stime.tv_sec * 1000000 + used.ru_stime.tv_usec;
+    long long cpu_us = user_us + system_us;
 
     /* `ru_maxrss` is the child's own here, and only because this process is
      * small: the mark survives `fork` and `exec`, so a child forked from a
      * large parent reports the parent's. That is the defect this replaces --
      * measuring from a PyPy driver returned its 64 MiB for every program. */
     char line[512];
-    snprintf(line, sizeof line, "%s aj-shim1 ok %d %d %lld %lld %lld\n",
+    /* **User and system apart, as well as together.** `wait4` has both and
+     * this summed them away. They answer a question the total cannot: work a
+     * program did, against work the kernel did on its behalf -- faulting its
+     * pages in, reading its input. Under load the second can be the larger,
+     * and a participant is charged for both. **The line's shape is fixed and
+     * `aj-shim1` names it**: a reader finding fewer fields than that version
+     * promises has been handed a report this Runner did not write. */
+    snprintf(line, sizeof line, "%s aj-shim1 ok %d %d %lld %lld %lld %lld %lld\n",
              nonce,
              WIFEXITED(status) ? WEXITSTATUS(status) : 0,
              WIFSIGNALED(status) ? WTERMSIG(status) : 0,
-             cpu_us, (long long)used.ru_maxrss * 1024, wall_us);
+             cpu_us, (long long)used.ru_maxrss * 1024, wall_us,
+             user_us, system_us);
     say(line);
 
     /* **The child's fate, worn as our own.** The runtime reports PID 1's exit

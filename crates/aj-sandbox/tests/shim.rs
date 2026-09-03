@@ -148,6 +148,11 @@ struct Report {
     signal: i32,
     cpu_us: u64,
     peak_bytes: u64,
+    /// The total split into the program's own work and the kernel's work on its
+    /// behalf. The wall clock sits between them on the line and is skipped: the
+    /// sandbox has its own and does not read the shim's.
+    user_us: u64,
+    system_us: u64,
     rest: String,
 }
 
@@ -169,6 +174,8 @@ fn report_in(output: &Output) -> Option<Report> {
         signal: fields.next()?.parse().ok()?,
         cpu_us: fields.next()?.parse().ok()?,
         peak_bytes: fields.next()?.parse().ok()?,
+        user_us: fields.nth(1)?.parse().ok()?,
+        system_us: fields.next()?.parse().ok()?,
         rest,
     })
 }
@@ -420,4 +427,41 @@ fn a_program_named_without_a_path_is_found() {
 
     assert_eq!(output.status.code(), Some(0), "`env` was not found on PATH");
     assert_eq!(report_in(&output).expect("a report").exit, 0);
+}
+
+/// **The halves are the whole, and they are the halves.** A total that grew
+/// under load says nothing about which of the two grew, and they have different
+/// causes: one is the program, the other is the kernel faulting its pages in and
+/// reading its input for it. This pins that the shim reports both and that they
+/// still add up to what a participant is judged on -- an arithmetic slip here
+/// would be invisible in every other test, because the total is what they read.
+#[test]
+fn the_report_splits_the_total_into_the_program_and_the_kernel() {
+    let built = built!();
+
+    // A busy loop is the program's own work and nothing else.
+    let spun = report_in(&run(built, &["spend", "50"], Some(NONCE))).expect("a report");
+    assert_eq!(
+        spun.user_us + spun.system_us,
+        spun.cpu_us,
+        "the halves must be the total: {} user, {} system, {} together",
+        spun.user_us,
+        spun.system_us,
+        spun.cpu_us,
+    );
+    assert!(
+        spun.user_us > 0,
+        "fifty milliseconds of spinning is the program's own time, and it read {} user",
+        spun.user_us,
+    );
+
+    // And touching thirty-two megabytes is the kernel's: every page is a fault
+    // it has to serve.
+    let grown = report_in(&run(built, &["grow", "32"], Some(NONCE))).expect("a report");
+    assert_eq!(grown.user_us + grown.system_us, grown.cpu_us);
+    assert!(
+        grown.system_us > 0,
+        "faulting in thirty-two megabytes is work done for it, and it read {} system",
+        grown.system_us,
+    );
 }

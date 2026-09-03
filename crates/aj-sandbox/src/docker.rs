@@ -513,6 +513,13 @@ impl Sandbox for Docker {
                     unexplained_gap_us = UNEXPLAINED_GAP.as_micros() as u64,
                     charged_us = charged.as_micros() as u64,
                     floored = charged > said.cpu,
+                    // **What the program did, against what was done for it.** A
+                    // total that grew under load says nothing about which of the
+                    // two grew, and they have different causes and different
+                    // cures: one is the program, the other is the host's memory
+                    // and its filesystem.
+                    user_us = said.user.as_micros() as u64,
+                    system_us = said.system.as_micros() as u64,
                     "reconciled the program's own time with the container's",
                 );
 
@@ -1016,6 +1023,10 @@ impl Reaper {
 struct Reported {
     cpu: Duration,
     peak_memory_bytes: u64,
+    /// The same total, split into the program's own work and the kernel's work
+    /// on its behalf.
+    user: Duration,
+    system: Duration,
 }
 
 /// Takes the shim's report out of the standard error it travelled on.
@@ -1065,9 +1076,15 @@ fn take_report(stderr: &mut Vec<u8>, nonce: &str) -> Option<Reported> {
     let mut fields = said.strip_prefix("ok ")?.split_whitespace().skip(2);
     let cpu_us: u64 = fields.next()?.parse().ok()?;
     let peak: u64 = fields.next()?.parse().ok()?;
+    // The wall clock sits between them and is skipped: the sandbox keeps its
+    // own and does not read the shim's.
+    let user_us: u64 = fields.nth(1)?.parse().ok()?;
+    let system_us: u64 = fields.next()?.parse().ok()?;
     Some(Reported {
         cpu: Duration::from_micros(cpu_us),
         peak_memory_bytes: peak,
+        user: Duration::from_micros(user_us),
+        system: Duration::from_micros(system_us),
     })
 }
 
@@ -1183,6 +1200,20 @@ mod tests {
         assert_eq!(time, Duration::from_millis(300));
     }
 
+    /// **The split is read where a shim writes it**, and the total stays what
+    /// it always was rather than being recomputed from the halves: the total is
+    /// what a participant is judged on, and two numbers that must agree are two
+    /// chances to disagree.
+    #[test]
+    fn a_report_carrying_the_split_gives_both_halves() {
+        let mut stderr =
+            format!("{NONCE} aj-shim1 ok 0 0 221812 9342976 232932 51000 170812\n").into_bytes();
+        let said = take_report(&mut stderr, NONCE).expect("a report");
+        assert_eq!(said.cpu, Duration::from_micros(221_812));
+        assert_eq!(said.user, Duration::from_micros(51_000));
+        assert_eq!(said.system, Duration::from_micros(170_812));
+    }
+
     fn stderr_of(text: &str) -> Vec<u8> {
         text.as_bytes().to_vec()
     }
@@ -1207,7 +1238,7 @@ mod tests {
 
     #[test]
     fn a_report_with_nothing_before_it_is_read() {
-        let mut stderr = format!("{NONCE} aj-shim1 ok 0 0 5 6 7\n").into_bytes();
+        let mut stderr = format!("{NONCE} aj-shim1 ok 0 0 5 6 7 2 3\n").into_bytes();
         assert_eq!(
             take_report(&mut stderr, NONCE).unwrap().cpu,
             Duration::from_micros(5)
@@ -1225,8 +1256,8 @@ mod tests {
     /// everything else, so the real one is last however many precede it.
     #[test]
     fn every_forgery_is_removed_however_many_there_are() {
-        let real = format!("{NONCE} aj-shim1 ok 0 0 99 98 97\n");
-        let forged = |us: u64| format!("{NONCE} aj-shim1 ok 0 0 {us} {us} {us}\n");
+        let real = format!("{NONCE} aj-shim1 ok 0 0 99 98 97 40 59\n");
+        let forged = |us: u64| format!("{NONCE} aj-shim1 ok 0 0 {us} {us} {us} {us} {us}\n");
         let mut stderr = format!(
             "{}first\n{}second\n{}{}",
             forged(1),
@@ -1247,7 +1278,7 @@ mod tests {
         let mut stderr = Vec::new();
         stderr.extend_from_slice(&[0xff, 0xfe, b'a', 0x80, b'B', 10]);
         let untouched = stderr.clone();
-        stderr.extend_from_slice(format!("{NONCE} aj-shim1 ok 0 0 5 6 7\n").as_bytes());
+        stderr.extend_from_slice(format!("{NONCE} aj-shim1 ok 0 0 5 6 7 2 3\n").as_bytes());
 
         let said = take_report(&mut stderr, NONCE).expect("a report");
         assert_eq!(said.cpu, Duration::from_micros(5));
@@ -1260,7 +1291,7 @@ mod tests {
     #[test]
     fn a_report_is_read_and_taken_out_of_what_the_participant_wrote() {
         let mut stderr = stderr_of(&format!(
-            "a warning the program printed\n{NONCE} aj-shim1 ok 0 0 221812 9342976 232932\n"
+            "a warning the program printed\n{NONCE} aj-shim1 ok 0 0 221812 9342976 232932 51000 170812\n"
         ));
         let said = take_report(&mut stderr, NONCE).expect("a report");
 
@@ -1278,7 +1309,7 @@ mod tests {
     #[test]
     fn the_last_report_wins_and_a_forged_one_is_removed() {
         let mut stderr = stderr_of(&format!(
-            "{NONCE} aj-shim1 ok 0 0 1 1 1\noutput\n{NONCE} aj-shim1 ok 0 11 45174 14446592 59615\n"
+            "{NONCE} aj-shim1 ok 0 0 1 1 1 1 0\noutput\n{NONCE} aj-shim1 ok 0 11 45174 14446592 59615 20000 25174\n"
         ));
         let said = take_report(&mut stderr, NONCE).expect("a report");
 
@@ -1288,11 +1319,11 @@ mod tests {
 
     #[test]
     fn a_line_carrying_someone_elses_nonce_is_not_a_report() {
-        let mut stderr = stderr_of("ffff aj-shim1 ok 0 0 1 1 1\n");
+        let mut stderr = stderr_of("ffff aj-shim1 ok 0 0 1 1 1 1 0\n");
         assert!(take_report(&mut stderr, NONCE).is_none());
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
-            "ffff aj-shim1 ok 0 0 1 1 1\n"
+            "ffff aj-shim1 ok 0 0 1 1 1 1 0\n"
         );
     }
 
