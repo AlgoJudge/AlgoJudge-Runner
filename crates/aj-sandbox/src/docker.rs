@@ -469,7 +469,13 @@ impl Sandbox for Docker {
         }
 
         // From here on the container exists, so every path out removes it.
-        let mut outcome = self.supervise(&name, profile).await;
+        let mut outcome = self
+            .supervise(
+                &name,
+                profile,
+                cgroup.as_ref().map(|(measuring, _)| measuring),
+            )
+            .await;
         self.remove(&name).await;
 
         // Read after the container is gone: the child's own cgroup goes with it,
@@ -524,7 +530,44 @@ impl Sandbox for Docker {
 }
 
 impl Docker {
-    async fn supervise(&self, name: &str, profile: &Profile) -> Result<Outcome> {
+    /// Waits for a run to stop being worth waiting for, and stops it.
+    ///
+    /// **A program spending processor time is never reaped**, however long it
+    /// takes in wall clock. That is the whole point: on a busy host a program
+    /// that is computing may be descheduled for most of its wall clock, and a
+    /// deadline that cannot tell that from a program doing nothing turns
+    /// contention into `Time limit exceeded` on work that was inside its limit.
+    async fn reap(
+        &self,
+        name: &str,
+        profile: &Profile,
+        measuring: Option<&crate::cgroups::Measuring>,
+    ) -> Stopped {
+        let started = Instant::now();
+        let mut reaper = Reaper::new(profile);
+        loop {
+            tokio::time::sleep(REAP_POLL).await;
+            let cpu = measuring.and_then(|measuring| measuring.so_far());
+            if let Some(stopped) = reaper.tick(REAP_POLL, started.elapsed(), cpu) {
+                tracing::debug!(
+                    container = name,
+                    ?stopped,
+                    cpu_us = cpu.map(|cpu| cpu.as_micros() as u64),
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "stopped waiting for a run",
+                );
+                self.kill(name).await;
+                return stopped;
+            }
+        }
+    }
+
+    async fn supervise(
+        &self,
+        name: &str,
+        profile: &Profile,
+        measuring: Option<&crate::cgroups::Measuring>,
+    ) -> Result<Outcome> {
         let started = Instant::now();
         self.client
             .start_container(name, None::<StartContainerOptions>)
@@ -562,11 +605,7 @@ impl Docker {
 
         let stopped = tokio::select! {
             _ = waiter.next() => Stopped::OnItsOwn,
-            _ = tokio::time::sleep(profile.wall_clock) => {
-                tracing::debug!(container = name, "killed at the wall clock");
-                self.kill(name).await;
-                Stopped::WallClock
-            }
+            stopped = self.reap(name, profile, measuring) => stopped,
         };
 
         let wall_time = started.elapsed();
@@ -838,6 +877,93 @@ fn measured_time(reported: Duration, whole: Option<Duration>) -> Duration {
 /// 2026-09-03, under load -- with room for a slower host.
 const SHIM_ALLOWANCE: Duration = Duration::from_millis(120);
 
+/// How often a run's processor time is looked at while it runs.
+///
+/// One small file read per run per tick — a dozen Runners make a few dozen
+/// reads a second — and fine enough that progress is seen long before any
+/// deadline below could pass.
+const REAP_POLL: Duration = Duration::from_millis(250);
+
+/// How far past its limit a program may get before there is no point waiting.
+///
+/// **Generous on purpose, because being early here is the expensive mistake.**
+/// The verdict is decided afterwards on the precise measurement; the reading
+/// this is compared against is the cgroup's, which carries the container's own
+/// start as well as the program. Twice the limit plus the shim's allowance is
+/// far outside anything a program inside its budget produces, and still stops a
+/// runaway in a fraction of the wall clock it used to take.
+fn cpu_ceiling(limit: Duration) -> Duration {
+    limit * 2 + SHIM_ALLOWANCE
+}
+
+/// The longest a run may take however little processor time it spends.
+///
+/// Nothing else bounds a program that wakes for a millisecond every quarter of
+/// a second: it never stalls and never approaches its limit. Ten times the
+/// no-progress window is far outside anything contention produces, and still
+/// bounds what one submission can take from the queue.
+fn absolute_cap(window: Duration) -> Duration {
+    window * 10
+}
+
+/// When a run stops being worth waiting for.
+///
+/// **Progress, not elapsed time.** Every field is a duration rather than an
+/// instant so the decision is a function of its arguments: the deadline this
+/// implements is the one thing in the sandbox that must be provably right about
+/// a program that is running slowly rather than not running.
+struct Reaper {
+    /// How long without the processor time growing before giving up.
+    window: Duration,
+    /// Where "plainly past its budget" starts, when the step has a budget.
+    ceiling: Option<Duration>,
+    /// The end of it, whatever the program is doing.
+    cap: Duration,
+    best: Duration,
+    idle: Duration,
+}
+
+impl Reaper {
+    fn new(profile: &Profile) -> Self {
+        Self {
+            window: profile.wall_clock,
+            ceiling: profile.cpu_limit.map(cpu_ceiling),
+            cap: absolute_cap(profile.wall_clock),
+            best: Duration::ZERO,
+            idle: Duration::ZERO,
+        }
+    }
+
+    /// One look. `None` means keep waiting.
+    fn tick(
+        &mut self,
+        since: Duration,
+        elapsed: Duration,
+        cpu: Option<Duration>,
+    ) -> Option<Stopped> {
+        match cpu {
+            // **Nothing to read is the plain wall clock, and deliberately.** A
+            // step nobody is timed on — a build, a checker — has no progress to
+            // watch, and neither has a measured run on a host that could not be
+            // measured. Both keep the deadline they always had.
+            None => self.idle += since,
+            Some(cpu) => {
+                if self.ceiling.is_some_and(|ceiling| cpu > ceiling) {
+                    return Some(Stopped::TimeLimit);
+                }
+                if cpu > self.best {
+                    self.best = cpu;
+                    self.idle = Duration::ZERO;
+                } else {
+                    self.idle += since;
+                }
+            }
+        }
+
+        (self.idle >= self.window || elapsed >= self.cap).then_some(Stopped::WallClock)
+    }
+}
+
 /// What the shim said about the one process it was there to watch.
 struct Reported {
     cpu: Duration,
@@ -1102,11 +1228,154 @@ mod tests {
         }
     }
 
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// A timed run: a 200 ms limit and the deadline the pipeline sets with it.
+    fn timed() -> Reaper {
+        Reaper::new(
+            &Profile::new("image", vec!["run".to_owned()])
+                .wall_clock(ms(1600))
+                .cpu_limit(ms(200)),
+        )
+    }
+
+    /// **The case the whole thing exists for.** A program that keeps spending
+    /// processor time is never reaped, however long the host makes it wait: it
+    /// is descheduled, not stuck, and the two were indistinguishable while the
+    /// deadline counted wall clock alone.
+    #[test]
+    fn a_program_that_keeps_computing_is_never_reaped_for_being_slow() {
+        let mut reaper = timed();
+        let mut cpu = ms(0);
+        // A 200 ms budget spent over ten seconds -- a fiftieth of a processor,
+        // which is what a badly oversubscribed host leaves a program. Every
+        // look is progress, so the 1.6 s window never starts.
+        for tick in 1..=40u64 {
+            cpu += ms(5);
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu)),
+                None,
+                "tick {tick}, {cpu:?} of processor time"
+            );
+        }
+        assert_eq!(cpu, ms(200), "it spent its whole limit and was left alone");
+    }
+
+    /// And one that stops spending it is reaped, which is what the deadline was
+    /// always for: waiting, or wedged in an uninterruptible call.
+    #[test]
+    fn a_program_that_stops_computing_is_reaped_after_the_window() {
+        let mut reaper = timed();
+        // It runs for a moment, and then spends nothing at all.
+        assert_eq!(reaper.tick(ms(250), ms(250), Some(ms(30))), None);
+        for tick in 2..=7u64 {
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), Some(ms(30))),
+                None,
+                "tick {tick}",
+            );
+        }
+        // The seventh quiet look puts the idle time past the 1.6 s window.
+        assert_eq!(
+            reaper.tick(ms(250), ms(2000), Some(ms(30))),
+            Some(Stopped::WallClock),
+        );
+    }
+
+    /// **Progress puts the window back**, so a program that computes in bursts
+    /// is not reaped for the pauses between them.
+    #[test]
+    fn every_step_forward_starts_the_window_again() {
+        let mut reaper = timed();
+        for round in 0..4u64 {
+            // Quiet for six ticks — 1.5 s, just inside the window.
+            for tick in 0..6 {
+                assert_eq!(
+                    reaper.tick(ms(250), ms(250 * (round * 7 + tick)), Some(ms(10))),
+                    None,
+                );
+            }
+            // Then a step forward, which must clear it.
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * (round * 7 + 6)), Some(ms(11 + round))),
+                None,
+            );
+        }
+    }
+
+    /// Plainly past its budget is stopped rather than left to run.
+    #[test]
+    fn a_runaway_is_stopped_well_past_its_limit() {
+        // Twice the limit and the shim's allowance: 520 ms for a 200 ms limit.
+        assert_eq!(
+            timed().tick(ms(250), ms(250), Some(ms(521))),
+            Some(Stopped::TimeLimit)
+        );
+    }
+
+    /// **And a program inside its budget is not**, which is the mistake that
+    /// would cost a correct submission its verdict. The reading is the cgroup's
+    /// and carries the container's own start, so a program at its limit reads
+    /// well above it and must still be left alone.
+    #[test]
+    fn a_program_at_its_limit_is_left_alone() {
+        for cpu in [200u64, 250, 274, 320] {
+            assert_eq!(
+                timed().tick(ms(250), ms(250), Some(ms(cpu))),
+                None,
+                "{cpu} ms"
+            );
+        }
+    }
+
+    /// A step nobody times keeps the deadline it always had.
+    #[test]
+    fn a_run_with_nothing_to_measure_keeps_the_plain_wall_clock() {
+        let mut reaper =
+            Reaper::new(&Profile::new("image", vec!["build".to_owned()]).wall_clock(ms(1000)));
+        for tick in 1..4u64 {
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), None),
+                None,
+                "tick {tick}"
+            );
+        }
+        assert_eq!(
+            reaper.tick(ms(250), ms(1000), None),
+            Some(Stopped::WallClock)
+        );
+    }
+
+    /// The end of it, however busy the program looks. Without this a program
+    /// waking for a millisecond every quarter-second never stalls and never
+    /// approaches its limit, and holds a Runner for ever.
+    #[test]
+    fn a_trickle_still_ends_at_the_cap() {
+        let mut reaper = timed();
+        let mut cpu = ms(0);
+        let mut verdict = None;
+        for tick in 1..=100u64 {
+            cpu += ms(1);
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(cpu));
+            if verdict.is_some() {
+                assert!(
+                    ms(250 * tick) >= ms(16_000),
+                    "ended at {tick} ticks, before the cap"
+                );
+                break;
+            }
+        }
+        assert_eq!(verdict, Some(Stopped::WallClock));
+    }
+
     /// Nothing the kernel did not count changes what a run was stopped by.
     #[test]
     fn no_kill_leaves_the_runtimes_answer_alone() {
         for stopped in [
             Stopped::OnItsOwn,
+            Stopped::TimeLimit,
             Stopped::WallClock,
             Stopped::Output,
             Stopped::Memory,

@@ -423,6 +423,9 @@ impl<S: Sandbox> Pipeline<S> {
                         .measured()
                         .max_output_bytes(64 * 1024 * 1024)
                         .wall_clock(reaping_deadline(limits.time_ms))
+                        // What the deadline above measures progress against,
+                        // and what "plainly past its budget" is measured from.
+                        .cpu_limit(Duration::from_millis(limits.time_ms))
                         .mount(Mount::read_only(&artefacts.on_host, PROGRAM))
                         .mount(input_mount(&job.package.on_host, &test.name)),
                     ),
@@ -449,18 +452,24 @@ impl<S: Sandbox> Pipeline<S> {
             // What the machinery did to it comes first: none of these is the
             // program having answered wrongly.
             let stopped = match run.stopped {
+                // Stopped for being plainly past its budget rather than left to
+                // run. An ordinary time limit, and it reads as one: what it
+                // spent is measured and shown beside the limit like any other.
+                Stopped::TimeLimit => Some(("Time limit exceeded".to_owned(), Reason::TimeLimit)),
+
                 // **Reaped rather than over its limit, and the note says so.**
-                // The deadline is three times the limit; a program that reaches
-                // it has usually spent that time *waiting*, so the table would
-                // otherwise read "Time limit exceeded — 4 ms of 1000 ms" and
-                // teach a participant nothing. The verdict and the `reason` are
-                // deliberately the same: the vocabulary is shared with the
-                // Client, the documentation and every package on disk, and a
-                // program stopped here has failed a time limit whether it spent
-                // the time computing or not.
+                // The deadline is three times the limit **without the processor
+                // time growing**, so a program that reaches it has stopped
+                // spending any — waiting, or wedged in an uninterruptible call.
+                // The table would otherwise read "Time limit exceeded — 4 ms of
+                // 1000 ms" and teach a participant nothing. The verdict and the
+                // `reason` are deliberately the same: the vocabulary is shared
+                // with the Client, the documentation and every package on disk,
+                // and a program stopped here has failed a time limit whether it
+                // spent the time computing or not.
                 Stopped::WallClock => Some((
                     format!(
-                        "Time limit exceeded: still running after {:.1} s",
+                        "Time limit exceeded: no processor time for {:.1} s",
                         reaping_deadline(limits.time_ms).as_secs_f64()
                     ),
                     Reason::TimeLimit,

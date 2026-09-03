@@ -52,8 +52,9 @@ pub struct Profile {
 
     pub memory_bytes: u64,
     pub pids: i64,
-    /// Whole cores. Pinning as well as capping is what stops threads buying
-    /// wall-clock time that a single-threaded rule says they may not have.
+    /// Whole cores: how much processor time a run may spend per second,
+    /// wherever the host chooses to spend it. On every container, always, and
+    /// independent of [`Self::cpuset`].
     pub cpus: f64,
 
     /// **A deadline to reap by, and not a limit anybody is judged against.**
@@ -61,10 +62,27 @@ pub struct Profile {
     /// A time limit is processor time (2026-09-02), so nothing here decides a
     /// verdict. What this catches is a program that is not *spending* processor
     /// time — one wedged in an uninterruptible syscall, or one that waits rather
-    /// than computes — which a limit on the processor would never reach. The
-    /// pipeline sets it to three times the limit and a second; a computing
-    /// program stops long before it.
+    /// than computes — which a limit on the processor would never reach.
+    ///
+    /// **It counts only while the processor time is not growing**, where there
+    /// is a [`Self::cpu_limit`] to measure that against. A program that computes
+    /// therefore never reaches it, however long the host makes it wait for a
+    /// processor — which on a busy host is most of its wall clock. Elsewhere,
+    /// where nothing is being timed, it is the plain timeout it reads as.
     pub wall_clock: Duration,
+
+    /// The processor time this step is judged against, where there is one.
+    ///
+    /// **Two things follow from it, and neither is the verdict.** The deadline
+    /// above stops counting while the program is spending processor time, so a
+    /// program that computes is never reaped for being descheduled — and a
+    /// program that spends far past this is stopped rather than left to burn a
+    /// Runner until the deadline.
+    ///
+    /// `None` for every step nobody is timed on — a build, a checker — and
+    /// those keep a plain wall-clock timeout, which is the whole of what they
+    /// need.
+    pub cpu_limit: Option<Duration>,
 
     pub max_output_bytes: u64,
 
@@ -167,6 +185,7 @@ impl Profile {
             pids: 64,
             cpus: 1.0,
             wall_clock: Duration::from_secs(10),
+            cpu_limit: None,
             max_output_bytes: 64 * 1024 * 1024,
             mounts: Vec::new(),
             measured: false,
@@ -192,6 +211,11 @@ impl Profile {
 
     pub fn wall_clock(mut self, wall_clock: Duration) -> Self {
         self.wall_clock = wall_clock;
+        self
+    }
+
+    pub fn cpu_limit(mut self, limit: Duration) -> Self {
+        self.cpu_limit = Some(limit);
         self
     }
 
@@ -255,9 +279,14 @@ impl Profile {
 pub enum Stopped {
     /// It finished on its own.
     OnItsOwn,
+    /// It went **so far past its processor-time limit** that there was no
+    /// reason to keep waiting — see [`Profile::cpu_limit`]. The verdict is
+    /// still decided afterwards, on the precise measurement; this only stops a
+    /// program that is plainly over budget from holding a Runner.
+    TimeLimit,
     /// The reaping deadline passed — see [`Profile::wall_clock`]. It is not the
-    /// time limit, and a program reaching it has usually spent the time waiting
-    /// rather than computing.
+    /// time limit: a program reaching it has stopped spending processor time
+    /// altogether, which means waiting, or wedged in an uninterruptible call.
     WallClock,
     /// The kernel killed it at the memory limit.
     Memory,
