@@ -159,6 +159,7 @@ impl Cgroups {
                 let opened = if fresh { None } else { reset_peak(&here) };
                 Measuring::Shared {
                     cpu_before: usage_usec(&here).unwrap_or(0),
+                    oom_before: oom_kills(&here).unwrap_or(0),
                     memory_before: opened.as_ref().map_or(0, |(_, at_reset)| *at_reset),
                     peak: opened.map(|(file, _)| file),
                     fresh,
@@ -243,6 +244,23 @@ impl Cgroups {
     }
 }
 
+/// What one run cost, and whether the kernel killed anything in it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Reading {
+    pub(crate) peak_memory_bytes: Option<u64>,
+    pub(crate) cpu_time: Option<Duration>,
+    /// How many processes the kernel killed for being over the memory limit.
+    ///
+    /// **The second opinion on a memory kill, and the one that comes from the
+    /// kernel.** The runtime reports `OOMKilled` on the container, which is what
+    /// the verdict was decided on until 2026-09-03 — and CI caught it reporting
+    /// `false` for a container that exited 137 after 117 ms, which turns a
+    /// memory limit into a runtime error in front of a participant. This counter
+    /// is `memory.events`, it is hierarchical, and it is read from the same
+    /// cgroup as everything else here.
+    pub(crate) oom_kills: u64,
+}
+
 /// One run's measurement, held from before its container starts until after it
 /// is gone.
 pub(crate) enum Measuring {
@@ -253,6 +271,9 @@ pub(crate) enum Measuring {
     Shared {
         here: PathBuf,
         cpu_before: u64,
+        /// Kills the slice had already seen. Cumulative like `cpu_before`, and
+        /// for the same reason: one slice serves every run.
+        oom_before: u64,
         /// What the slice already held when the run began, and **the reason a
         /// peak here is a subtraction.**
         ///
@@ -281,20 +302,27 @@ impl Measuring {
     /// Either may be absent and neither is ever guessed. This is measurement,
     /// not enforcement — the limits were applied by the runtime and hold
     /// whether or not this succeeds.
-    pub(crate) fn finish(self) -> (Option<u64>, Option<Duration>) {
+    pub(crate) fn finish(self) -> Reading {
         match self {
             Self::Own { here } => {
                 let peak = read_number(&here.join("memory.peak"));
                 let cpu = usage_usec(&here).map(Duration::from_micros);
+                // A directory of this run's own, so the count is this run's.
+                let oom_kills = oom_kills(&here).unwrap_or(0);
                 // Read before the directory goes, and removed here rather than
                 // left: the child's own cgroup is taken away with its container,
                 // and this one is nobody else's to collect.
                 let _ = std::fs::remove_dir(&here);
-                (peak, cpu)
+                Reading {
+                    peak_memory_bytes: peak,
+                    cpu_time: cpu,
+                    oom_kills,
+                }
             }
             Self::Shared {
                 here,
                 cpu_before,
+                oom_before,
                 memory_before,
                 mut peak,
                 fresh,
@@ -314,7 +342,11 @@ impl Measuring {
                     (None, true) => read_number(&here.join("memory.peak")),
                     (None, false) => None,
                 };
-                (peak, cpu)
+                Reading {
+                    peak_memory_bytes: peak,
+                    cpu_time: cpu,
+                    oom_kills: oom_kills(&here).map_or(0, |after| after.saturating_sub(oom_before)),
+                }
             }
         }
     }
@@ -475,6 +507,19 @@ fn usage_usec(dir: &Path) -> Option<u64> {
         .ok()?
         .lines()
         .find_map(|line| line.strip_prefix("usage_usec "))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// `oom_kill` from `memory.events`: how many processes the kernel killed here
+/// for being over the memory limit, this cgroup and everything under it.
+///
+/// `memory.events` rather than `memory.events.local`, because the container
+/// runs in a child of the cgroup this reads.
+fn oom_kills(dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(dir.join("memory.events"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("oom_kill "))
         .and_then(|v| v.trim().parse().ok())
 }
 
@@ -683,6 +728,76 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A run's own directory carries the run's own count, and a cgroup that
+    /// never saw a kill answers zero rather than nothing.
+    #[test]
+    fn a_run_that_was_oom_killed_says_so_from_its_own_cgroup() {
+        let here = std::env::temp_dir().join(format!("aj-oom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&here);
+        std::fs::create_dir_all(&here).expect("a scratch cgroup");
+        std::fs::write(
+            here.join("cpu.stat"),
+            "usage_usec 4056
+user_usec 4000
+",
+        )
+        .unwrap();
+        std::fs::write(
+            here.join("memory.peak"),
+            "7655424
+",
+        )
+        .unwrap();
+        std::fs::write(
+            here.join("memory.events"),
+            "low 0
+high 0
+max 12
+oom 1
+oom_kill 2
+oom_group_kill 0
+",
+        )
+        .unwrap();
+
+        let reading = Measuring::Own { here: here.clone() }.finish();
+        assert_eq!(reading.oom_kills, 2);
+        assert_eq!(reading.peak_memory_bytes, Some(7_655_424));
+        assert_eq!(reading.cpu_time, Some(Duration::from_micros(4056)));
+
+        // Not asserted here: that `finish` gave the directory back. A cgroup's
+        // files are not directory entries, so `rmdir` works on a real one and
+        // not on this imitation. `a_measured_run_leaves_no_cgroup_behind` is
+        // where that is checked, against a cgroup.
+        let _ = std::fs::remove_dir_all(&here);
+    }
+
+    #[test]
+    fn a_cgroup_with_no_memory_events_is_not_a_kill() {
+        let here = std::env::temp_dir().join(format!("aj-nooom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&here);
+        std::fs::create_dir_all(&here).expect("a scratch cgroup");
+        std::fs::write(
+            here.join("memory.events"),
+            "low 0
+high 0
+max 0
+oom 0
+oom_kill 0
+",
+        )
+        .unwrap();
+        assert_eq!(oom_kills(&here), Some(0));
+
+        std::fs::remove_file(here.join("memory.events")).unwrap();
+        assert_eq!(
+            oom_kills(&here),
+            None,
+            "absent is not zero, and finish() decides which"
+        );
+        let _ = std::fs::remove_dir_all(&here);
     }
 
     #[test]
