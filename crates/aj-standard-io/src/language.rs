@@ -37,6 +37,8 @@
 
 use std::collections::BTreeMap;
 
+use aj_sandbox::SHIM;
+
 /// What a toolchain has in common with the others that share its rules.
 ///
 /// Deliberately an enum rather than a string: this is what `policy.rs` switches
@@ -497,14 +499,36 @@ fn shell(script: &str) -> Vec<String> {
     vec!["/bin/sh".into(), "-c".into(), script.into()]
 }
 
-/// Wraps a start command so the test's input arrives on standard input.
+/// A POSIX single-quoted word. The only thing that cannot appear inside single
+/// quotes is a single quote, so one is written by leaving and re-entering them.
+fn quoted(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+/// Wraps a start command so the test's input arrives on standard input, through
+/// the measuring shim where the image has one.
 ///
-/// `exec` on purpose: the shell replaces itself, so the process limit counts
-/// the program rather than the program plus a shell, and a signal reaches what
-/// it was aimed at.
+/// **`exec` in both arms, and that is what makes the test free.** The shell
+/// replaces itself either way, so it is not a second process in the accounting
+/// and not a second entry against the process limit; what it spends deciding is
+/// inside the cgroup's total and outside the shim's report, which is the right
+/// side of each. Without a shim this is exactly what it has always been: the
+/// program as PID 1 with its input redirected.
+///
+/// The shim is not probed for. An image may be an operator's own -- the
+/// catalogue lets a toolchain name one -- so the absence has to be handled where
+/// the command is built rather than by a capability the Runner remembers.
 pub fn with_input(start: &[String], test: &str) -> Vec<String> {
-    let quoted: Vec<String> = start.iter().map(|part| format!("'{part}'")).collect();
-    shell(&format!("exec {} < {INPUT}/{test}.in", quoted.join(" ")))
+    let program = start
+        .iter()
+        .map(|part| quoted(part))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let input = quoted(&format!("{INPUT}/{test}.in"));
+    shell(&format!(
+        "if [ -x {SHIM} ]; then exec {SHIM} {input} {program}; \
+         else exec {program} < {input}; fi"
+    ))
 }
 
 #[cfg(test)]
@@ -647,13 +671,52 @@ mod tests {
     }
 
     #[test]
-    fn input_is_redirected_by_the_shell_replacing_itself() {
+    fn the_shim_is_given_the_input_and_the_fallback_redirects_it() {
         let wrapped = with_input(&["python3".into(), "/program/program.py".into()], "1a");
         let script = wrapped.last().unwrap();
 
-        assert!(script.starts_with("exec "), "got {script}");
-        assert!(script.contains("< /in/1a.in"), "got {script}");
-        assert!(script.contains("'python3' '/program/program.py'"));
+        // Through the shim the input is an argument, because the shim opens it.
+        assert!(
+            script.contains(
+                "exec /usr/local/bin/aj-shim '/in/1a.in' 'python3' '/program/program.py'"
+            ),
+            "got {script}"
+        );
+        // Without one it is a redirect, which is what it has always been.
+        assert!(
+            script.contains("exec 'python3' '/program/program.py' < '/in/1a.in'"),
+            "got {script}"
+        );
+    }
+
+    /// **Both arms, or the shell is a process in the accounting.** It would also
+    /// be a second entry against a process limit set at sixteen, and a signal
+    /// aimed at the submission would reach the shell instead.
+    #[test]
+    fn neither_arm_leaves_a_shell_behind() {
+        let script = with_input(&["/program/program".into()], "0a")
+            .pop()
+            .unwrap();
+
+        assert_eq!(script.matches("exec ").count(), 2, "got {script}");
+        for arm in script.split("; ") {
+            let arm = arm
+                .trim()
+                .trim_start_matches("then ")
+                .trim_start_matches("else ");
+            if arm.starts_with("if ") || arm == "fi" {
+                continue;
+            }
+            assert!(arm.starts_with("exec "), "an arm that does not exec: {arm}");
+        }
+    }
+
+    /// A quote in a path would otherwise end the quoting and hand the rest of
+    /// the word to the shell as syntax.
+    #[test]
+    fn a_word_carrying_a_quote_stays_one_word() {
+        assert_eq!(quoted("plain"), "'plain'");
+        assert_eq!(quoted("a'b"), "'a'\\''b'");
     }
 
     /// Every compiled submission is judged against an optimised, statically

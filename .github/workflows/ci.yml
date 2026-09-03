@@ -107,10 +107,10 @@ jobs:
       # the Runner in the stack doing the judging and nobody helping it.
       - name: Build the language images
         run: |
-          docker build -t algojudge/lang-gcc:local    images/gcc
-          docker build -t algojudge/lang-clang:local  images/clang
-          docker build -t algojudge/lang-python:local images/python
-          docker build -t algojudge/lang-pypy:local   images/pypy
+          docker build -t algojudge/lang-gcc:local    -f images/gcc/Dockerfile images/
+          docker build -t algojudge/lang-clang:local  -f images/clang/Dockerfile images/
+          docker build -t algojudge/lang-python:local -f images/python/Dockerfile images/
+          docker build -t algojudge/lang-pypy:local   -f images/pypy/Dockerfile images/
 
       - name: Judge every outcome, end to end
         env:
@@ -227,10 +227,10 @@ jobs:
 
       - name: Build the language images
         run: |
-          docker build -t algojudge/lang-gcc:local    images/gcc
-          docker build -t algojudge/lang-clang:local  images/clang
-          docker build -t algojudge/lang-python:local images/python
-          docker build -t algojudge/lang-pypy:local   images/pypy
+          docker build -t algojudge/lang-gcc:local    -f images/gcc/Dockerfile images/
+          docker build -t algojudge/lang-clang:local  -f images/clang/Dockerfile images/
+          docker build -t algojudge/lang-python:local -f images/python/Dockerfile images/
+          docker build -t algojudge/lang-pypy:local   -f images/pypy/Dockerfile images/
 
       # The one that proves the whole thing: a submission goes in, a mark comes
       # out, and it is the right mark.

@@ -18,7 +18,7 @@
 //! applies to the socket file, not to the API spoken over it.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bollard::container::LogOutput;
 use bollard::models::SystemInfoCgroupVersionEnum;
@@ -70,6 +70,13 @@ pub struct Docker {
     ///
     /// Resolved by [`Self::preflight`], because deciding it needs the daemon.
     cgroups: std::sync::OnceLock<Option<Cgroups>>,
+    /// Whether each image carries the measuring shim, asked once.
+    ///
+    /// **It has to be known before the container is made**, because it decides
+    /// who the container starts as, and that is fixed at creation. An image with
+    /// no shim runs unprivileged and measures from the cgroup alone; one that
+    /// has it starts as root so the shim can drop.
+    shims: tokio::sync::Mutex<HashMap<String, bool>>,
 }
 
 impl Docker {
@@ -79,6 +86,7 @@ impl Docker {
             client: bollard::Docker::connect_with_local_defaults()?,
             instance: instance.into(),
             cgroups: std::sync::OnceLock::new(),
+            shims: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -109,6 +117,54 @@ impl Docker {
     /// evaluation on a fresh host does not fail with "no such image", which
     /// would be reported as an infrastructure failure and be entirely correct
     /// and entirely unhelpful.
+    /// Whether an image carries the shim, asked once per image and remembered.
+    ///
+    /// **Read out of the image rather than run.** A container is created and
+    /// never started, and the path is fetched through the archive endpoint --
+    /// the same one a build's artefacts come back through. Starting one to run
+    /// `test -x` would cost a container start per image and would be the only
+    /// place the Runner executes something in an image before it has decided how
+    /// to confine it.
+    ///
+    /// Any failure answers `false`, which is the safe direction: the run falls
+    /// back to the shell, the container stays unprivileged, and the measurement
+    /// is the cgroup's alone.
+    async fn image_has_shim(&self, image: &str) -> bool {
+        if let Some(known) = self.shims.lock().await.get(image) {
+            return *known;
+        }
+
+        let name = format!("algojudge-{}-shimprobe", self.instance);
+        let _ = self.remove(&name).await;
+        let created = self
+            .client
+            .create_container(
+                Some(CreateContainerOptionsBuilder::default().name(&name).build()),
+                ContainerCreateBody {
+                    image: Some(image.to_owned()),
+                    labels: Some(self.labels()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let found = match created {
+            Err(e) => {
+                tracing::debug!(image, %e, "could not probe for the shim");
+                false
+            }
+            Ok(_) => {
+                let read = self.take(&name, crate::SHIM, 8 * 1024 * 1024).await;
+                matches!(read, Ok(Some(_)))
+            }
+        };
+        self.remove(&name).await;
+
+        tracing::info!(image, shim = found, "measured runs in this image");
+        self.shims.lock().await.insert(image.to_owned(), found);
+        found
+    }
+
     pub async fn ensure_image(&self, image: &str) -> Result<()> {
         if self.client.inspect_image(image).await.is_ok() {
             return Ok(());
@@ -184,7 +240,12 @@ impl Docker {
         Ok(swept)
     }
 
-    fn host_config(&self, profile: &Profile, cgroup_parent: Option<&str>) -> HostConfig {
+    fn host_config(
+        &self,
+        profile: &Profile,
+        cgroup_parent: Option<&str>,
+        shim: bool,
+    ) -> HostConfig {
         let memory = profile.memory_bytes as i64;
 
         HostConfig {
@@ -196,6 +257,11 @@ impl Docker {
             // No route anywhere. The first line of the adversarial suite.
             network_mode: Some("none".to_owned()),
             cap_drop: Some(vec!["ALL".to_owned()]),
+            // **Two, and only where a shim will use them to give privilege up.**
+            // Dropping to another user is the one thing `cap_drop: ALL` takes
+            // away that the shim needs; `no-new-privileges` below still forbids
+            // gaining any, and the submission itself never holds either.
+            cap_add: shim.then(|| vec!["SETUID".to_owned(), "SETGID".to_owned()]),
             security_opt: Some(vec!["no-new-privileges".to_owned()]),
             readonly_rootfs: Some(!profile.writable_root),
 
@@ -339,6 +405,12 @@ impl Sandbox for Docker {
     }
 
     async fn run(&self, profile: &Profile) -> Result<Outcome> {
+        // Asked before anything is created: the user a container starts as
+        // cannot be changed afterwards, and an image with no shim must not be
+        // handed a root one.
+        let shim = profile.measured && self.image_has_shim(&profile.image).await;
+        let nonce = shim.then(|| format!("{:016x}{:016x}", rand_suffix(), rand_suffix()));
+
         let name = format!(
             "algojudge-{}-{}",
             std::process::id(),
@@ -358,16 +430,25 @@ impl Sandbox for Docker {
             image: Some(profile.image.clone()),
             cmd: Some(profile.command.clone()),
             working_dir: Some(profile.working_directory.clone()),
-            // Nobody. The image's own user is not to be trusted to be
-            // unprivileged.
-            user: Some("65534:65534".to_owned()),
+            // Nobody, unless the shim is there to put the submission back to
+            // nobody itself. The image's own user is not to be trusted to be
+            // unprivileged either way, so it is always stated here.
+            user: Some(container_user(profile.measured, shim).to_owned()),
+            // The nonce reaches the shim and nothing else: it scrubs the bytes
+            // before forking, and the submission runs as a different user that
+            // cannot read `/proc/1/environ` in any case.
+            env: nonce
+                .as_ref()
+                .map(|nonce| vec![format!("AJ_SHIM_NONCE={nonce}")]),
             labels: Some(self.labels()),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             network_disabled: Some(true),
-            host_config: Some(
-                self.host_config(profile, cgroup.as_ref().map(|(_, parent)| parent.as_str())),
-            ),
+            host_config: Some(self.host_config(
+                profile,
+                cgroup.as_ref().map(|(_, parent)| parent.as_str()),
+                shim,
+            )),
             ..Default::default()
         };
 
@@ -398,7 +479,22 @@ impl Sandbox for Docker {
             if let Ok(outcome) = outcome.as_mut() {
                 outcome.peak_memory_bytes = reading.peak_memory_bytes;
                 outcome.cpu_time = reading.cpu_time;
+                // **The verdict for memory stays the cgroup's.** A limit is
+                // enforced by the kernel, so what the report claims about memory
+                // changes nothing about whether the kernel killed it.
                 outcome.stopped = memory_kill(outcome.stopped, &reading);
+            }
+        }
+
+        if let (Some(nonce), Ok(outcome)) = (nonce.as_deref(), outcome.as_mut()) {
+            if let Some(said) = take_report(&mut outcome.stderr, nonce) {
+                outcome.cpu_time = Some(measured_time(said.cpu, outcome.cpu_time));
+                // Memory needs no floor: understating it buys nothing, because
+                // the kernel and not this number decides the memory verdict. The
+                // shim's figure is the better one -- the program's own resident
+                // peak, where the cgroup also carries the page cache of whatever
+                // the container read.
+                outcome.peak_memory_bytes = Some(said.peak_memory_bytes);
             }
         }
         outcome
@@ -675,6 +771,110 @@ async fn collect(
 }
 
 /// Enough to keep two containers started in the same nanosecond apart.
+/// Who a container starts as.
+///
+/// **Root only where a shim will hand the privilege straight back.** Every other
+/// container -- a build, a checker, and a measured run in an image with no shim
+/// -- starts as nobody, which is what they have always done. A step that gained
+/// root because someone marked the wrong profile would be a far worse bargain
+/// than a coarser number, so the two conditions are named here together rather
+/// than spread across the call site.
+fn container_user(measured: bool, shim: bool) -> &'static str {
+    if measured && shim {
+        "0:0"
+    } else {
+        "65534:65534"
+    }
+}
+
+/// A run's processor time, from the precise instrument and the trusted one.
+///
+/// **The cgroup is a floor and the report may only lift it.** The reading covers
+/// the whole container, so it is never less than the program's own cost; the
+/// report is the program alone but arrives through a channel the submission
+/// shares. Allowing the report to explain away at most [`SHIM_ALLOWANCE`] gives
+/// an honest run its exact figure -- the floor sits well below what it really
+/// spent -- and bounds what a forged one is worth to that same constant.
+fn measured_time(reported: Duration, whole: Option<Duration>) -> Duration {
+    match whole {
+        Some(whole) => reported.max(whole.saturating_sub(SHIM_ALLOWANCE)),
+        None => reported,
+    }
+}
+
+/// The most a shim's report may take off the cgroup's reading.
+///
+/// **The report is precise and untrusted; the cgroup is coarse and cannot be
+/// reached from inside a container.** So the second is kept as a floor under the
+/// first: an honest run is corrected exactly, because the floor sits below what
+/// it really cost, and a forged one cannot claim less than the cgroup's total
+/// less this. The most a lie is worth is therefore this constant, which is what
+/// subtracting a blanket average would have given away in every direction at
+/// once.
+///
+/// Above the worst container start measured on any of the four images -- 74 ms,
+/// 2026-09-03, under load -- with room for a slower host.
+const SHIM_ALLOWANCE: Duration = Duration::from_millis(120);
+
+/// What the shim said about the one process it was there to watch.
+struct Reported {
+    cpu: Duration,
+    peak_memory_bytes: u64,
+}
+
+/// Takes the shim's report out of the standard error it travelled on.
+///
+/// **The last one wins, and every one of them is removed.** A submission can
+/// write a line in the same shape -- it shares the descriptor -- but the shim
+/// kills every other process in the namespace before writing, so nothing is
+/// alive to write after it. Removing the others as well keeps a forged line out
+/// of what is stored against the submission.
+fn take_report(stderr: &mut Vec<u8>, nonce: &str) -> Option<Reported> {
+    let marker = format!("{nonce} aj-shim1 ").into_bytes();
+
+    // **Bytes throughout.** Reading this as text to find the marker and
+    // writing the text back would replace every invalid sequence with a
+    // replacement character, so a program that printed a buffer would have it
+    // rewritten by the act of measuring it.
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while at + marker.len() <= stderr.len() {
+        if stderr[at..].starts_with(&marker) {
+            let line = stderr[at..].iter().position(|byte| *byte == b'\n');
+            // **A line with no newline after it was cut short** -- by the
+            // output cap, or by the container dying mid-write. Half a report
+            // parses into a smaller number than the truth, so it is not one.
+            let ends = match line {
+                Some(n) => at + n + 1,
+                None => break,
+            };
+            found.push((at, ends));
+            at = ends;
+        } else {
+            at += 1;
+        }
+    }
+
+    let (last, ends) = *found.last()?;
+    let said = String::from_utf8_lossy(&stderr[last + marker.len()..ends])
+        .trim_end()
+        .to_owned();
+
+    // Every one of them, so a forged line is not stored against the submission
+    // either. Backwards, so the earlier offsets stay valid.
+    for (from, to) in found.into_iter().rev() {
+        stderr.drain(from..to);
+    }
+
+    let mut fields = said.strip_prefix("ok ")?.split_whitespace().skip(2);
+    let cpu_us: u64 = fields.next()?.parse().ok()?;
+    let peak: u64 = fields.next()?.parse().ok()?;
+    Some(Reported {
+        cpu: Duration::from_micros(cpu_us),
+        peak_memory_bytes: peak,
+    })
+}
+
 fn rand_suffix() -> u64 {
     use std::hash::{BuildHasher as _, RandomState};
     RandomState::new().hash_one(std::time::SystemTime::now())
@@ -683,6 +883,194 @@ fn rand_suffix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NONCE: &str = "0123456789abcdef";
+
+    #[test]
+    fn only_a_measured_run_in_an_image_with_a_shim_starts_as_root() {
+        assert_eq!(container_user(true, true), "0:0");
+
+        for (measured, shim, because) in [
+            (true, false, "a measured run in an image with no shim"),
+            (false, true, "a build in an image that happens to carry one"),
+            (false, false, "everything else"),
+        ] {
+            assert_eq!(container_user(measured, shim), "65534:65534", "{because}");
+        }
+    }
+
+    #[test]
+    fn an_honest_report_is_taken_exactly() {
+        // The numbers the shim and the cgroup gave for one real run.
+        let time = measured_time(
+            Duration::from_micros(221_812),
+            Some(Duration::from_micros(271_044)),
+        );
+        assert_eq!(time, Duration::from_micros(221_812));
+    }
+
+    /// **The bound is the point.** Whatever a forged report claims, the answer
+    /// cannot fall below the cgroup's own reading less the allowance -- which is
+    /// the same amount subtracting a blanket average would have given away, and
+    /// no more.
+    #[test]
+    fn a_forged_report_cannot_buy_more_than_the_allowance() {
+        let whole = Duration::from_millis(500);
+        for claimed in [0, 1, 10, 379] {
+            let time = measured_time(Duration::from_millis(claimed), Some(whole));
+            assert_eq!(time, whole - SHIM_ALLOWANCE, "claiming {claimed} ms");
+        }
+        assert!(measured_time(Duration::ZERO, Some(whole)) >= whole - SHIM_ALLOWANCE);
+    }
+
+    /// A run shorter than the allowance has nothing to subtract from, and a
+    /// floor below zero is zero rather than a panic.
+    #[test]
+    fn a_run_shorter_than_the_allowance_keeps_what_the_shim_said() {
+        let time = measured_time(Duration::from_millis(5), Some(Duration::from_millis(60)));
+        assert_eq!(time, Duration::from_millis(5));
+    }
+
+    /// Nothing to floor it with: a host the Runner could not read a cgroup on
+    /// is one that refuses to judge, but the arithmetic still has to answer.
+    #[test]
+    fn without_a_cgroup_the_report_stands_alone() {
+        assert_eq!(
+            measured_time(Duration::from_millis(222), None),
+            Duration::from_millis(222)
+        );
+    }
+
+    /// The report is the *program's* time and the reading is the container's, so
+    /// this cannot happen -- and if it ever does, the larger number is the safe
+    /// one to charge.
+    #[test]
+    fn a_report_larger_than_the_whole_container_is_taken() {
+        let time = measured_time(Duration::from_millis(300), Some(Duration::from_millis(271)));
+        assert_eq!(time, Duration::from_millis(300));
+    }
+
+    fn stderr_of(text: &str) -> Vec<u8> {
+        text.as_bytes().to_vec()
+    }
+
+    /// **A program's standard error comes back byte for byte, or not at all.**
+    /// Reading it as text to find the report and writing the text back replaces
+    /// every invalid sequence with a replacement character -- so a program that
+    /// printed a buffer, an image, or any other bytes would have them rewritten
+    /// by the act of measuring it.
+    /// **Half a report is not a report.** The output collector kills a container
+    /// that passes the cap mid-write, and a line cut through its numbers parses
+    /// into a smaller figure than the truth -- which is the one direction that
+    /// must never be accepted on trust.
+    #[test]
+    fn a_report_cut_short_is_not_read() {
+        let mut stderr = format!("{NONCE} aj-shim1 ok 0 0 2218").into_bytes();
+        let before = stderr.clone();
+
+        assert!(take_report(&mut stderr, NONCE).is_none());
+        assert_eq!(stderr, before, "and it is left where it was");
+    }
+
+    #[test]
+    fn a_report_with_nothing_before_it_is_read() {
+        let mut stderr = format!("{NONCE} aj-shim1 ok 0 0 5 6 7\n").into_bytes();
+        assert_eq!(
+            take_report(&mut stderr, NONCE).unwrap().cpu,
+            Duration::from_micros(5)
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn no_output_at_all_is_no_report() {
+        let mut stderr = Vec::new();
+        assert!(take_report(&mut stderr, NONCE).is_none());
+    }
+
+    /// Three forged lines and the real one. The shim writes after killing
+    /// everything else, so the real one is last however many precede it.
+    #[test]
+    fn every_forgery_is_removed_however_many_there_are() {
+        let real = format!("{NONCE} aj-shim1 ok 0 0 99 98 97\n");
+        let forged = |us: u64| format!("{NONCE} aj-shim1 ok 0 0 {us} {us} {us}\n");
+        let mut stderr = format!(
+            "{}first\n{}second\n{}{}",
+            forged(1),
+            forged(2),
+            forged(3),
+            real
+        )
+        .into_bytes();
+
+        let said = take_report(&mut stderr, NONCE).expect("a report");
+        assert_eq!(said.cpu, Duration::from_micros(99));
+        assert_eq!(said.peak_memory_bytes, 98);
+        assert_eq!(String::from_utf8(stderr).unwrap(), "first\nsecond\n");
+    }
+
+    #[test]
+    fn output_that_is_not_utf8_survives_being_read() {
+        let mut stderr = Vec::new();
+        stderr.extend_from_slice(&[0xff, 0xfe, b'a', 0x80, b'B', 10]);
+        let untouched = stderr.clone();
+        stderr.extend_from_slice(format!("{NONCE} aj-shim1 ok 0 0 5 6 7\n").as_bytes());
+
+        let said = take_report(&mut stderr, NONCE).expect("a report");
+        assert_eq!(said.cpu, Duration::from_micros(5));
+        assert_eq!(
+            stderr, untouched,
+            "the bytes before the report were rewritten"
+        );
+    }
+
+    #[test]
+    fn a_report_is_read_and_taken_out_of_what_the_participant_wrote() {
+        let mut stderr = stderr_of(&format!(
+            "a warning the program printed\n{NONCE} aj-shim1 ok 0 0 221812 9342976 232932\n"
+        ));
+        let said = take_report(&mut stderr, NONCE).expect("a report");
+
+        assert_eq!(said.cpu, Duration::from_micros(221_812));
+        assert_eq!(said.peak_memory_bytes, 9_342_976);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "a warning the program printed\n"
+        );
+    }
+
+    /// The submission shares the descriptor, so it can write a line in the same
+    /// shape. The shim writes after killing everything else, so its line is the
+    /// last one -- and none of them is left in what is stored.
+    #[test]
+    fn the_last_report_wins_and_a_forged_one_is_removed() {
+        let mut stderr = stderr_of(&format!(
+            "{NONCE} aj-shim1 ok 0 0 1 1 1\noutput\n{NONCE} aj-shim1 ok 0 11 45174 14446592 59615\n"
+        ));
+        let said = take_report(&mut stderr, NONCE).expect("a report");
+
+        assert_eq!(said.cpu, Duration::from_micros(45_174));
+        assert_eq!(String::from_utf8(stderr).unwrap(), "output\n");
+    }
+
+    #[test]
+    fn a_line_carrying_someone_elses_nonce_is_not_a_report() {
+        let mut stderr = stderr_of("ffff aj-shim1 ok 0 0 1 1 1\n");
+        assert!(take_report(&mut stderr, NONCE).is_none());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "ffff aj-shim1 ok 0 0 1 1 1\n"
+        );
+    }
+
+    #[test]
+    fn a_shim_that_failed_reports_no_measurement() {
+        let mut stderr = stderr_of(&format!(
+            "{NONCE} aj-shim1 failed setuid: Operation not permitted\n"
+        ));
+        assert!(take_report(&mut stderr, NONCE).is_none());
+        assert!(stderr.is_empty(), "the line is still removed");
+    }
 
     fn reading(oom_kills: u64, over_limit: u64) -> cgroups::Reading {
         cgroups::Reading {
