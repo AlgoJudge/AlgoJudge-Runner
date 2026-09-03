@@ -1218,7 +1218,7 @@ async fn a_pinned_run_is_given_one_core_and_the_one_it_asked_for() {
         .unwrap_or_else(|| panic!("no core number in Cpus_allowed_list {all_list:?}"));
 
     let pinned = docker
-        .run(&shell(ASK).cpuset(core))
+        .run(&shell(ASK).cpuset(core.to_string()))
         .await
         .expect("the pinned run");
 

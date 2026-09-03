@@ -82,19 +82,23 @@ pub struct Profile {
     pub max_open_files: i64,
     pub max_file_bytes: i64,
 
-    /// One core, by number, for the step that is being timed.
+    /// The processors a timed run may use: **the ones the Runner itself was
+    /// given**, and absent when it was given the whole machine.
+    ///
+    /// [`crate::affinity`] holds the decision and the measurements behind it.
+    /// The short of it: a job container inherits no affinity from the Runner --
+    /// the daemon starts it, not the Runner -- so an operator's split has to be
+    /// carried here explicitly or jobs escape it; and where there is no split, a
+    /// pin chosen without coordination is worse than none, because several
+    /// Runners choose the same processor while others idle and the kernel is
+    /// then forbidden from repairing it.
     ///
     /// **Capping CPU is not the same as pinning it.** `--cpus=1` limits how much
-    /// CPU time a program may use per second; it does not stop two threads
-    /// running on two cores and finishing in half the wall-clock time.
-    ///
-    /// The threading hole this was introduced to close is now closed by the
-    /// accounting instead: `cpu.stat` sums the whole subtree, so two threads
-    /// spend twice the processor time and reach the limit twice as fast. **The
-    /// pin is kept for two other reasons.** It keeps a run reproducible rather
-    /// than a function of what else the host was doing; and it keeps processor
-    /// time close to wall clock, which is what makes a reaping deadline set as a
-    /// multiple of the limit mean anything.
+    /// processor time a program may spend per second; it does not stop two
+    /// threads running on two cores and finishing in half the wall-clock time.
+    /// Neither does it need to: `cpu.stat` sums the whole subtree, so threads
+    /// spend the budget faster rather than escaping it, and a limit is processor
+    /// time.
     pub cpuset: Option<String>,
 
     /// Whether this step is one a participant is judged on the time of.
@@ -211,8 +215,15 @@ impl Profile {
         self
     }
 
-    pub fn cpuset(mut self, core: usize) -> Self {
-        self.cpuset = Some(core.to_string());
+    /// A processor set, spelled the way the kernel spells one: `3`, `0-1`,
+    /// `0-3,8`.
+    ///
+    /// **A set rather than a number, because what is passed on is what the
+    /// Runner was given.** See [`crate::affinity`]: the only caller hands over
+    /// its own allowed processors verbatim, and hands over nothing when it was
+    /// allowed everything.
+    pub fn cpuset(mut self, set: impl Into<String>) -> Self {
+        self.cpuset = Some(set.into());
         self
     }
 

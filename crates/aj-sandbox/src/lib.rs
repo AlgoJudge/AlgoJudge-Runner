@@ -14,6 +14,7 @@
 //! Nothing here understands a problem, a test or a verdict. It is handed a
 //! command and limits, and reports what happened.
 
+pub mod affinity;
 pub mod cgroups;
 pub mod docker;
 pub mod profile;

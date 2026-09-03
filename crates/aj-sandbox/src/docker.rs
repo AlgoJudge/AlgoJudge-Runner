@@ -488,7 +488,29 @@ impl Sandbox for Docker {
 
         if let (Some(nonce), Ok(outcome)) = (nonce.as_deref(), outcome.as_mut()) {
             if let Some(said) = take_report(&mut outcome.stderr, nonce) {
-                outcome.cpu_time = Some(measured_time(said.cpu, outcome.cpu_time));
+                let whole = outcome.cpu_time;
+                let charged = measured_time(said.cpu, whole);
+
+                // **Both instruments, side by side, and nothing else records
+                // them.** What a run is charged is a `max` of the two, so a run
+                // charged more than it spent was charged by exactly one of them
+                // and the gap says which. The report is the program alone; the
+                // reading is the program plus the container it started in; and
+                // [`SHIM_ALLOWANCE`] is the constant standing in for that
+                // container, measured on a host with nothing else to do. On a
+                // loaded one that constant is the likeliest thing to be wrong,
+                // and this line is how anybody would find out.
+                tracing::debug!(
+                    container = name,
+                    reported_us = said.cpu.as_micros() as u64,
+                    cgroup_us = whole.map(|whole| whole.as_micros() as u64),
+                    allowance_us = SHIM_ALLOWANCE.as_micros() as u64,
+                    charged_us = charged.as_micros() as u64,
+                    floored = charged > said.cpu,
+                    "reconciled the program's own time with the container's",
+                );
+
+                outcome.cpu_time = Some(charged);
                 // Memory needs no floor: understating it buys nothing, because
                 // the kernel and not this number decides the memory verdict. The
                 // shim's figure is the better one -- the program's own resident

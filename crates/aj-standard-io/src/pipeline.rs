@@ -204,13 +204,16 @@ pub enum Evaluated {
 pub struct Pipeline<S> {
     sandbox: S,
     images: Images,
-    /// Which core the next timed run is pinned to.
+    /// The processors a timed run may use, taken once from this Runner's own
+    /// affinity.
     ///
-    /// Rotated rather than fixed: pinning every job to core 0 would make a
-    /// machine with sixteen of them evaluate on one, and two Runners sharing a
-    /// host would fight over it. The build is not pinned — it is not the step
-    /// being timed, and it is the one that benefits from more.
-    next_core: std::sync::atomic::AtomicUsize,
+    /// `None` — the default — means it was given the whole machine, and then
+    /// nothing is pinned at all. `aj_sandbox::affinity` holds that decision and
+    /// what was measured to reach it.
+    ///
+    /// The build is not pinned either way: it is not the step being timed, and
+    /// it is the one that benefits from more.
+    cpus: Option<String>,
 }
 
 impl<S: Sandbox> Pipeline<S> {
@@ -218,17 +221,16 @@ impl<S: Sandbox> Pipeline<S> {
         Self {
             sandbox,
             images,
-            next_core: std::sync::atomic::AtomicUsize::new(0),
+            cpus: aj_sandbox::affinity::allowed(),
         }
     }
 
-    fn core(&self) -> usize {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        self.next_core
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % cores
+    /// A timed run, confined to the processors this Runner was given.
+    ///
+    /// **Given, not chosen.** Where the Runner may use the whole machine this
+    /// adds nothing and the host's scheduler places the job.
+    fn pinned(&self, profile: Profile) -> Profile {
+        pin(profile, self.cpus.as_deref())
     }
 
     pub async fn evaluate(&self, job: &Job<'_>) -> Evaluated {
@@ -409,20 +411,21 @@ impl<S: Sandbox> Pipeline<S> {
             let run = self
                 .sandbox
                 .run(
-                    &Profile::new(
-                        &language.image,
-                        language::with_input(&language.start, &test.name),
-                    )
-                    .memory_bytes(limits.memory_bytes)
-                    .pids(16)
-                    .cpuset(self.core())
-                    // The one step a participant is judged on the time of, and
-                    // so the one that goes through the shim.
-                    .measured()
-                    .max_output_bytes(64 * 1024 * 1024)
-                    .wall_clock(reaping_deadline(limits.time_ms))
-                    .mount(Mount::read_only(&artefacts.on_host, PROGRAM))
-                    .mount(input_mount(&job.package.on_host, &test.name)),
+                    &self.pinned(
+                        Profile::new(
+                            &language.image,
+                            language::with_input(&language.start, &test.name),
+                        )
+                        .memory_bytes(limits.memory_bytes)
+                        .pids(16)
+                        // The one step a participant is judged on the time of, and
+                        // so the one that goes through the shim.
+                        .measured()
+                        .max_output_bytes(64 * 1024 * 1024)
+                        .wall_clock(reaping_deadline(limits.time_ms))
+                        .mount(Mount::read_only(&artefacts.on_host, PROGRAM))
+                        .mount(input_mount(&job.package.on_host, &test.name)),
+                    ),
                 )
                 .await
                 .map_err(|e| format!("a test could not be run: {e}"))?;
@@ -740,6 +743,19 @@ fn reaping_deadline(time_ms: u64) -> Duration {
     Duration::from_millis(time_ms.saturating_mul(3)) + Duration::from_secs(1)
 }
 
+/// A timed run confined to the processors the Runner was given, and to nothing
+/// where it was given the whole machine.
+///
+/// A function of its argument rather than of the process, so the decision this
+/// makes is testable without a machine that has been divided up.
+/// `aj_sandbox::affinity` decides which of the two a Runner is in.
+fn pin(profile: Profile, cpus: Option<&str>) -> Profile {
+    match cpus {
+        Some(cpus) => profile.cpuset(cpus),
+        None => profile,
+    }
+}
+
 /// What one test cost, where anything was run at all.
 ///
 /// **One value for both numbers, because they are one reading.** They come out
@@ -916,6 +932,29 @@ mod tests {
     use super::*;
 
     use crate::policy::Violation;
+
+    fn a_run() -> Profile {
+        Profile::new("image", vec!["true".to_owned()])
+    }
+
+    /// **A Runner given the whole machine pins nothing**, and this is the case
+    /// that has to keep working without anybody configuring it: several Runners
+    /// choosing processors with nothing coordinating them is worse than letting
+    /// the host place the work, and a pin also forbids the kernel from moving a
+    /// job off a processor somebody else is using.
+    #[test]
+    fn a_runner_that_was_given_no_processors_in_particular_pins_none() {
+        assert_eq!(pin(a_run(), None).cpuset, None);
+    }
+
+    /// And a Runner that *was* given a set hands that set on, because a job
+    /// container is the daemon's child and inherits no affinity from the Runner
+    /// that asked for it.
+    #[test]
+    fn a_runner_given_processors_confines_its_jobs_to_them() {
+        assert_eq!(pin(a_run(), Some("0,1")).cpuset, Some("0,1".to_owned()));
+        assert_eq!(pin(a_run(), Some("4-7")).cpuset, Some("4-7".to_owned()));
+    }
 
     fn violations(how_many: usize) -> Vec<Violation> {
         (1..=how_many)
