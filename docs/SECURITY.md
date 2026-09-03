@@ -47,14 +47,14 @@ correctly.
 | wall clock = **three times the limit plus one second** | not a limit anybody is judged against: a time limit is processor time, so this reaps what is *not* spending any — one stuck in an uninterruptible syscall, or one that waits rather than computes |
 | an output cap enforced **while it runs** | read afterwards, a flooding program fills the host's disk first |
 
-**The tmpfs row was in this table until 2026-08-31 and did not belong**: no step
-that runs a submission is given one. The two profiles that ask for a tmpfs are
-the submission build and the checker build, and both ask for a writable root on
-the next line — so the two properties are mutually exclusive across the pipeline.
+**No step that runs a submission is given a tmpfs.** The two profiles that ask
+for one are the submission build and the checker build, and both ask for a
+writable root on the next line — so the two properties are mutually exclusive
+across the pipeline.
 A running submission's only writable path is `/dev/shm`, which the contract below
 describes as a surface nobody declared and rule 3's test names explicitly.
 
-**A memory kill is told from two places, and that is since 2026-09-03.** The
+**A memory kill is told from two places.** The
 container runtime reports `OOMKilled` on the container, and the kernel counts in
 the run's own cgroup — `memory.events`, read beside `memory.peak` and
 `cpu.stat`. Either source is enough, and neither is checked against the other.
@@ -71,27 +71,18 @@ Together they are a program killed for exceeding the limit it was given.
 `memory.events` and not `memory.events.local`, because the container runs in a
 *child* of the cgroup this reads and only the first is hierarchical.
 
-The second was added because the first was caught being wrong: CI reported a
-container that exited **137 after 117 ms** with `OOMKilled` false, on a
-systemd-driver host. That is not a missing number but a **wrong verdict** — a
-memory limit told to a participant as a runtime error — and there was nothing
-else in the product to catch it, because `Stopped::Memory` was the only route to
-that verdict. It did not recur in 25 local attempts, so it is a rare race in the
-runtime rather than a broken flag; a second opinion is the cheap answer to a
-rare one.
+**Two sources because the runtime's flag is not reliable on its own.** It has
+been observed reporting `OOMKilled` false for a container that exited **137
+after 117 ms** on a systemd-driver host. That is not a missing number but a
+**wrong verdict** — a memory limit told to a participant as a runtime error —
+and `Stopped::Memory` is the only route to that verdict, so nothing else would
+catch it. It does not recur in 25 attempts, so it is a rare race in the runtime
+rather than a broken flag; a second opinion is the cheap answer to a rare one.
 
 Every row has a test in `crates/aj-sandbox/tests/adversarial.rs`, and each
 asserts two things: the program was stopped correctly, **and the host is
 unchanged afterwards**. A sandbox that contains a program by leaking a process
 has not contained it.
-
-**That was untrue for a day, and the four rows it was untrue of are worth
-naming.** Until 2026-08-31 nothing tested `--cap-drop=ALL`,
-`--security-opt=no-new-privileges`, `--user 65534:65534` or the CPU pair — every
-case built its profile through one helper that set none of them, so identity,
-capabilities and CPU pinning were configured and unproven. Five cases also had
-no leftovers assertion, among them the one this document cites below as the proof
-of rule 3. All of it is closed; the suite is twenty cases now.
 
 **One of those four taught something that outlives it.** The obvious capability
 test — assert the effective set is empty — is no test at all here. Measured with
@@ -119,9 +110,9 @@ has a test rather than a paragraph.
    answer that does not depend on cleanup having been written correctly.
 2. **The program is given its own test's input and nothing else.** One file:
    `<name>.in`, mounted read-only, and the program is started as
-   `exec … < /in/<name>.in`. Until 2026-08-09 the whole `tests/` directory was
-   mounted, which put `<name>.out` — the answer — inside the submission's own
-   container. See `pipeline.rs::input_mount`.
+   `exec … < /in/<name>.in`. Mounting the whole `tests/` directory would put
+   `<name>.out` — the answer — inside the submission's own container. See
+   `pipeline.rs::input_mount`.
 3. **Nothing a program writes reaches the next test.** Asserted in
    `adversarial.rs::nothing_survives_from_one_run_to_the_next`, for the scratch
    tmpfs **and** for `/dev/shm`.
@@ -209,24 +200,15 @@ memory limit is OOM-killed there and `OOMKilled` is reported. What v1 cannot do
 is **measure**: `memory.peak` and `cpu.stat` are v2 interfaces, and `isolate`
 2.x dropped v1 outright.
 
-**Since 2026-09-02 that is a refusal to judge, not a missing number.** A time
-limit is decided on processor time read from `cpu.stat`, so the refusal covers
-three conditions rather than one — cgroup v1, a cgroup driver this Runner knows
-neither of, and a cgroup tree it cannot use. The second and third used to give
-up with a single `info` line and judge anyway, which was defensible while the
-reading was only printed beside a verdict.
-
-**The middle one narrowed on 2026-09-03**, when the Runner learned to measure
-under the `systemd` driver as well as `cgroupfs`. It had refused every systemd
-host, which is virtually every Linux server, and the cost of that was an
-operator editing `/etc/docker/daemon.json` and restarting the daemon before the
-product would judge anything.
+**That is a refusal to judge, not a missing number.** A time limit is decided on
+processor time read from `cpu.stat`, so the refusal covers three conditions:
+cgroup v1, a cgroup driver this Runner knows neither of, and a cgroup tree it
+cannot use.
 
 **Measuring at all needs the Runner's own container to run as root under
 `cgroupfs`, and only the peak-memory number needs it under `systemd`** — the
 tree's directories are root's, and `cgroupfs` is the backend that creates one.
-Running as root is a decision rather than a slip: the
-Runner holds the container runtime's socket, which is root-equivalent on the
+Running as root is a decision rather than a slip: the Runner holds the container runtime's socket, which is root-equivalent on the
 host by §1 of this document, so the uid inside its container was never the
 boundary. Nothing it *starts* gains anything by it — a job container still runs
 as `65534:65534` with every capability dropped.

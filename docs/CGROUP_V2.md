@@ -26,10 +26,8 @@ Asking the daemon rather than reading `/sys/fs/cgroup` is deliberate: the Runner
 may itself be in a container, and what *it* sees is a different question from
 what the containers *it starts* will get.
 
-*This cited `:211` until 2026-08-30 and `:334` until 2026-08-31, each right when
-written and drifted within the day. **The number is gone rather than re-pinned a
-third time** — search for `cgroup_version`. A line number is the citation most
-likely to be wrong, and this document said so while carrying one.*
+*No line number is given: search for `cgroup_version`. A line number is the
+citation most likely to be wrong.*
 
 **Do not test with `[ -s /sys/fs/cgroup/cgroup.controllers ]`.** A cgroup
 pseudo-file reports `st_size` zero however much it holds, so the size test calls
@@ -47,10 +45,9 @@ every host v1. Test the content.
 | **Docker** | ≥ 20.10 | earlier versions have no cgroup v2 support at all |
 | **Swap** | accounted, or absent | see §4 |
 
-*The **5.19** in the row above predates this document's checks and could not be
-confirmed against the kernel's own summaries on 2026-09-03. It is left as it was
-rather than replaced with a second guess; the command in §1 and the Runner's own
-refusal are what an operator should go by, and both are facts about the host
+*The **5.19** above is **unverified**: it could not be confirmed against the
+kernel's own summaries, and is left rather than replaced with a second guess. Go
+by the command in §1 and by the Runner's refusal — both are facts about the host
 rather than about a version number.*
 
 ### Distributions
@@ -102,20 +99,15 @@ Both suites passed on this host with **no escape hatch**, on 2026-08-09:
 `aj-sandbox --test adversarial` **11/11**, `aj-standard-io --test judging`
 **10/10**.
 
-> **Both suites have grown since, so those fractions describe 2026-08-09 and
-> nothing later.** Counted on 2026-08-30: `crates/aj-sandbox/tests/adversarial.rs`
-> held **12** cases and `crates/aj-standard-io/tests/judging.rs` held **21**; on
-> 2026-08-31 they hold **16** and **22**. That is a count of the files, not a
-> run — this document reports one measurement on one host and a fresh number
-> belongs to a fresh measurement.
+> **Those fractions describe that run and nothing later.** Both suites have
+> grown since; a fresh number belongs to a fresh measurement.
 >
-> **This said "none of them ignored", and the truth is the opposite: every one
-> is.** Both suites need a container runtime, so every case carries `#[ignore]`
-> and `--include-ignored` is mandatory — which is why the commands below carry
-> it. A reader who believed the old clause ran them without it and saw
-> `0 passed; 0 failed; 16 ignored`, which reads like a pass.
+> **Every case is `#[ignore]`d**, because both suites need a container runtime,
+> so `--include-ignored` is mandatory — which is why the commands below carry it.
+> Without it the run reports `0 passed; 0 failed; 16 ignored`, which reads like a
+> pass.
 >
-> **And neither command above is runnable as written.** Rust is not installed on
+> **Neither command above is runnable as written.** Rust is not installed on
 > the development host; everything goes through the container wrapper:
 >
 > ```
@@ -123,9 +115,7 @@ Both suites passed on this host with **no escape hatch**, on 2026-08-09:
 > AJ_DOCKER_SOCKET=1 ./x test -p aj-standard-io --test judging -- --include-ignored --test-threads=1
 > ```
 >
-> Both suites need the socket, and this named only the adversarial one until
-> 2026-08-31 — so the judging command was printed without it and could not have
-> worked. `AJ_DOCKER_SOCKET` is what mounts the runtime socket and
+> **Both suites need the socket.** `AJ_DOCKER_SOCKET` is what mounts it and
 > `/sys/fs/cgroup`; both start sibling containers, and the adversarial one also
 > reads their cgroups. An ordinary `./x test` deliberately does not take that
 > privilege — anything that can reach the socket is root on the host.
@@ -276,10 +266,6 @@ start that the number beside it will be missing.
 not. Preflight *attempts the reset* rather than merely opening the file, so what
 it reports is the interface rather than a file mode.
 
-*This said **6.8** from 2026-09-03 until it was checked against the kernel later
-the same day. The number had never been verified against anything — the reset
-was measured working on a 6.18 host and the version was asserted around it.*
-
 **And a reset does not zero the mark — it sets it to the usage of the moment,
 which on a shared slice is not zero.** Page cache charged to a container is
 **reparented to the parent** when that container dies, so the slice accumulates
@@ -316,28 +302,51 @@ AJ_Sandbox__CgroupRoot      # defaults to /sys/fs/cgroup
 
 Without the host namespace the Runner sees its own cgroup as the root, and the
 path it reads is not the path the daemon resolved `--cgroup-parent` against.
-That used to be an empty read rather than a failure; preflight now refuses a
-root whose `cgroup.controllers` it cannot read.
+Preflight refuses a root whose `cgroup.controllers` it cannot read, so this is a
+refusal at start rather than an empty read at judging time.
 
 **It costs write permission, not a capability.** Creating a directory in a
 mounted cgroup2 needs neither `CAP_SYS_ADMIN` nor privilege — which is the whole
 reason D-13 could decline `isolate` and keep the numbers.
 
-**These are refusals since 2026-09-02, not degradations.** The Runner used to
-give up with one `info` line and judge anyway, so an operator could satisfy
-every row of the table above and still get nothing, with a single line to say
-so. That was defensible while the reading was only printed beside a verdict. A
-time limit is now decided on processor time read from `cpu.stat`, so a Runner
-that cannot read one cannot judge, and says so at start rather than failing
-every job it later claims.
+**These are refusals, not degradations.** A time limit is decided on processor
+time read from `cpu.stat`, so a Runner that cannot read one cannot judge — and
+it says so at start rather than failing every job it later claims.
 
-*Requiring the `cgroupfs` driver was a refusal too, from 2026-08-31 to
-2026-09-03, and it was the expensive one: it meant every systemd host on earth
-had to edit `/etc/docker/daemon.json` and restart its daemon before it could
-judge anything. **Nothing here asks for that any more.** It was found the way
-such things are: CI caught it and the workstation did not, because the
-workstation runs `cgroupfs` and a GitHub runner runs `systemd`. CI now runs
-both, as a matrix, for the same reason.*
+*Neither driver is a refusal, and no host has to reconfigure its daemon. A
+workstation on Docker Desktop can only ever be `cgroupfs` and a GitHub runner is
+`systemd`, which is why CI runs both as a matrix: one host cannot cover them.*
+
+### What a Runner leaves behind, and why it stays
+
+**One cgroup, its own, and it outlives the process.** Under `cgroupfs` that is
+`<root>/algojudge`, reused by every Runner on the host; under `systemd` it is
+`algojudge-<fingerprint>.slice`, one per Runner identity. Per-run cgroups are
+removed — that is what the `cgroupfs` backend's `rmdir` does and what the
+systemd backend avoids needing by not asking for one — but the home itself is
+never taken away.
+
+**The Runner cannot take it away, and this is measured rather than assumed.**
+`rmdir` on a slice whose unit is still loaded is **undone**: systemd recreated
+the directory both times it was removed on 2026-09-03. Stopping the unit is the
+only thing that works, and that needs a D-Bus connection to systemd which this
+Runner deliberately does not hold — it holds the container runtime's socket and
+nothing else. There is also nowhere to hook it: the Runner installs no signal
+handler and is killed rather than asked to stop.
+
+**The cost is one empty slice per Runner identity that has judged something**,
+and it is one rather than many for a reason worth knowing: **the slice is
+created when a container is first started under it**, not when the Runner
+starts. A Runner that registered and waited for approval leaves nothing at all.
+Counted on the development host after a full day of this work: one, beside the
+two the test suites own.
+
+It grows only where identities are recreated — `docker compose down -v` destroys
+the identity volume, so a development host accumulates one per cycle that
+judged. **Accepted rather than solved**: the alternative is a D-Bus
+dependency in a process whose whole security argument is how little it reaches
+for. `AlgoJudge-Ops/docs/OPERATIONS.md` says what an operator does about it,
+under garbage collection, and the answer is that a reboot clears them.
 
 ### A third thing read from the same cgroup
 
@@ -364,11 +373,11 @@ container killed by its own limit reports `oom 1, oom_kill 1`, and the cgroup
 the Runner reads carries no limit of its own (`memory.max` is `max`), so nothing
 it sees is an ancestor's doing.
 
-**The runtime's `OOMKilled` was the only source until then, and it was caught
-being wrong**: a container that exited 137 after 117 ms, reported as not
-OOM-killed, on a systemd-driver host. A memory limit reaching a participant as a
-runtime error is a wrong verdict rather than a missing number, and nothing else
-in the product would have caught it. Either source saying so is now enough.
+**Two sources because the runtime's `OOMKilled` is not reliable on its own.**
+It has been observed reporting a container as not OOM-killed that exited 137
+after 117 ms, on a systemd-driver host — rare, and not reproduced in 25
+attempts, but a memory limit reaching a participant as a runtime error is a
+wrong verdict rather than a missing number. Either source saying so is enough.
 
 ### The rule this implies for calibration
 

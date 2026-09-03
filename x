@@ -18,9 +18,9 @@
 #   ./x build            ./x test            ./x fmt
 #   ./x clippy           ./x run             ./x shell
 #
-# This offered `./x run -- --help` until 2026-08-31. The Runner parses no
-# arguments at all, so that reached no help: it built, started, and stopped at
-# the first configuration check.
+# `./x run` takes no arguments worth passing: the Runner parses none at all, so
+# `-- --help` reaches no help -- it builds, starts, and stops at the first
+# configuration check.
 #
 set -eu
 
