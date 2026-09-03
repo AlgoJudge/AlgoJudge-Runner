@@ -135,7 +135,7 @@ impl Docker {
         }
 
         let name = format!("algojudge-{}-shimprobe", self.instance);
-        let _ = self.remove(&name).await;
+        self.take_nothing(&name).await;
         let created = self
             .client
             .create_container(
@@ -718,15 +718,33 @@ impl Docker {
     }
 
     async fn remove(&self, name: &str) {
-        let options = RemoveContainerOptionsBuilder::default()
-            .force(true)
-            .v(true)
-            .build();
-        if let Err(e) = self.client.remove_container(name, Some(options)).await {
+        if let Err(e) = self.take_away(name).await {
             // Worth a warning rather than a shrug: an evaluation host that
             // accumulates these runs out of disk on the busiest day of the year.
             tracing::warn!(container = name, %e, "a sandbox container was left behind");
         }
+    }
+
+    /// The same removal where **there is usually nothing to remove**, and the
+    /// absence is the ordinary case rather than a leak.
+    ///
+    /// Only the shim probe, which clears a name it is about to reuse in case a
+    /// killed Runner left one behind. Going through [`Self::remove`] there
+    /// reported `404: no such container` as a container left behind, on every
+    /// probe of every image — an operator being taught that this warning means
+    /// nothing, which is the whole of what it costs.
+    async fn take_nothing(&self, name: &str) {
+        if let Err(e) = self.take_away(name).await {
+            tracing::debug!(container = name, %e, "nothing to clear before the probe");
+        }
+    }
+
+    async fn take_away(&self, name: &str) -> std::result::Result<(), bollard::errors::Error> {
+        let options = RemoveContainerOptionsBuilder::default()
+            .force(true)
+            .v(true)
+            .build();
+        self.client.remove_container(name, Some(options)).await
     }
 }
 
