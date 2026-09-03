@@ -159,7 +159,7 @@ impl Cgroups {
                 let opened = if fresh { None } else { reset_peak(&here) };
                 Measuring::Shared {
                     cpu_before: usage_usec(&here).unwrap_or(0),
-                    oom_before: oom_kills(&here).unwrap_or(0),
+                    oom_before: memory_kills(&here).unwrap_or((0, 0)),
                     memory_before: opened.as_ref().map_or(0, |(_, at_reset)| *at_reset),
                     peak: opened.map(|(file, _)| file),
                     fresh,
@@ -249,16 +249,32 @@ impl Cgroups {
 pub(crate) struct Reading {
     pub(crate) peak_memory_bytes: Option<u64>,
     pub(crate) cpu_time: Option<Duration>,
-    /// How many processes the kernel killed for being over the memory limit.
+    /// Processes the kernel killed here — `oom_kill` from `memory.events`.
     ///
     /// **The second opinion on a memory kill, and the one that comes from the
     /// kernel.** The runtime reports `OOMKilled` on the container, which is what
     /// the verdict was decided on until 2026-09-03 — and CI caught it reporting
     /// `false` for a container that exited 137 after 117 ms, which turns a
-    /// memory limit into a runtime error in front of a participant. This counter
-    /// is `memory.events`, it is hierarchical, and it is read from the same
-    /// cgroup as everything else here.
+    /// memory limit into a runtime error in front of a participant.
+    ///
+    /// **Not enough on its own**, and the kernel's own wording is why: *"the
+    /// number of processes belonging to this cgroup killed by **any kind of OOM
+    /// killer**"*. That includes the system one, so a host that ran out of
+    /// memory and killed a submission would be reported as the submission
+    /// exceeding its own limit. See [`Self::over_limit`].
     pub(crate) oom_kills: u64,
+
+    /// Times this cgroup reached **its own** limit — `oom` from `memory.events`.
+    ///
+    /// *"The number of time the cgroup's memory usage was reached the limit and
+    /// allocation was about to fail."* That is the question a memory verdict
+    /// asks, and it is what tells a submission over its limit from a host over
+    /// its own.
+    ///
+    /// **Also not enough on its own**: it moves without anything dying —
+    /// measured on one slice after a term of judging, `oom 845` against
+    /// `oom_kill 843`. So a memory kill is both, and neither alone.
+    pub(crate) over_limit: u64,
 }
 
 /// One run's measurement, held from before its container starts until after it
@@ -271,9 +287,9 @@ pub(crate) enum Measuring {
     Shared {
         here: PathBuf,
         cpu_before: u64,
-        /// Kills the slice had already seen. Cumulative like `cpu_before`, and
-        /// for the same reason: one slice serves every run.
-        oom_before: u64,
+        /// What the slice had already seen, both counters. Cumulative like
+        /// `cpu_before`, and for the same reason: one slice serves every run.
+        oom_before: (u64, u64),
         /// What the slice already held when the run began, and **the reason a
         /// peak here is a subtraction.**
         ///
@@ -307,8 +323,8 @@ impl Measuring {
             Self::Own { here } => {
                 let peak = read_number(&here.join("memory.peak"));
                 let cpu = usage_usec(&here).map(Duration::from_micros);
-                // A directory of this run's own, so the count is this run's.
-                let oom_kills = oom_kills(&here).unwrap_or(0);
+                // A directory of this run's own, so the counts are this run's.
+                let (oom_kills, over_limit) = memory_kills(&here).unwrap_or((0, 0));
                 // Read before the directory goes, and removed here rather than
                 // left: the child's own cgroup is taken away with its container,
                 // and this one is nobody else's to collect.
@@ -317,6 +333,7 @@ impl Measuring {
                     peak_memory_bytes: peak,
                     cpu_time: cpu,
                     oom_kills,
+                    over_limit,
                 }
             }
             Self::Shared {
@@ -342,10 +359,12 @@ impl Measuring {
                     (None, true) => read_number(&here.join("memory.peak")),
                     (None, false) => None,
                 };
+                let (kills, limits) = memory_kills(&here).unwrap_or(oom_before);
                 Reading {
                     peak_memory_bytes: peak,
                     cpu_time: cpu,
-                    oom_kills: oom_kills(&here).map_or(0, |after| after.saturating_sub(oom_before)),
+                    oom_kills: kills.saturating_sub(oom_before.0),
+                    over_limit: limits.saturating_sub(oom_before.1),
                 }
             }
         }
@@ -510,17 +529,24 @@ fn usage_usec(dir: &Path) -> Option<u64> {
         .and_then(|v| v.trim().parse().ok())
 }
 
-/// `oom_kill` from `memory.events`: how many processes the kernel killed here
-/// for being over the memory limit, this cgroup and everything under it.
+/// `oom_kill` and `oom` from `memory.events`, in that order.
 ///
-/// `memory.events` rather than `memory.events.local`, because the container
-/// runs in a child of the cgroup this reads.
-fn oom_kills(dir: &Path) -> Option<u64> {
-    std::fs::read_to_string(dir.join("memory.events"))
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("oom_kill "))
-        .and_then(|v| v.trim().parse().ok())
+/// **`memory.events` and not `memory.events.local`**, because the container runs
+/// in a *child* of the cgroup this reads and only the first is hierarchical:
+/// *"all fields in this file are hierarchical"*, against `.local`, whose fields
+/// are *"local to the cgroup i.e. not hierarchical"*.
+///
+/// Both fields or neither: they answer different questions, and [`Reading`]
+/// says which is which.
+fn memory_kills(dir: &Path) -> Option<(u64, u64)> {
+    let events = std::fs::read_to_string(dir.join("memory.events")).ok()?;
+    let field = |name: &str| {
+        events
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    Some((field("oom_kill ")?, field("oom ")?))
 }
 
 fn read_number(path: &Path) -> Option<u64> {
@@ -764,6 +790,10 @@ oom_group_kill 0
 
         let reading = Measuring::Own { here: here.clone() }.finish();
         assert_eq!(reading.oom_kills, 2);
+        assert_eq!(
+            reading.over_limit, 1,
+            "`oom` is not `oom_kill`, and both are read"
+        );
         assert_eq!(reading.peak_memory_bytes, Some(7_655_424));
         assert_eq!(reading.cpu_time, Some(Duration::from_micros(4056)));
 
@@ -789,11 +819,11 @@ oom_kill 0
 ",
         )
         .unwrap();
-        assert_eq!(oom_kills(&here), Some(0));
+        assert_eq!(memory_kills(&here), Some((0, 0)));
 
         std::fs::remove_file(here.join("memory.events")).unwrap();
         assert_eq!(
-            oom_kills(&here),
+            memory_kills(&here),
             None,
             "absent is not zero, and finish() decides which"
         );
