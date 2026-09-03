@@ -55,10 +55,21 @@ A running submission's only writable path is `/dev/shm`, which the contract belo
 describes as a surface nobody declared and rule 3's test names explicitly.
 
 **A memory kill is told from two places, and that is since 2026-09-03.** The
-container runtime reports `OOMKilled` on the container, and the kernel counts
-kills in the run's own cgroup — `memory.events`, read beside `memory.peak` and
-`cpu.stat`. Either saying so is enough, and neither is checked against the
-other.
+container runtime reports `OOMKilled` on the container, and the kernel counts in
+the run's own cgroup — `memory.events`, read beside `memory.peak` and
+`cpu.stat`. Either source is enough, and neither is checked against the other.
+
+**The kernel's half is two fields and needs both**, because each alone says the
+wrong thing — the definitions are the kernel's own:
+
+| Field | *"…"* | Alone it would |
+|---|---|---|
+| `oom_kill` | *the number of processes belonging to this cgroup killed by **any kind of OOM killer*** | blame a submission for a **host** that ran out of memory |
+| `oom` | *the number of time the cgroup's memory usage **was reached the limit** and allocation was about to fail* | report a limit reached but survived — measured on one slice after a term of judging, `oom 845` against `oom_kill 843` |
+
+Together they are a program killed for exceeding the limit it was given.
+`memory.events` and not `memory.events.local`, because the container runs in a
+*child* of the cgroup this reads and only the first is hierarchical.
 
 The second was added because the first was caught being wrong: CI reported a
 container that exited **137 after 117 ms** with `OOMKilled` false, on a

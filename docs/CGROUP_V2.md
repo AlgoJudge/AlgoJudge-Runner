@@ -326,12 +326,28 @@ both, as a matrix, for the same reason.*
 
 ### A third thing read from the same cgroup
 
-`memory.events` carries `oom_kill`, a count of the processes the kernel killed
-in this cgroup and everything under it for being over the limit. Since
-2026-09-03 the Runner reads it beside `memory.peak` and `cpu.stat` and treats it
-as a second source for the `Memory limit exceeded` verdict — under `cgroupfs`
-the run's own directory, so the count is the run's; under `systemd` a difference
-across the slice, exactly as processor time is.
+`memory.events` carries two counters the Runner reads beside `memory.peak` and
+`cpu.stat`, as a second source for the `Memory limit exceeded` verdict — under
+`cgroupfs` from the run's own directory, so the counts are the run's; under
+`systemd` as differences across the slice, exactly as processor time is.
+
+**Both are needed, and the kernel's own definitions are why.** `oom_kill` is
+*"the number of processes belonging to this cgroup killed by **any kind of OOM
+killer**"* — the system one included, so on its own it would blame a submission
+for a host that ran out of memory. `oom` is *"the number of time the cgroup's
+memory usage was reached **the limit** and allocation was about to fail"* — the
+right question, but it moves without anything dying: measured on one slice after
+a term of judging, `oom 845` against `oom_kill 843`. A memory kill is both.
+
+`memory.events` rather than `memory.events.local`: the container runs in a child
+of the cgroup being read, and only the first is hierarchical — *"all fields in
+this file are hierarchical"*, against `.local`, *"local to the cgroup i.e. not
+hierarchical"*.
+
+Verified against `Documentation/admin-guide/cgroup-v2` and on both drivers: a
+container killed by its own limit reports `oom 1, oom_kill 1`, and the cgroup
+the Runner reads carries no limit of its own (`memory.max` is `max`), so nothing
+it sees is an ancestor's doing.
 
 **The runtime's `OOMKilled` was the only source until then, and it was caught
 being wrong**: a container that exited 137 after 117 ms, reported as not

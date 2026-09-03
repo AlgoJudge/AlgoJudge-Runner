@@ -398,7 +398,7 @@ impl Sandbox for Docker {
             if let Ok(outcome) = outcome.as_mut() {
                 outcome.peak_memory_bytes = reading.peak_memory_bytes;
                 outcome.cpu_time = reading.cpu_time;
-                outcome.stopped = memory_kill(outcome.stopped, reading.oom_kills);
+                outcome.stopped = memory_kill(outcome.stopped, &reading);
             }
         }
         outcome
@@ -589,12 +589,19 @@ impl Docker {
 /// this is a rare race and not a broken flag; a second opinion is the cheap
 /// answer to a rare one.
 ///
+/// **The kernel's half is two counters and needs both**, because each alone says
+/// the wrong thing. `oom_kill` counts kills *by any kind of OOM killer*, so a
+/// host out of memory would be reported as a submission over its limit; `oom`
+/// counts this cgroup reaching **its own** limit, and moves without anything
+/// dying. Together they are a program killed for exceeding the limit it was
+/// given.
+///
 /// **Memory outranks everything**, which is what the runtime's flag already did
 /// here: a program stopped at the reaping deadline or over the output cap
 /// *while also* being OOM-killed ran out of memory, and that is the useful
 /// thing to tell somebody.
-fn memory_kill(stopped: Stopped, oom_kills: u64) -> Stopped {
-    if oom_kills > 0 {
+fn memory_kill(stopped: Stopped, reading: &cgroups::Reading) -> Stopped {
+    if reading.oom_kills > 0 && reading.over_limit > 0 {
         Stopped::Memory
     } else {
         stopped
@@ -677,6 +684,14 @@ fn rand_suffix() -> u64 {
 mod tests {
     use super::*;
 
+    fn reading(oom_kills: u64, over_limit: u64) -> cgroups::Reading {
+        cgroups::Reading {
+            oom_kills,
+            over_limit,
+            ..Default::default()
+        }
+    }
+
     /// Nothing the kernel did not count changes what a run was stopped by.
     #[test]
     fn no_kill_leaves_the_runtimes_answer_alone() {
@@ -686,7 +701,7 @@ mod tests {
             Stopped::Output,
             Stopped::Memory,
         ] {
-            assert_eq!(memory_kill(stopped, 0), stopped);
+            assert_eq!(memory_kill(stopped, &reading(0, 0)), stopped);
         }
     }
 
@@ -694,14 +709,44 @@ mod tests {
     /// and the kernel had killed something in it for being over the limit.
     #[test]
     fn a_kill_the_runtime_did_not_report_is_still_a_memory_limit() {
-        assert_eq!(memory_kill(Stopped::OnItsOwn, 1), Stopped::Memory);
+        assert_eq!(
+            memory_kill(Stopped::OnItsOwn, &reading(1, 1)),
+            Stopped::Memory
+        );
+    }
+
+    /// **A host out of memory is not a submission over its limit.** `oom_kill`
+    /// counts kills by any OOM killer, the system one included, so alone it
+    /// would blame a program for the machine it ran on.
+    #[test]
+    fn a_kill_this_cgroup_did_not_earn_is_not_a_memory_limit() {
+        assert_eq!(
+            memory_kill(Stopped::OnItsOwn, &reading(1, 0)),
+            Stopped::OnItsOwn
+        );
+    }
+
+    /// **And reaching the limit is not being killed by it.** `oom` moves
+    /// without anything dying: measured, `oom 845` against `oom_kill 843`.
+    #[test]
+    fn reaching_the_limit_without_dying_is_not_a_memory_limit() {
+        assert_eq!(
+            memory_kill(Stopped::OnItsOwn, &reading(0, 1)),
+            Stopped::OnItsOwn
+        );
     }
 
     /// Memory outranks the deadline and the output cap, which is what the
     /// runtime's own flag already did at this point.
     #[test]
     fn a_memory_kill_outranks_what_else_may_have_stopped_it() {
-        assert_eq!(memory_kill(Stopped::WallClock, 1), Stopped::Memory);
-        assert_eq!(memory_kill(Stopped::Output, 3), Stopped::Memory);
+        assert_eq!(
+            memory_kill(Stopped::WallClock, &reading(1, 1)),
+            Stopped::Memory
+        );
+        assert_eq!(
+            memory_kill(Stopped::Output, &reading(3, 2)),
+            Stopped::Memory
+        );
     }
 }
