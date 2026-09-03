@@ -180,12 +180,19 @@ impl Cgroups {
     ///
     /// Under `systemd` the Runner creates nothing, so there is nothing left to
     /// prove beyond a readable hierarchy, which [`Self::resolve`] proved.
-    pub(crate) fn prepare(&self) -> Result<()> {
+    ///
+    /// **Named for the Runner and not fixed**, because several of them share one
+    /// host and one `algojudge` directory, and `docker compose up` starts them
+    /// together. With one name they raced: the second saw `AlreadyExists`,
+    /// removed the first one's probe, and the first then failed its own
+    /// `remove_dir` and refused to start blaming the host. Reproduced on the
+    /// first attempt by `two_runners_preparing_at_once_do_not_collide`.
+    pub(crate) fn prepare(&self, instance: &str) -> Result<()> {
         let Self::Cgroupfs { root } = self else {
             return Ok(());
         };
         let home = root.join(OURS);
-        let probe = home.join(".probe");
+        let probe = home.join(probe_name(instance));
         std::fs::create_dir_all(&home)
             .and_then(|()| match std::fs::create_dir(&probe) {
                 Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e),
@@ -415,6 +422,17 @@ fn slice_path(root: &Path, slice: &str) -> Option<PathBuf> {
     Some(path)
 }
 
+/// A probe directory of this Runner's own, inside the shared `algojudge` one.
+///
+/// **A dot rather than `algojudge-`**, so nothing this leaves can be mistaken
+/// for a per-run cgroup, which is exactly what the suites and CI count. A crash
+/// between the two calls leaves **at most one per Runner**, and that Runner's
+/// own next start removes it — the same reasoning that makes `sweep`'s instance
+/// label survive a restart.
+fn probe_name(instance: &str) -> String {
+    format!(".probe.{}", unit_safe(instance))
+}
+
 /// An instance id as one component of a systemd unit name.
 ///
 /// A `-` in a unit name is a level of nesting rather than a character, so one
@@ -632,6 +650,50 @@ mod tests {
                 "/sys/fs/cgroup/algojudge.slice/algojudge-test_judging.slice"
             )),
         );
+    }
+
+    /// **Several Runners share one host and one cgroup tree**, and they start
+    /// together: `docker compose up` brings a second one up alongside the first.
+    /// Nothing either of them does at start may depend on the other not doing it
+    /// at the same moment.
+    #[test]
+    fn two_runners_preparing_at_once_do_not_collide() {
+        let root = std::env::temp_dir().join(format!("aj-prepare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a scratch root");
+
+        // Enough attempts that the window cannot be missed by luck alone.
+        for round in 0..200 {
+            let outcomes: Vec<_> = ["first", "second"]
+                .map(|who| {
+                    let backend = Cgroups::Cgroupfs { root: root.clone() };
+                    let who = who.to_owned();
+                    std::thread::spawn(move || backend.prepare(&who))
+                })
+                .into_iter()
+                .map(|t| t.join().expect("the thread"))
+                .collect();
+
+            for outcome in &outcomes {
+                assert!(
+                    outcome.is_ok(),
+                    "round {round}: a Runner refused to start because another was                      preparing at the same moment: {:?}",
+                    outcome.as_ref().err().map(ToString::to_string),
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_probe_is_this_runners_own_and_is_never_read_as_a_run() {
+        assert_ne!(probe_name("first"), probe_name("second"));
+        for instance in ["abc", "test-judging", "a/b", "../x", ""] {
+            let name = probe_name(instance);
+            assert!(name.starts_with(".probe."), "{name}");
+            assert!(!name.starts_with(OURS), "{name}");
+            assert_eq!(Path::new(&name).components().count(), 1, "{name}");
+        }
     }
 
     #[test]
