@@ -318,7 +318,7 @@ impl Sandbox for Docker {
             .unwrap_or_default();
         let decided = cgroups::root_from_environment()
             .and_then(|root| Cgroups::resolve(&driver, root, &self.instance))
-            .and_then(|chosen| chosen.prepare().map(|()| chosen));
+            .and_then(|chosen| chosen.prepare(&self.instance).map(|()| chosen));
 
         if let Ok(chosen) = &decided {
             tracing::info!(
