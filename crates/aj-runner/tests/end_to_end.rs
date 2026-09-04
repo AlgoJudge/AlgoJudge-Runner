@@ -1229,13 +1229,36 @@ async fn a_runner_told_to_stop_hands_its_job_back_at_once() {
     // because a Runner that comes back and judges it is the only proof that it
     // did come back. Generous: a start is a preflight and four image probes
     // before it claims anything.
-    daemon
-        .start_container(
-            &container,
-            None::<bollard::query_parameters::StartContainerOptions>,
-        )
-        .await
-        .expect("the Runner starts again");
+    // **Asked until it is actually running.** A container that is still shutting
+    // down answers a start with "nothing changed" rather than an error, so one
+    // call is a coin toss on whether the Runner had finished exiting -- and a
+    // lost toss leaves every test after this one without a Runner, which is
+    // exactly how this was found.
+    let mut up = false;
+    for _ in 0..60 {
+        let running = daemon
+            .inspect_container(
+                &container,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .ok()
+            .and_then(|seen| seen.state)
+            .and_then(|state| state.running)
+            .unwrap_or(false);
+        if running {
+            up = true;
+            break;
+        }
+        let _ = daemon
+            .start_container(
+                &container,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(up, "the Runner never came back up");
 
     let judged = settled_within(&participant, &activity, &sent, 360).await;
     assert_eq!(
