@@ -1221,6 +1221,46 @@ async fn a_runner_told_to_stop_hands_its_job_back_at_once() {
         took < Duration::from_secs(60),
         "it took {took:?} to come back, which is the lease expiring rather than          the Runner giving it back",
     );
+
+    // **And the stack is handed on working.** A signal sent with `docker kill`
+    // counts as the operator stopping the container, so `restart: unless-stopped`
+    // leaves it down -- measured, after this case took the Runner away from every
+    // test that ran after it. Started again here, and the submission waited for,
+    // because a Runner that comes back and judges it is the only proof that it
+    // did come back. Generous: a start is a preflight and four image probes
+    // before it claims anything.
+    daemon
+        .start_container(
+            &container,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
+        .await
+        .expect("the Runner starts again");
+
+    let judged = settled_within(&participant, &activity, &sent, 360).await;
+    assert_eq!(
+        judged["state"], "completed",
+        "the Runner never came back to judge it: {judged}",
+    );
+}
+
+/// `settled`, with the patience named by the caller.
+async fn settled_within(
+    participant: &Session,
+    activity: &str,
+    submission: &str,
+    tries: usize,
+) -> Value {
+    for _ in 0..tries {
+        let seen = participant
+            .get(&format!("/activities/{activity}/submissions/{submission}"))
+            .await;
+        match seen["state"].as_str().unwrap_or("") {
+            "completed" | "failed" | "cancelled" => return seen,
+            _ => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    }
+    panic!("submission {submission} never settled");
 }
 
 /// Polls until a submission reads as `want`, and answers with it.
