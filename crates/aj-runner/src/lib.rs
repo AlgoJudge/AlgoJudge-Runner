@@ -13,7 +13,6 @@ use std::time::Duration;
 pub mod config;
 pub mod keeper;
 pub mod run;
-pub mod stopping;
 
 /// Waits between attempts at something that may simply not be ready.
 pub(crate) async fn pause(what: &str, delay: Duration) {

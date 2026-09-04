@@ -33,6 +33,9 @@ aj-standard-io = { path = "../aj-standard-io" }
 # Driving the Server as a manager and as a participant, which is a session and
 # a cookie rather than a Runner token.
 reqwest = { workspace = true, features = ["cookies", "multipart"] }
+# One test sends the Runner a real `SIGTERM` and watches what the Server sees.
+# Nothing else here talks to the daemon; the sandbox does that for the rest.
+bollard = { workspace = true }
 hex.workspace = true
 sha2.workspace = true
 # The clock, stopped. Renewal is a timer against a ten-minute lease, and a test

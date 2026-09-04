@@ -561,7 +561,10 @@ async fn a_runner_that_is_stopping_gives_the_job_back() {
     // was wrong and nothing was recorded against the submission.
     let again = claim_ours(&server).await;
     assert_eq!(again.job_id, job.job_id);
-    assert_ne!(again.lease_token, job.lease_token, "a new lease, not the old");
+    assert_ne!(
+        again.lease_token, job.lease_token,
+        "a new lease, not the old"
+    );
 
     // And the lease it was let go of is gone, so a late renewal from the Runner
     // that stopped cannot reach past the one now holding it.

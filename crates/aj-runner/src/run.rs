@@ -12,7 +12,7 @@ use aj_standard_io::{Evaluated, Pipeline, Places};
 use crate::config::Config;
 use crate::keeper::Keeper;
 use crate::pause;
-use crate::stopping::Stopping;
+use aj_protocol::stopping::Stopping;
 
 /// Registers, waits to be approved, and comes back holding a token.
 ///

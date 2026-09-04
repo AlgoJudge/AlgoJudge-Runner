@@ -1,5 +1,10 @@
 //! Being told to stop, and hearing it everywhere at once.
 //!
+//! **Here rather than in one Runner**, because both of them need it and neither
+//! is more entitled to it: a Runner waiting on a container and an External
+//! Runner waiting on somebody else's archive are stopped the same way and owe
+//! the queue the same thing.
+//!
 //! **A Runner that is stopped in the middle of a job gives that job back.** The
 //! alternative — and what happened before this existed — is going quiet and
 //! letting the lease expire, which costs a participant up to ten minutes while

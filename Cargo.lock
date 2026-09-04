@@ -66,6 +66,7 @@ dependencies = [
  "aj-sandbox",
  "aj-standard-io",
  "anyhow",
+ "bollard",
  "hex",
  "reqwest",
  "serde_json",

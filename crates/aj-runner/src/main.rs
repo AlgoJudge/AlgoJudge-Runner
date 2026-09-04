@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
 
     // **Listening starts before the first claim**, so a stop arriving while the
     // Runner is still waiting to be approved is heard as well.
-    let stopping = aj_runner::stopping::Stopping::listen();
+    let stopping = aj_protocol::stopping::Stopping::listen();
 
     let worked = run::work(&server, &cache, &pipeline, &config, &stopping).await;
 
