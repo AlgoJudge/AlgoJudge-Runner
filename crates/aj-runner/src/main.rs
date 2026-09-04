@@ -88,10 +88,24 @@ async fn main() -> anyhow::Result<()> {
     // A Runner that cannot reach the Server yet is not a Runner that has
     // failed: a Compose stack brings both up at once, and the one that wins the
     // race would otherwise exit before the other finished migrating.
-    run::admitted(&server, &identity, &config).await?;
+    //
+    // **Nothing is listening yet, and that is the right answer here.** A Runner
+    // waiting to be approved holds nothing, so an uncaught `SIGTERM` takes the
+    // process down at once — which is what somebody stopping it wants, and
+    // faster than any handler could manage. Installing one first would only put
+    // machinery between the signal and an exit that costs nothing. The External
+    // Runner says the same where it does the same thing.
+    //
+    // The handle below is therefore one nothing ever says the word to. It is
+    // not decoration: `admitted` is **re-entered from inside `work`**, where a
+    // handler *is* installed, and there the same waits have to hear it — the
+    // comment under this one used to claim they did.
+    let (before_anything_is_held, _never) = aj_protocol::stopping::Stopping::told();
+    run::admitted(&server, &identity, &config, &before_anything_is_held).await?;
 
-    // **Listening starts before the first claim**, so a stop arriving while the
-    // Runner is still waiting to be approved is heard as well.
+    // **Listening starts once there is something to lose**, which is the first
+    // claim. Until 2026-09-04 the comment here said it started before the wait
+    // for approval as well; it did not, and now it deliberately does not.
     let stopping = aj_protocol::stopping::Stopping::listen();
 
     let worked = run::work(&server, &cache, &pipeline, &config, &stopping).await;

@@ -10,10 +10,27 @@
 //! letting the lease expire, which costs a participant up to ten minutes while
 //! idle Runners wait for a deadline nobody is going to miss.
 //!
-//! The signal has to reach two places: the poll, so an idle Runner exits at
-//! once rather than after its backoff, and the evaluation, so a busy one stops
-//! rather than finishing work whose result nobody is waiting for. Both are
-//! `select!` arms against [`Stopping::wait`].
+//! The signal has to reach **every wait**, not two of them. It said "two
+//! places" — the poll and the evaluation — until 2026-09-04, and the sentence
+//! was read as a list rather than as an example: three other waits were sleeping
+//! straight through a stop, and each of them is longer than either of the two
+//! that were covered.
+//!
+//!   - the retry that carries an answer already computed, bounded by the lease:
+//!     **ten minutes** at the shipped default;
+//!   - the wait on a Server that is deliberately down, which honours the
+//!     operator's own `Retry-After` and so has **no bound this side sets**;
+//!   - the registration loop, which a Runner re-enters whenever its token is
+//!     forgotten, and which took no handle at all.
+//!
+//! A container runtime allows thirty seconds. Any of those three turns a stop
+//! into a `SIGKILL`, and a `SIGKILL` is not a slower release — it is none: the
+//! jobs in hand stay leased for their full lease, which is the cost this module
+//! exists to remove.
+//!
+//! [`Stopping::sleep`] is how a wait becomes stop-aware, and the reason it is
+//! here rather than written out at each site is that it was written out at two
+//! sites and forgotten at three.
 
 use std::sync::Arc;
 
@@ -98,6 +115,20 @@ impl Stopping {
     }
 }
 
+impl Stopping {
+    /// Waits out `delay`, or returns early because the word came.
+    ///
+    /// Answers **whether the whole delay elapsed** — so a caller can tell a
+    /// backoff that ran its course from one that was cut short, which is
+    /// usually the difference between trying again and going home.
+    pub async fn sleep(&self, delay: std::time::Duration) -> bool {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => true,
+            _ = self.wait() => false,
+        }
+    }
+}
+
 /// Says the word to every handle made alongside it.
 pub struct Teller(Arc<tokio::sync::watch::Sender<bool>>);
 
@@ -139,6 +170,32 @@ async fn wait_for_a_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A wait that was cut short says so**, and one that ran its course says
+    /// that instead. Every caller of `sleep` branches on the answer, so getting
+    /// the two the wrong way round would turn "we are stopping" into "try
+    /// again" at three sites at once.
+    #[tokio::test]
+    async fn a_sleep_says_whether_it_was_cut_short() {
+        let (stopping, teller) = Stopping::told();
+
+        assert!(
+            stopping.sleep(std::time::Duration::from_millis(10)).await,
+            "a delay nobody interrupted has elapsed",
+        );
+
+        teller.stop();
+        let began = tokio::time::Instant::now();
+        assert!(
+            !stopping.sleep(std::time::Duration::from_secs(30)).await,
+            "a delay the word interrupted has not elapsed",
+        );
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(1),
+            "it waited {:?}, so the word did not cut it short",
+            began.elapsed(),
+        );
+    }
 
     /// **Nothing has been said until something is said.** A Runner that read a
     /// fresh handle as a stop would exit before claiming anything.

@@ -19,7 +19,12 @@ use aj_protocol::stopping::Stopping;
 /// None of the waiting here is a failure. A Runner announces itself and an
 /// administrator approves it, possibly tomorrow; a process that exited because
 /// nobody had got to it yet would have to be watched by something else.
-pub async fn admitted(server: &Server, identity: &Identity, config: &Config) -> anyhow::Result<()> {
+pub async fn admitted(
+    server: &Server,
+    identity: &Identity,
+    config: &Config,
+    stopping: &Stopping,
+) -> anyhow::Result<()> {
     let register = Register {
         name: config.name.clone(),
         product: "AlgoJudge-Runner".into(),
@@ -40,7 +45,7 @@ pub async fn admitted(server: &Server, identity: &Identity, config: &Config) -> 
     let mut backoff = Backoff::new(config.poll_min, config.poll_max);
 
     loop {
-        match server.register(&register).await {
+        match server.register(&register, identity).await {
             Ok(registered) => {
                 if registered.fingerprint != identity.fingerprint() {
                     // Both sides hash the same 32 bytes. Disagreeing means
@@ -67,13 +72,21 @@ pub async fn admitted(server: &Server, identity: &Identity, config: &Config) -> 
                 // decisions for a person, not a retry loop.
                 anyhow::bail!("this key has been revoked; register a new one: {e}");
             }
-            Err(e) if e.unavailable() => wait_out(server, &e, &mut backoff).await,
+            Err(e) if e.unavailable() => {
+                if !wait_out(server, &e, &mut backoff, stopping).await {
+                    return Ok(());
+                }
+            }
             Err(e) if e.retryable() => {
-                pause(
+                if !pause(
                     &format!("the Server is not answering ({e})"),
                     how_long(&e, &mut backoff),
+                    stopping,
                 )
                 .await
+                {
+                    return Ok(());
+                }
             }
             Err(e) => anyhow::bail!("registration was refused: {e}"),
         }
@@ -89,20 +102,36 @@ pub async fn admitted(server: &Server, identity: &Identity, config: &Config) -> 
                 // than seconds — but it still backs off, because a room of
                 // Runners registered together would otherwise ask in one burst
                 // for however long it takes somebody to get to the panel.
-                pause(
+                // **And a stop is heard through it.** Waiting for a person
+                // is the longest wait this loop has, and a Runner that had to
+                // be killed to stop waiting for approval left nothing behind
+                // but a container the runtime shot.
+                if !pause(
                     "this Runner has not been approved yet",
                     how_long(&e, &mut backoff),
-                )
-                .await;
-            }
-            Err(e) if e.revoked() => anyhow::bail!("this key has been revoked: {e}"),
-            Err(e) if e.unavailable() => wait_out(server, &e, &mut backoff).await,
-            Err(e) if e.retryable() => {
-                pause(
-                    &format!("the handshake failed ({e})"),
-                    how_long(&e, &mut backoff),
+                    stopping,
                 )
                 .await
+                {
+                    return Ok(());
+                }
+            }
+            Err(e) if e.revoked() => anyhow::bail!("this key has been revoked: {e}"),
+            Err(e) if e.unavailable() => {
+                if !wait_out(server, &e, &mut backoff, stopping).await {
+                    return Ok(());
+                }
+            }
+            Err(e) if e.retryable() => {
+                if !pause(
+                    &format!("the handshake failed ({e})"),
+                    how_long(&e, &mut backoff),
+                    stopping,
+                )
+                .await
+                {
+                    return Ok(());
+                }
             }
             Err(e) => anyhow::bail!("the handshake was refused: {e}"),
         }
@@ -124,20 +153,30 @@ fn how_long(e: &aj_protocol::Error, backoff: &mut Backoff) -> Duration {
 
 /// Waits out a Server that is up and declining to serve, and says which it is.
 ///
+/// **Answers `false` when the word came instead**, which is not the same as the
+/// window having ended: the caller is going away, and a maintenance window that
+/// advertises `Retry-After: 300` used to hold a stopping Runner for five
+/// minutes against a thirty-second grace.
+///
 /// Asks `/health` rather than guessing, because that is the one path a window
 /// leaves open and because the answer carries the operator's own words. Waiting
 /// in silence would be indistinguishable from a Runner that had stopped.
 ///
 /// Returns as soon as the window has ended, without sleeping: the question is
 /// asked before the wait, so a window that closed in between costs nothing.
-async fn wait_out(server: &Server, e: &aj_protocol::Error, backoff: &mut Backoff) {
+async fn wait_out(
+    server: &Server,
+    e: &aj_protocol::Error,
+    backoff: &mut Backoff,
+    stopping: &Stopping,
+) -> bool {
     let delay = how_long(e, backoff);
 
     match server.health().await {
         Ok(health) if health.open() => {
             tracing::info!("the Server is serving again");
             backoff.reset();
-            return;
+            return true;
         }
         Ok(health) => tracing::info!(
             level = health.level(),
@@ -155,7 +194,7 @@ async fn wait_out(server: &Server, e: &aj_protocol::Error, backoff: &mut Backoff
         ),
     }
 
-    tokio::time::sleep(delay).await;
+    stopping.sleep(delay).await
 }
 
 /// Claim, evaluate, report. For ever.
@@ -194,15 +233,50 @@ pub async fn work(
         // The claim itself waits on an empty queue, so it is where an idle
         // Runner spends nearly all its life and where a stop has to reach it.
         let asked = tokio::time::Instant::now();
+        let mut claim = std::pin::pin!(server.claim(
+            Some(config.lease_seconds),
+            // Zero means the Runner does not want to be held, which is what
+            // an operator behind a proxy that cuts silent requests sets.
+            (!config.poll_wait.is_zero()).then_some(config.poll_wait),
+        ));
         let claimed = tokio::select! {
-            claimed = server.claim(
-                Some(config.lease_seconds),
-                // Zero means the Runner does not want to be held, which is what
-                // an operator behind a proxy that cuts silent requests sets.
-                (!config.poll_wait.is_zero()).then_some(config.poll_wait),
-            ) => claimed,
-            _ = stopping.wait() => { beating.abort(); return Ok(()); },
+            // **`biased`, so an answer that has already arrived is taken.**
+            // With a random draw, a stop landing at the same moment as a job
+            // threw that job away about half the time — and the Server had
+            // already committed it.
+            biased;
+            claimed = &mut claim => claimed,
+            _ = stopping.wait() => {
+                // **Settled, not dropped.** Dropping the request aborts it, and
+                // the Server commits a claim before writing the answer to it:
+                // `Running`, a lease token, one of five attempts spent. What is
+                // dropped is therefore sometimes a job this Runner owns and
+                // cannot give back, because it never learned the token.
+                //
+                // Two seconds, and the number is not a guess about the network.
+                // At the instant a stop is heard there are only two states. The
+                // Server has committed and the response is in flight, which is
+                // the queries behind `DescribeAsync` plus a round trip —
+                // milliseconds. Or it has not, and the request is parked in the
+                // long poll, where the abort costs nothing and this timeout
+                // simply expires. Waiting out the *poll* instead would put
+                // twenty-five seconds, or three hundred, in front of every
+                // release this Runner still owes — inside a stop grace of
+                // thirty. That converts a rare loss into a certain SIGKILL.
+                // Anything else is nothing to hand back: no job, an error, or a
+                // Server still holding the poll open when the two seconds ran
+                // out.
+                if let Ok(Ok(Some(job))) = tokio::time::timeout(SETTLE, &mut claim).await {
+                    give_back(server, &job).await;
+                }
+                beating.abort();
+                return Ok(());
+            }
         };
+        // Measured around the claim alone. It used to be read at the bottom of
+        // this arm, with a trial claim in between, so a slow trial could pass
+        // for a Server that had held the poll open.
+        let waited = asked.elapsed();
 
         match claimed {
             Ok(Some(job)) => {
@@ -216,6 +290,19 @@ pub async fn work(
                 // grade. Asking for trials first would let a busy trial queue
                 // delay a verdict, which is the one thing the separate table
                 // exists to prevent.
+                // **Checked again here, and this is not belt and braces.** A
+                // trial is the longest work this Runner does — every model
+                // solution against every test — and there is no endpoint to
+                // hand one back. Starting one while stopping means work that
+                // cannot be released and a lease that has to expire. The claim
+                // above can return an empty queue at the same moment the stop
+                // arrives, and `biased` makes that the *likely* order rather
+                // than a coin flip.
+                if stopping.now() {
+                    beating.abort();
+                    return Ok(());
+                }
+
                 match server.claim_trial(Some(config.lease_seconds)).await {
                     Ok(Some(trial)) => {
                         backoff.reset();
@@ -238,8 +325,7 @@ pub async fn work(
                 // setting: a Server that does not know about `waitSeconds`
                 // answers at once, and so does one that is draining, and
                 // neither should be asked again immediately.
-                let held =
-                    config.poll_wait > Duration::ZERO && asked.elapsed() >= config.poll_wait / 2;
+                let held = config.poll_wait > Duration::ZERO && waited >= config.poll_wait / 2;
                 if !held {
                     tokio::select! {
                         _ = backoff.wait() => {}
@@ -253,12 +339,16 @@ pub async fn work(
                 tracing::info!("the token is no longer known; shaking hands again");
                 server.forget_token();
                 let identity = Identity::load_or_create(&config.key_path)?;
-                admitted(server, &identity, config).await?;
+                admitted(server, &identity, config, stopping).await?;
             }
             // **Not a fault, and not a reason to exit.** At `draining` the
             // Server answers an empty queue instead, so this is the deeper
             // level — everything closed but health.
-            Err(e) if e.unavailable() => wait_out(server, &e, &mut backoff).await,
+            Err(e) if e.unavailable() => {
+                if !wait_out(server, &e, &mut backoff, stopping).await {
+                    return Ok(());
+                }
+            }
             Err(e) if e.retryable() => {
                 tracing::warn!(%e, "could not ask for work");
                 tokio::time::sleep(how_long(&e, &mut backoff)).await;
@@ -529,7 +619,7 @@ async fn handle(
     // wrong and the log explaining a failure is the thing that goes missing.
     attach(server, &job, attachments).await;
 
-    report_with_retries(server, &job, &report, config).await;
+    report_with_retries(server, &job, &report, config, stopping).await;
 
     drop(keeper);
 }
@@ -968,6 +1058,7 @@ async fn report_with_retries(
     job: &ClaimedJob,
     report: &ReportResult,
     config: &Config,
+    stopping: &Stopping,
 ) {
     let mut keep = KeepTrying::for_a_lease(config);
 
@@ -998,7 +1089,23 @@ async fn report_with_retries(
                         maintenance = e.in_maintenance(),
                         "the report did not land; holding on to it",
                     );
-                    tokio::time::sleep(delay).await;
+
+                    // **And letting go of it when the word comes.** This wait
+                    // is bounded by the lease — ten minutes at the shipped
+                    // default — and it used to sleep straight through a stop,
+                    // which turns a thirty-second grace into a `SIGKILL`. A
+                    // kill drops this answer too, and takes the sandbox sweep
+                    // and every other release with it; the lease requeues the
+                    // job either way. So the choice is not between keeping the
+                    // work and losing it, only between losing it cleanly and
+                    // losing more.
+                    if !stopping.sleep(delay).await {
+                        tracing::warn!(
+                            job = %job.job_id,
+                            "told to stop while carrying an answer; the lease will requeue the job",
+                        );
+                        return;
+                    }
                 }
                 None => {
                     tracing::error!(
@@ -1045,6 +1152,13 @@ fn total_memory_bytes() -> Option<u64> {
         // `MemTotal` is stated in kibibytes; everything here is bytes.
         .map(|kib| kib * 1024)
 }
+
+/// How long a stop waits for a claim already in flight to answer.
+///
+/// **Long enough for a response, far too short for a poll.** See the stopping
+/// arm in `work`, which is the only place it is used and where the argument
+/// for the number is written.
+const SETTLE: Duration = Duration::from_secs(2);
 
 const FIVE: Duration = Duration::from_secs(5);
 const THIRTY: Duration = Duration::from_secs(30);

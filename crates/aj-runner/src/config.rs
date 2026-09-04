@@ -86,6 +86,27 @@ impl Config {
             anyhow::bail!("AJ_Server__BaseUrl is {base_url:?}, which has no /api/v1 prefix");
         }
 
+        // **A Runner that declares nothing can never be handed anything**, and
+        // nothing downstream says so. `AJ_Runner__ProblemTypes=","` — or a
+        // trailing comma in a pasted value — survives `var`, which rejects only
+        // a wholly empty string, so it never falls through to the default; the
+        // split then drops every fragment and leaves an empty list. The Server
+        // stores it without complaint and `p."Type" = ANY(ARRAY[]::text[])` is
+        // false for every row, so the Runner registers, is approved, heartbeats,
+        // shows as connected in the panel, and sits there for ever.
+        //
+        // Refused rather than defaulted, for the reason `number` gives: an
+        // operator who meant to narrow this and mistyped it should learn that
+        // here, not from a queue that never moves.
+        let problem_types = problem_types(var("Runner__ProblemTypes"));
+
+        if problem_types.is_empty() {
+            anyhow::bail!(
+                "AJ_Runner__ProblemTypes names no problem type, so this Runner \
+                 could never be handed a job. Leave it unset for standard-io@1."
+            );
+        }
+
         let work = var("Work__Path").unwrap_or_else(|| "/var/lib/algojudge-runner/work".into());
 
         Ok(Self {
@@ -94,12 +115,7 @@ impl Config {
             key_path: var("Runner__KeyPath")
                 .unwrap_or_else(|| "/var/lib/algojudge-runner/identity.key".into())
                 .into(),
-            problem_types: var("Runner__ProblemTypes")
-                .unwrap_or_else(|| "standard-io@1".into())
-                .split(',')
-                .map(|t| t.trim().to_owned())
-                .filter(|t| !t.is_empty())
-                .collect(),
+            problem_types,
             // Empty by default, which the Server reads as the general pool —
             // the same pool an untagged activity is in, so a Runner that names
             // nothing behaves exactly as every Runner did before tags existed.
@@ -120,7 +136,7 @@ impl Config {
             // that owns its whole network path can raise this to the Server's
             // ceiling of three hundred; one behind somebody else's proxy may
             // have to lower it.
-            poll_wait: Duration::from_secs(number("Poll__WaitSeconds", 25)),
+            poll_wait: wait_within_ceiling(number("Poll__WaitSeconds", 25))?,
             heartbeat: Duration::from_secs(number("Heartbeat__Seconds", 60)),
 
             lease_seconds: number("Lease__RequestSeconds", 600) as u32,
@@ -199,6 +215,47 @@ impl Config {
 const LEASE_FLOOR: u32 = 60;
 const LEASE_CEILING: u32 = 3600;
 
+/// The longest a Server will hold a `claim` open, whatever `waitSeconds` asks.
+///
+/// **Prose until 2026-09-04**, in the table below this file's `poll_wait`, and
+/// checked by nothing. Asking for more is not merely ignored: the loop decides
+/// whether the Server *held* the claim by comparing how long the answer took
+/// against half of what it asked for, so a Runner asking nine hundred sees the
+/// Server's three hundred, reads it as a Server that answered immediately, and
+/// sleeps its backoff after every held claim — the deafness the held-claim
+/// handling exists to remove, restored by a setting, silently. Read off
+/// `RunnerController.MaxWait` on 2026-09-04.
+const SERVER_MAX_WAIT: u64 = 300;
+
+/// The wait this Runner may ask for, or a refusal naming the ceiling.
+fn wait_within_ceiling(seconds: u64) -> anyhow::Result<Duration> {
+    if seconds > SERVER_MAX_WAIT {
+        anyhow::bail!(
+            "AJ_Poll__WaitSeconds is {seconds}, above the {SERVER_MAX_WAIT} seconds the \
+             Server will hold a claim open. It would answer sooner than this Runner \
+             expects, which reads as a Server that is not holding claims at all — so \
+             this Runner would sleep its backoff after every one and be deaf to new \
+             work for the length of it."
+        );
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+/// The problem types a configured value names.
+///
+/// Split out of `from_environment` so the separator cases can be tested without
+/// an environment — setting a process-wide variable from a test is racy against
+/// every other test in the binary, and the interesting inputs here are all
+/// punctuation.
+fn problem_types(configured: Option<String>) -> Vec<String> {
+    configured
+        .unwrap_or_else(|| "standard-io@1".into())
+        .split(',')
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
 fn var(key: &str) -> Option<String> {
     std::env::var(format!("AJ_{key}"))
         .ok()
@@ -229,6 +286,8 @@ fn default_name() -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{problem_types, wait_within_ceiling, SERVER_MAX_WAIT};
+
     /// **`.env.example` claims to list every variable, and nothing checked it.**
     ///
     /// This repository had no such file at all until 2026-08-31, and one reason
@@ -248,6 +307,52 @@ mod tests {
     /// `DOCKER_HOST` and the proxy four are read by libraries this Runner links
     /// rather than by its own source, so no file here mentions them and the
     /// comparison would reject every one. They are listed by hand.
+    /// **Punctuation is not a problem type.** Each of these reached the Server
+    /// as `[]` before 2026-09-04, and an empty list matches no row, so the
+    /// Runner registered, was approved, heartbeated and was handed nothing for
+    /// as long as it ran. `from_environment` refuses on the empty answer; this
+    /// pins which answers are empty.
+    #[test]
+    fn a_value_that_is_only_separators_names_no_problem_type() {
+        assert_eq!(problem_types(None), ["standard-io@1"]);
+        assert_eq!(
+            problem_types(Some("uva@1, standard-io@1".into())),
+            ["uva@1", "standard-io@1"]
+        );
+        // The one an operator actually types: a trailing comma from a paste.
+        assert_eq!(
+            problem_types(Some("standard-io@1,".into())),
+            ["standard-io@1"]
+        );
+
+        assert!(problem_types(Some(",".into())).is_empty());
+        assert!(problem_types(Some(" , , ".into())).is_empty());
+    }
+
+    /// **The ceiling was a table in `.env.example`, and asking past it made
+    /// things quietly worse rather than being ignored.**
+    ///
+    /// The loop tells a held claim from an immediate answer by how long it
+    /// took, so a Runner asking for more than the Server will hold reads every
+    /// held claim as an empty one and sleeps its backoff after each. Refusing at
+    /// the ceiling also keeps that comparison sound: the Server shortens what it
+    /// holds by at most a sixteenth, so anything at or under the ceiling comes
+    /// back after at least fifteen sixteenths of what was asked, which is
+    /// comfortably past the half the loop tests against.
+    #[test]
+    fn a_wait_above_what_the_server_will_hold_is_refused() {
+        assert!(wait_within_ceiling(0).is_ok());
+        assert!(wait_within_ceiling(25).is_ok());
+        // The ceiling itself is a setting, not the first refusal.
+        assert!(wait_within_ceiling(SERVER_MAX_WAIT).is_ok());
+
+        let refused = wait_within_ceiling(SERVER_MAX_WAIT + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("AJ_Poll__WaitSeconds"), "{refused}");
+        assert!(refused.contains("300"), "{refused}");
+    }
+
     #[test]
     fn every_variable_the_config_reads_is_in_the_example_and_no_others() {
         // This file names its keys without the prefix, `AJ_` being added by the

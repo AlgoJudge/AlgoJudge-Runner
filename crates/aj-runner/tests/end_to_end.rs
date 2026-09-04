@@ -1005,7 +1005,9 @@ async fn a_renewed_lease_outlives_the_deadline_it_was_granted() {
             approve_the_runner(&admin).await;
         }
     });
-    run::admitted(&server, &identity, &config)
+    // Nothing says stop here, so the handle only satisfies the signature.
+    let (never, _teller) = aj_protocol::stopping::Stopping::told();
+    run::admitted(&server, &identity, &config, &never)
         .await
         .expect("this Runner was never admitted");
     approving.abort();

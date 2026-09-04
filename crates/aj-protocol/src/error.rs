@@ -131,6 +131,12 @@ impl Error {
         self.code() == "runner.revoked"
     }
 
+    /// Nothing of that name here — which, asking for a challenge, means this
+    /// key has never registered.
+    pub fn not_found(&self) -> bool {
+        self.status() == Some(404)
+    }
+
     /// Somebody else has the job now. Whatever this Runner computed is no
     /// longer wanted, and pushing it would overwrite a newer attempt.
     pub fn lease_lost(&self) -> bool {
