@@ -583,11 +583,22 @@ impl Docker {
         loop {
             tokio::time::sleep(REAP_POLL).await;
             let cpu = measuring.and_then(|measuring| measuring.so_far());
-            if let Some(stopped) = reaper.tick(REAP_POLL, started.elapsed(), cpu) {
+            // Read together, from the same cgroup, in the same look: the
+            // decision is about what happened *between* two looks, and two
+            // readings taken at different moments would not describe one
+            // interval.
+            let stalled = measuring.and_then(|measuring| measuring.stalled());
+            if let Some(stopped) = reaper.tick(REAP_POLL, started.elapsed(), cpu, stalled) {
                 tracing::debug!(
                     container = name,
                     ?stopped,
                     cpu_us = cpu.map(|cpu| cpu.as_micros() as u64),
+                    // **Beside the reason, because it is half of it.** A
+                    // `WallClock` with pressure that never moved is a program
+                    // that was not trying to run; one with pressure climbing
+                    // would be a starved program this rule failed to protect,
+                    // and that is the shape to look for if this ever goes wrong.
+                    stalled_us = stalled.map(|stalled| stalled.as_micros() as u64),
                     waited_ms = started.elapsed().as_millis() as u64,
                     "stopped waiting for a run",
                 );
@@ -999,6 +1010,9 @@ struct Reaper {
     cap: Duration,
     best: Duration,
     idle: Duration,
+    /// The last pressure reading, to take a difference against. `None` until
+    /// the first look, and on a kernel that carries no PSI.
+    stalled: Option<Duration>,
 }
 
 impl Reaper {
@@ -1009,7 +1023,23 @@ impl Reaper {
             cap: absolute_cap(profile.wall_clock),
             best: Duration::ZERO,
             idle: Duration::ZERO,
+            stalled: None,
         }
+    }
+
+    /// Whether something was **runnable and waiting for a processor** since the
+    /// last look, and remembers this look for the next one.
+    ///
+    /// Always called, whatever the processor time did, so the baseline cannot
+    /// go stale across a burst of progress.
+    ///
+    /// `false` without a reading, which is the answer that changes nothing: a
+    /// kernel with no PSI reaps exactly as it did before this existed.
+    fn waited_for_a_processor(&mut self, now: Option<Duration>) -> bool {
+        let Some(now) = now else { return false };
+        let grew = self.stalled.is_some_and(|before| now > before);
+        self.stalled = Some(now);
+        grew
     }
 
     /// One look. `None` means keep waiting.
@@ -1018,7 +1048,10 @@ impl Reaper {
         since: Duration,
         elapsed: Duration,
         cpu: Option<Duration>,
+        stalled: Option<Duration>,
     ) -> Option<Stopped> {
+        let waiting = self.waited_for_a_processor(stalled);
+
         match cpu {
             // **Progress only counts against a limit.** A step nobody is timed
             // on — a build, a checker — has a cgroup like any other, so there is
@@ -1036,7 +1069,29 @@ impl Reaper {
                 if cpu > self.best {
                     self.best = cpu;
                     self.idle = Duration::ZERO;
-                } else {
+                } else if !waiting {
+                    // **Not scheduled is not idle**, so the window only runs
+                    // while nothing was waiting for a core.
+                    //
+                    // Counting processor time was meant to tell a program that
+                    // computes slowly from one that does not compute at all,
+                    // and it does — until the host is loaded enough that a
+                    // program gets *no* processor between two looks. Its
+                    // reading then does not grow, and it is indistinguishable
+                    // from a program asleep.
+                    //
+                    // Measured 2026-09-04, twelve Runners over eight physical
+                    // cores: three correct submissions in a hundred and fifty
+                    // were reported `Time limit exceeded` after using between a
+                    // fifth and a third of their limit, each carrying the note
+                    // `no processor time for 1.6 s`. The host's own pressure was
+                    // a quarter of every window.
+                    //
+                    // What the deadline is still for is untouched. A program in
+                    // an uninterruptible call is not runnable, and a program
+                    // waiting on input is not runnable, so neither raises
+                    // pressure and both are still reaped. And a program starved
+                    // for ever is bounded by `cap` below, which nothing resets.
                     self.idle += since;
                 }
             }
@@ -1399,12 +1454,116 @@ mod tests {
         for tick in 1..=40u64 {
             cpu += ms(5);
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(cpu)),
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu), None),
                 None,
                 "tick {tick}, {cpu:?} of processor time"
             );
         }
         assert_eq!(cpu, ms(200), "it spent its whole limit and was left alone");
+    }
+
+    /// **The case this was measured into existence by.** A program the kernel
+    /// gives *nothing* to between two looks spends no processor time, and until
+    /// pressure was read it was indistinguishable from a program asleep.
+    ///
+    /// Measured 2026-09-04 on twelve Runners over eight physical cores: three
+    /// correct submissions in a hundred and fifty came back `Time limit
+    /// exceeded` after a fifth to a third of their limit, each noting `no
+    /// processor time for 1.6 s`.
+    #[test]
+    fn a_program_starved_of_a_processor_is_not_reaped() {
+        let mut reaper = timed();
+        // It computed once, and then got no processor at all -- while something
+        // in its cgroup was runnable and waiting the whole time.
+        let mut stalled = ms(0);
+        assert_eq!(
+            reaper.tick(ms(250), ms(250), Some(ms(30)), Some(stalled)),
+            None
+        );
+        for tick in 2..=40u64 {
+            stalled += ms(200);
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), Some(stalled)),
+                None,
+                "tick {tick}: it was waiting for a core, not idle",
+            );
+        }
+    }
+
+    /// **And the deadline still ends it.** A program starved for ever is not
+    /// left running for ever: nothing resets the absolute cap, so the run stops
+    /// at ten windows whatever the pressure says.
+    #[test]
+    fn a_program_starved_for_ever_still_meets_the_absolute_cap() {
+        let mut reaper = timed();
+        let mut stalled = ms(0);
+        let mut verdict = None;
+        for tick in 1..=80u64 {
+            stalled += ms(200);
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), Some(stalled));
+            if verdict.is_some() {
+                // Ten times the 1.6 s window.
+                assert_eq!(ms(250 * tick), ms(16000), "it stopped at the cap");
+                break;
+            }
+        }
+        assert_eq!(verdict, Some(Stopped::WallClock));
+    }
+
+    /// **Asleep is still asleep.** Nothing runnable means no pressure, so a
+    /// program waiting on input or wedged in an uninterruptible call is reaped
+    /// exactly as it was -- which is the whole of what the deadline is for.
+    #[test]
+    fn a_program_that_is_only_asleep_is_reaped_with_the_instrument_present() {
+        let mut reaper = timed();
+        // A reading that is present and never moves: nothing was waiting.
+        let quiet = Some(ms(7));
+        assert_eq!(reaper.tick(ms(250), ms(250), Some(ms(30)), quiet), None);
+        for tick in 2..=7u64 {
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), quiet),
+                None,
+                "tick {tick}",
+            );
+        }
+        assert_eq!(
+            reaper.tick(ms(250), ms(2000), Some(ms(30)), quiet),
+            Some(Stopped::WallClock),
+        );
+    }
+
+    /// **A baseline that cannot go stale.** Pressure is recorded on every look,
+    /// including the ones where the program made progress -- otherwise a burst
+    /// of work would leave the comparison pointing at a reading from before it,
+    /// and the first quiet look after it would read as starvation.
+    #[test]
+    fn progress_does_not_leave_the_pressure_baseline_behind() {
+        let mut reaper = timed();
+        // Four looks of real progress, with pressure climbing alongside.
+        let mut cpu = ms(0);
+        let mut stalled = ms(0);
+        for tick in 1..=4u64 {
+            cpu += ms(20);
+            stalled += ms(100);
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu), Some(stalled)),
+                None,
+            );
+        }
+        // Then it stops, and so does the waiting: it is asleep, not starved.
+        // Six quiet looks are 1.5 s, just inside the 1.6 s window.
+        for tick in 5..=10u64 {
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu), Some(stalled)),
+                None,
+                "tick {tick}",
+            );
+        }
+        assert_eq!(
+            reaper.tick(ms(250), ms(3000), Some(cpu), Some(stalled)),
+            Some(Stopped::WallClock),
+            "the window ran out on a program that was doing nothing",
+        );
     }
 
     /// And one that stops spending it is reaped, which is what the deadline was
@@ -1413,17 +1572,17 @@ mod tests {
     fn a_program_that_stops_computing_is_reaped_after_the_window() {
         let mut reaper = timed();
         // It runs for a moment, and then spends nothing at all.
-        assert_eq!(reaper.tick(ms(250), ms(250), Some(ms(30))), None);
+        assert_eq!(reaper.tick(ms(250), ms(250), Some(ms(30)), None), None);
         for tick in 2..=7u64 {
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(ms(30))),
+                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), None),
                 None,
                 "tick {tick}",
             );
         }
         // The seventh quiet look puts the idle time past the 1.6 s window.
         assert_eq!(
-            reaper.tick(ms(250), ms(2000), Some(ms(30))),
+            reaper.tick(ms(250), ms(2000), Some(ms(30)), None),
             Some(Stopped::WallClock),
         );
     }
@@ -1437,13 +1596,18 @@ mod tests {
             // Quiet for six ticks — 1.5 s, just inside the window.
             for tick in 0..6 {
                 assert_eq!(
-                    reaper.tick(ms(250), ms(250 * (round * 7 + tick)), Some(ms(10))),
+                    reaper.tick(ms(250), ms(250 * (round * 7 + tick)), Some(ms(10)), None),
                     None,
                 );
             }
             // Then a step forward, which must clear it.
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * (round * 7 + 6)), Some(ms(11 + round))),
+                reaper.tick(
+                    ms(250),
+                    ms(250 * (round * 7 + 6)),
+                    Some(ms(11 + round)),
+                    None
+                ),
                 None,
             );
         }
@@ -1459,7 +1623,7 @@ mod tests {
     #[test]
     fn a_runaway_is_stopped_well_past_its_limit() {
         assert_eq!(
-            timed().tick(ms(250), ms(250), Some(ms(1401))),
+            timed().tick(ms(250), ms(250), Some(ms(1401)), None),
             Some(Stopped::TimeLimit)
         );
     }
@@ -1468,7 +1632,10 @@ mod tests {
     /// whose container cost the worst ever measured is nowhere near it.
     #[test]
     fn a_correct_program_in_an_expensive_container_is_not_stopped() {
-        assert_eq!(timed().tick(ms(250), ms(250), Some(ms(180 + 619))), None);
+        assert_eq!(
+            timed().tick(ms(250), ms(250), Some(ms(180 + 619)), None),
+            None
+        );
     }
 
     /// **And a program inside its budget is not**, which is the mistake that
@@ -1479,7 +1646,7 @@ mod tests {
     fn a_program_at_its_limit_is_left_alone() {
         for cpu in [200u64, 250, 274, 320] {
             assert_eq!(
-                timed().tick(ms(250), ms(250), Some(ms(cpu))),
+                timed().tick(ms(250), ms(250), Some(ms(cpu)), None),
                 None,
                 "{cpu} ms"
             );
@@ -1493,13 +1660,13 @@ mod tests {
             Reaper::new(&Profile::new("image", vec!["build".to_owned()]).wall_clock(ms(1000)));
         for tick in 1..4u64 {
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), None),
+                reaper.tick(ms(250), ms(250 * tick), None, None),
                 None,
                 "tick {tick}"
             );
         }
         assert_eq!(
-            reaper.tick(ms(250), ms(1000), None),
+            reaper.tick(ms(250), ms(1000), None, None),
             Some(Stopped::WallClock)
         );
     }
@@ -1517,14 +1684,14 @@ mod tests {
         for tick in 1..4u64 {
             cpu += ms(250);
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(cpu)),
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu), None),
                 None,
                 "tick {tick}",
             );
         }
         cpu += ms(250);
         assert_eq!(
-            reaper.tick(ms(250), ms(1000), Some(cpu)),
+            reaper.tick(ms(250), ms(1000), Some(cpu), None),
             Some(Stopped::WallClock),
             "a build that spins is stopped at a minute, not at ten",
         );
@@ -1540,7 +1707,7 @@ mod tests {
         let mut verdict = None;
         for tick in 1..=100u64 {
             cpu += ms(1);
-            verdict = reaper.tick(ms(250), ms(250 * tick), Some(cpu));
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(cpu), None);
             if verdict.is_some() {
                 assert!(
                     ms(250 * tick) >= ms(16_000),
