@@ -978,21 +978,63 @@ const REAP_POLL: Duration = Duration::from_millis(250);
 /// **Generous on purpose, because being early here is the expensive mistake.**
 /// The verdict is decided afterwards on the precise measurement; the reading
 /// this is compared against is the cgroup's, which carries the container's own
-/// start as well as the program. Twice the limit plus the shim's allowance is
-/// far outside anything a program inside its budget produces, and still stops a
+/// start as well as the program. The limit plus [`STARTUP_ALLOWANCE`] is far
+/// outside anything a program inside its budget produces, and still stops a
 /// runaway in a fraction of the wall clock it used to take.
 fn cpu_ceiling(limit: Duration) -> Duration {
-    limit * 2 + UNEXPLAINED_GAP
+    limit + STARTUP_ALLOWANCE
 }
+
+/// What a container may honestly add to the reading this ceiling is compared
+/// against.
+///
+/// **Added, not multiplied, because that is the shape of the thing it covers.**
+/// The reading is the cgroup's, so it carries the container's own start as well
+/// as the program — and a container costs what it costs whatever limit the
+/// problem set. Doubling the participant's limit instead answered a question
+/// nobody asked: it was most generous exactly where the overhead matters least,
+/// and tightest where it matters most.
+///
+/// Two seconds against a measured maximum difference of **619 ms across 7077
+/// runs under load**, which is the same measurement `UNEXPLAINED_GAP` is drawn
+/// from — three times it, because that figure is one host's and the tail of a
+/// loaded one is longer.
+const STARTUP_ALLOWANCE: Duration = Duration::from_secs(2);
 
 /// The longest a run may take however little processor time it spends.
 ///
 /// Nothing else bounds a program that wakes for a millisecond every quarter of
-/// a second: it never stalls and never approaches its limit. Ten times the
-/// no-progress window is far outside anything contention produces, and still
-/// bounds what one submission can take from the queue.
-fn absolute_cap(window: Duration) -> Duration {
-    window * 10
+/// a second: it never stalls, never approaches its limit, and resets the
+/// no-progress window every time it twitches. This is what ends it.
+///
+/// **A number of its own, and not a multiple of the window.** It was ten times
+/// it, which tied the last bound in the sandbox to a figure chosen for
+/// something else — widen the window because a loaded host makes a program look
+/// idle, and the cap widens with it, so the one deadline that must not move
+/// moves furthest. They answer different questions: the window asks whether
+/// this program is still working, and this asks how much of the queue's time
+/// one submission may take whatever the answer.
+///
+/// **Five times what the run is entitled to spend, and that is the coupling
+/// that makes sense.** A problem allowed more processor time has earned more
+/// wall clock; a problem allowed less has not. Tying it to the *window* instead
+/// tied the last bound in the sandbox to a figure chosen for something else
+/// entirely — how quickly a program that has gone quiet should be noticed — so
+/// widening the window to survive a loaded host widened the one deadline that
+/// must not move, and widened it furthest.
+///
+/// It sits above the window at every limit, which is what keeps the window
+/// meaningful: `5(L + 2 s) - (4L + 4 s) = L + 6 s`, positive for every `L`.
+/// `the_cap_always_sits_above_the_window` holds it there.
+///
+/// A step with no processor budget — a build, a checker — has nothing to take
+/// five times, and needs nothing: `idle` never resets there, so the window is
+/// already the elapsed time and already ends it.
+fn absolute_cap(window: Duration, ceiling: Option<Duration>) -> Duration {
+    match ceiling {
+        Some(ceiling) => ceiling * 5,
+        None => window,
+    }
 }
 
 /// When a run stops being worth waiting for.
@@ -1020,7 +1062,7 @@ impl Reaper {
         Self {
             window: profile.wall_clock,
             ceiling: profile.cpu_limit.map(cpu_ceiling),
-            cap: absolute_cap(profile.wall_clock),
+            cap: absolute_cap(profile.wall_clock, profile.cpu_limit.map(cpu_ceiling)),
             best: Duration::ZERO,
             idle: Duration::ZERO,
             stalled: None,
@@ -1056,9 +1098,10 @@ impl Reaper {
             // **Progress only counts against a limit.** A step nobody is timed
             // on — a build, a checker — has a cgroup like any other, so there is
             // a reading; what there is not is anything for it to mean. Letting
-            // it hold the deadline open would give a build ten times the minute
-            // it is allowed, and an infinite loop in one would be reaped ten
-            // minutes late rather than at its deadline.
+            // it hold the deadline open would leave an infinite loop in a build
+            // to the absolute cap rather than to its own deadline — and for an
+            // untimed step the cap *is* that deadline, so the run would end at
+            // the same instant reported as the wrong thing.
             //
             // The same arm takes a measured run on a host that could not be
             // measured. Both keep the plain wall clock they always had.
@@ -1098,7 +1141,26 @@ impl Reaper {
             _ => self.idle += since,
         }
 
-        (self.idle >= self.window || elapsed >= self.cap).then_some(Stopped::WallClock)
+        if self.idle < self.window && elapsed < self.cap {
+            return None;
+        }
+
+        // **Nothing was ever recorded, so there is nothing to have failed.** A
+        // judged run whose processor time never moved off zero did not compute
+        // slowly and did not wedge: it never began. Only a step that is timed
+        // can say this — a build or a checker has no budget to be measured
+        // against and keeps the answer it always had.
+        if self.ceiling.is_some() && self.best.is_zero() {
+            return Some(Stopped::NeverStarted);
+        }
+
+        // **Which one ended it, because the participant is told.** The window
+        // is the more specific statement, so it wins where both hold — and for
+        // a step with no budget they always do, the cap being the window there.
+        if self.idle >= self.window {
+            return Some(Stopped::WallClock);
+        }
+        Some(Stopped::Overall)
     }
 }
 
@@ -1431,7 +1493,11 @@ mod tests {
         Duration::from_millis(n)
     }
 
-    /// A timed run: a 200 ms limit and the deadline the pipeline sets with it.
+    /// A timed run: a 200 ms limit, and a window compact enough to tick
+    /// through. **Not the pipeline's own** — that is four times the limit and
+    /// four seconds, so 4.8 s here, and a test asserting tick by tick would
+    /// need twenty of them to say what six say. Every deadline derived from
+    /// these two is the real function of them, which is what is asserted.
     fn timed() -> Reaper {
         Reaper::new(
             &Profile::new("image", vec!["run".to_owned()])
@@ -1492,22 +1558,24 @@ mod tests {
 
     /// **And the deadline still ends it.** A program starved for ever is not
     /// left running for ever: nothing resets the absolute cap, so the run stops
-    /// at ten windows whatever the pressure says.
+    /// at five times the processor ceiling whatever the pressure says — and it
+    /// is reported as [`Stopped::Overall`] rather than as no progress, because
+    /// this program was making some.
     #[test]
     fn a_program_starved_for_ever_still_meets_the_absolute_cap() {
         let mut reaper = timed();
         let mut stalled = ms(0);
         let mut verdict = None;
-        for tick in 1..=80u64 {
+        for tick in 1..=300u64 {
             stalled += ms(200);
             verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), Some(stalled));
             if verdict.is_some() {
-                // Ten times the 1.6 s window.
-                assert_eq!(ms(250 * tick), ms(16000), "it stopped at the cap");
+                // Five times the 2.2 s ceiling this test builds.
+                assert_eq!(ms(250 * tick), ms(11000), "it stopped at the cap");
                 break;
             }
         }
-        assert_eq!(verdict, Some(Stopped::WallClock));
+        assert_eq!(verdict, Some(Stopped::Overall));
     }
 
     /// **Asleep is still asleep.** Nothing runnable means no pressure, so a
@@ -1616,16 +1684,34 @@ mod tests {
     /// Plainly past its budget is stopped rather than left to run.
     ///
     /// **The ceiling carries the container's own cost too**, because the
-    /// reading it is compared against is the cgroup's: twice the limit plus
-    /// [`UNEXPLAINED_GAP`], so 1.4 s for a 200 ms limit. Anything tighter would
-    /// stop a correct program whose container was expensive -- the same mistake
-    /// the reconciliation above exists to avoid, made at the other end.
+    /// reading it is compared against is the cgroup's: the limit plus
+    /// [`STARTUP_ALLOWANCE`], so 2.2 s for a 200 ms limit. Anything tighter
+    /// would stop a correct program whose container was expensive -- the same
+    /// mistake the reconciliation above exists to avoid, made at the other end.
     #[test]
     fn a_runaway_is_stopped_well_past_its_limit() {
         assert_eq!(
-            timed().tick(ms(250), ms(250), Some(ms(1401)), None),
+            timed().tick(ms(250), ms(250), Some(ms(2201)), None),
             Some(Stopped::TimeLimit)
         );
+        // And a program at its ceiling is not.
+        assert_eq!(timed().tick(ms(250), ms(250), Some(ms(2200)), None), None);
+    }
+
+    /// **The cap may never be the first thing to fire**, or the window it is
+    /// meant to sit behind stops existing and nothing says so. Held across the
+    /// whole range of limits a problem may set.
+    #[test]
+    fn the_cap_always_sits_above_the_window() {
+        for limit_ms in [1u64, 50, 100, 200, 500, 1000, 5000, 60_000] {
+            let window = ms(limit_ms * 4 + 4000);
+            let ceiling = cpu_ceiling(ms(limit_ms));
+            let cap = absolute_cap(window, Some(ceiling));
+            assert!(
+                cap > window,
+                "at a {limit_ms} ms limit the cap is {cap:?} and the window {window:?}",
+            );
+        }
     }
 
     /// And the case that makes the ceiling generous: a program inside its limit
@@ -1673,9 +1759,10 @@ mod tests {
 
     /// **A step nobody is timed on is reaped at its deadline while computing.**
     /// The case CI caught: a build has a cgroup like every other container, so
-    /// the reading is there — and taking it as progress gave an infinite loop
-    /// in a build ten times the minute a build is allowed. The reading is not
-    /// the question; having a limit for it to mean something is.
+    /// the reading is there — and taking it as progress left an infinite loop
+    /// in a build running to the absolute cap instead of to its own deadline.
+    /// The reading is not the question; having a limit for it to mean something
+    /// is.
     #[test]
     fn a_step_with_no_limit_is_reaped_at_its_deadline_even_while_it_computes() {
         let mut reaper =
@@ -1693,8 +1780,42 @@ mod tests {
         assert_eq!(
             reaper.tick(ms(250), ms(1000), Some(cpu), None),
             Some(Stopped::WallClock),
-            "a build that spins is stopped at a minute, not at ten",
+            "a build that spins is stopped at its own deadline",
         );
+    }
+
+    /// **A run that never started is not a run that was too slow.** The
+    /// deadline is the same one; what differs is that nothing was ever recorded
+    /// against it, which is a fact about the host and not about the program.
+    /// Reported as a verdict it reads "no processor time", which is an
+    /// accusation rather than a description.
+    #[test]
+    fn a_run_that_never_spent_a_microsecond_is_not_a_time_limit() {
+        let mut reaper = timed();
+        let mut verdict = None;
+        for tick in 1..=40u64 {
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(0)), None);
+            if verdict.is_some() {
+                break;
+            }
+        }
+        assert_eq!(verdict, Some(Stopped::NeverStarted));
+    }
+
+    /// And one that spent some and then stopped is, which is the pair that
+    /// proves the two are told apart by the reading and not by the deadline.
+    #[test]
+    fn a_run_that_spent_something_and_then_stopped_is_a_time_limit() {
+        let mut reaper = timed();
+        let mut verdict = None;
+        for tick in 1..=40u64 {
+            // One microsecond, once, and never again.
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(1)), None);
+            if verdict.is_some() {
+                break;
+            }
+        }
+        assert_eq!(verdict, Some(Stopped::WallClock));
     }
 
     /// The end of it, however busy the program looks. Without this a program
@@ -1705,18 +1826,22 @@ mod tests {
         let mut reaper = timed();
         let mut cpu = ms(0);
         let mut verdict = None;
-        for tick in 1..=100u64 {
+        for tick in 1..=300u64 {
             cpu += ms(1);
             verdict = reaper.tick(ms(250), ms(250 * tick), Some(cpu), None);
             if verdict.is_some() {
                 assert!(
-                    ms(250 * tick) >= ms(16_000),
+                    ms(250 * tick) >= ms(11_000),
                     "ended at {tick} ticks, before the cap"
                 );
                 break;
             }
         }
-        assert_eq!(verdict, Some(Stopped::WallClock));
+        // **The cap, not the window, and the participant is told which.** This
+        // program spent processor time in every tick of its life, so a note
+        // saying it spent none for the window would be false about the one run
+        // the window was never able to end.
+        assert_eq!(verdict, Some(Stopped::Overall));
     }
 
     /// Nothing the kernel did not count changes what a run was stopped by.
