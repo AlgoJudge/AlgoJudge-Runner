@@ -19,10 +19,17 @@
 //! **Why one slice rather than one per run**, measured on WSL2, kernel 6.18: a
 //! slice systemd created for a container is never collected. It stays `loaded
 //! active active` indefinitely — twenty-nine hours in the case that settled it
-//! — and removing its directory does not release the unit. Two hundred of them
-//! cost 49 MB in pid 1, so a slice per test would cost some 37 MB per
-//! submission, permanently. Nothing this Runner can reach takes them away; not
-//! asking for them does.
+//! — and removing its directory does not release the unit, `CollectMode` being
+//! `inactive`. So a slice per test would be a **permanent systemd unit per
+//! test**, growing for as long as the installation judges anything. Nothing
+//! this Runner can reach takes them away — only `systemctl stop` as root does,
+//! and not asking for them in the first place.
+//!
+//! **The cost of one is small, and that is not the argument.** This said two
+//! hundred cost 49 MB in pid 1; re-measured 2026-09-04, stopping 238 of them
+//! released nothing measurable, in a pid 1 whose whole resident set was 17 MB
+//! while it held 250. Unbounded growth is disqualifying whatever the constant,
+//! which is why the constant was never load-bearing.
 //!
 //! Every refusal here names the same consequence, because there is only one: a
 //! time limit is decided on processor time read from that cgroup, so a Runner

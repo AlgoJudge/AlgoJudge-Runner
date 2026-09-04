@@ -241,10 +241,23 @@ docker info --format '{{.CgroupDriver}}'    # cgroupfs or systemd; both are supp
 **Why one slice and not one per run.** Measured 2026-09-03 on WSL2, kernel 6.18:
 a slice systemd created for a container is **never collected**. It stays `loaded
 active active` indefinitely — twenty-nine hours in the case that settled it —
-and removing its directory does not release the unit. Two hundred of them cost
-49 MB in pid 1, so a slice per test would cost some 37 MB per submission,
-permanently. Nothing the Runner can reach takes them away; not asking for them
-does.
+and removing its directory does not release the unit — `CollectMode` is
+`inactive`, so systemd never garbage-collects one. A slice per test would
+therefore be a **permanent unit per test**, growing for as long as the
+installation judges anything. Nothing the Runner can reach takes them away: only
+`systemctl stop` as root does, and not asking for them in the first place.
+
+**What one costs is not the argument, and the figure that was here is wrong.**
+This said two hundred of them cost 49 MB in pid 1. Re-measured 2026-09-04 on the
+same host: it held **250** leftover slices, every one `loaded active`, and pid
+1's entire resident set was **17.1 MB** — so two hundred cannot cost 49 MB
+inside it. Stopping 238 took one second and moved that resident set from
+17124 kB to 17180 kB, which is to say nothing at all. Unbounded growth is
+disqualifying whatever the constant.
+
+An operator who has recreated Runner identities — a `down -v`, a lost volume —
+can reclaim what those left with `systemctl stop 'algojudge-*.slice'`, naming
+only the fingerprints no running Runner announced at start.
 
 That is what makes the systemd numbers differences rather than readings, and
 what makes **one run at a time** part of the arrangement rather than an
