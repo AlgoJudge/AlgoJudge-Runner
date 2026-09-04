@@ -997,12 +997,16 @@ impl Reaper {
         cpu: Option<Duration>,
     ) -> Option<Stopped> {
         match cpu {
-            // **Nothing to read is the plain wall clock, and deliberately.** A
-            // step nobody is timed on — a build, a checker — has no progress to
-            // watch, and neither has a measured run on a host that could not be
-            // measured. Both keep the deadline they always had.
-            None => self.idle += since,
-            Some(cpu) => {
+            // **Progress only counts against a limit.** A step nobody is timed
+            // on — a build, a checker — has a cgroup like any other, so there is
+            // a reading; what there is not is anything for it to mean. Letting
+            // it hold the deadline open would give a build ten times the minute
+            // it is allowed, and an infinite loop in one would be reaped ten
+            // minutes late rather than at its deadline.
+            //
+            // The same arm takes a measured run on a host that could not be
+            // measured. Both keep the plain wall clock they always had.
+            Some(cpu) if self.ceiling.is_some() => {
                 if self.ceiling.is_some_and(|ceiling| cpu > ceiling) {
                     return Some(Stopped::TimeLimit);
                 }
@@ -1013,6 +1017,7 @@ impl Reaper {
                     self.idle += since;
                 }
             }
+            _ => self.idle += since,
         }
 
         (self.idle >= self.window || elapsed >= self.cap).then_some(Stopped::WallClock)
@@ -1473,6 +1478,32 @@ mod tests {
         assert_eq!(
             reaper.tick(ms(250), ms(1000), None),
             Some(Stopped::WallClock)
+        );
+    }
+
+    /// **A step nobody is timed on is reaped at its deadline while computing.**
+    /// The case CI caught: a build has a cgroup like every other container, so
+    /// the reading is there — and taking it as progress gave an infinite loop
+    /// in a build ten times the minute a build is allowed. The reading is not
+    /// the question; having a limit for it to mean something is.
+    #[test]
+    fn a_step_with_no_limit_is_reaped_at_its_deadline_even_while_it_computes() {
+        let mut reaper =
+            Reaper::new(&Profile::new("image", vec!["build".to_owned()]).wall_clock(ms(1000)));
+        let mut cpu = ms(0);
+        for tick in 1..4u64 {
+            cpu += ms(250);
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu)),
+                None,
+                "tick {tick}",
+            );
+        }
+        cpu += ms(250);
+        assert_eq!(
+            reaper.tick(ms(250), ms(1000), Some(cpu)),
+            Some(Stopped::WallClock),
+            "a build that spins is stopped at a minute, not at ten",
         );
     }
 
