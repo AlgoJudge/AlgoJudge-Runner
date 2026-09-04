@@ -292,6 +292,17 @@ pub enum Stopped {
     Memory,
     /// It produced more than it was allowed to.
     Output,
+    /// **The deadline passed and the program never ran at all.** Not a verdict
+    /// about anybody's code: no processor time was ever recorded against this
+    /// run, so what took the time was the container, the image or the host —
+    /// never the submission.
+    ///
+    /// Told apart from [`Stopped::WallClock`] by a single fact, and it is worth
+    /// the extra variant because the two are opposites. A run that spent
+    /// processor time and then stopped spending it has failed; a run that never
+    /// spent any was never given the chance, and reporting that to a
+    /// participant as "no processor time" reads as an accusation.
+    NeverStarted,
 }
 
 #[derive(Debug, Clone)]

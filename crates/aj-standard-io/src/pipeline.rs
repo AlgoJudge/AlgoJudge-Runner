@@ -460,6 +460,18 @@ impl<S: Sandbox> Pipeline<S> {
 
             // What the machinery did to it comes first: none of these is the
             // program having answered wrongly.
+            // **Not a verdict, so it never becomes one.** No processor time
+            // was ever recorded against this run, which makes it a statement
+            // about the host and not about the submission — the same class as a
+            // test that could not be run at all.
+            if run.stopped == Stopped::NeverStarted {
+                return Err(format!(
+                    "test {}: the program never started; the sandbox recorded no \
+                     processor time for it before the deadline",
+                    test.name
+                ));
+            }
+
             let stopped = match run.stopped {
                 // Stopped for being plainly past its budget rather than left to
                 // run. An ordinary time limit, and it reads as one: what it
@@ -483,6 +495,10 @@ impl<S: Sandbox> Pipeline<S> {
                     ),
                     Reason::TimeLimit,
                 )),
+                // Refused above, before this match, because it is a statement
+                // about the host rather than a verdict about a submission.
+                Stopped::NeverStarted => unreachable!("a run that never started is not judged"),
+
                 Stopped::Memory => Some(("Memory limit exceeded".to_owned(), Reason::MemoryLimit)),
                 Stopped::Output => Some(("Output limit exceeded".to_owned(), Reason::OutputLimit)),
 
@@ -758,7 +774,7 @@ fn how_it_died(exit_code: i64) -> String {
 /// `saturating_mul` because nothing bounds `timeMs` above: `Config::validated`
 /// refuses zero and nothing else, so three times a large one wraps.
 fn reaping_deadline(time_ms: u64) -> Duration {
-    Duration::from_millis(time_ms.saturating_mul(3)) + Duration::from_secs(1)
+    Duration::from_millis(time_ms.saturating_mul(4)) + Duration::from_secs(4)
 }
 
 /// A timed run confined to the processors the Runner was given, and to nothing
@@ -1087,9 +1103,9 @@ mod tests {
     /// was an inline expression at one call site, so a change to it would have
     /// been caught by no test at all.
     #[test]
-    fn the_reaping_deadline_is_three_times_the_limit_and_a_second() {
-        assert_eq!(reaping_deadline(1000), Duration::from_millis(4000));
-        assert_eq!(reaping_deadline(1), Duration::from_millis(1003));
+    fn the_reaping_deadline_is_four_times_the_limit_and_four_seconds() {
+        assert_eq!(reaping_deadline(1000), Duration::from_millis(8000));
+        assert_eq!(reaping_deadline(1), Duration::from_millis(4004));
 
         // Nothing bounds `timeMs` above: `Config::validated` refuses zero and
         // nothing else. Three times a large one has to saturate rather than
