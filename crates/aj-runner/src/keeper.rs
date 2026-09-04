@@ -156,6 +156,26 @@ impl Drop for Keeper {
 ///
 /// The floor is for a caller that passes nothing sensible; a real configuration
 /// cannot reach it, because the granted lease is itself floored at a minute.
+/// **Liveness is not this timer's business any more.** A renewal does refresh
+/// `LastSeenAt` as a side effect, and for a while this was capped at the
+/// heartbeat interval to keep a judging Runner from being shown as
+/// disconnected. The Runner now beats on a timer of its own — see
+/// `run::heartbeat` — so the cap is gone and the interval is the lease's again,
+/// which is the only thing it was ever about.
+///
+/// The two are different questions sharing one write: `LastSeenAt` is refreshed
+/// by a renewal, and the manager panel calls a Runner connected only while that
+/// is under two minutes old. A busy Runner never heartbeats — the heartbeat
+/// lives in the empty-queue arm of the loop and judging is the other arm — so
+/// the renewal is the only thing keeping it fresh. At the shipped lease of six
+/// hundred seconds a quarter is a hundred and fifty, and a Runner working a
+/// submission was shown as disconnected for thirty seconds out of every hundred
+/// and fifty, while working perfectly.
+///
+/// Capping it here rather than widening the window there: the window is two
+/// minutes for every Runner, and the interval it has to survive is a property
+/// of whatever lease each one was granted — at the ceiling of an hour a quarter
+/// is fifteen minutes, so no fixed window could ever be right.
 pub fn every(granted: Duration) -> Duration {
     (granted / 4).max(Duration::from_secs(5))
 }
