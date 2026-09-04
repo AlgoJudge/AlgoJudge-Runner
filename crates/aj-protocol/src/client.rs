@@ -281,6 +281,30 @@ impl Server {
         accept(response).await.map(|_| ())
     }
 
+    /// Gives a job back, because this Runner is stopping.
+    ///
+    /// **It means only that.** The job is queued again at once and the delivery
+    /// the claim counted is given back — an operator restarting a fleet must not
+    /// spend a participant's attempts. Every other way a job comes back without
+    /// a result is a report, which carries a description of what went wrong.
+    ///
+    /// A `runner.lease.stale` here is a success: the job this was trying to give
+    /// back is already back.
+    pub async fn release(&self, job_id: &str, lease_token: &str) -> Result<()> {
+        let response = self
+            .bearer(
+                self.http
+                    .post(self.url(&format!("runner/jobs/{job_id}/release"))),
+            )
+            .json(&LeaseRequest {
+                lease_token: lease_token.to_owned(),
+                lease_seconds: None,
+            })
+            .send()
+            .await?;
+        accept(response).await.map(|_| ())
+    }
+
     /// Records a verdict, once.
     ///
     /// **Safe to resend.** Idempotency is on the lease token and is enforced by

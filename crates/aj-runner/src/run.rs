@@ -12,6 +12,7 @@ use aj_standard_io::{Evaluated, Pipeline, Places};
 use crate::config::Config;
 use crate::keeper::Keeper;
 use crate::pause;
+use aj_protocol::stopping::Stopping;
 
 /// Registers, waits to be approved, and comes back holding a token.
 ///
@@ -163,15 +164,29 @@ pub async fn work(
     cache: &Arc<Cache>,
     pipeline: &Pipeline<aj_sandbox::Docker>,
     config: &Config,
+    stopping: &Stopping,
 ) -> anyhow::Result<()> {
     let mut backoff = Backoff::new(config.poll_min, config.poll_max);
     let mut last_beat = tokio::time::Instant::now();
 
     loop {
-        match server.claim(Some(config.lease_seconds)).await {
+        // **Asked before every claim**, so a Runner told to stop while it was
+        // finishing one job does not take another.
+        if stopping.now() {
+            return Ok(());
+        }
+
+        // The claim itself waits on an empty queue, so it is where an idle
+        // Runner spends nearly all its life and where a stop has to reach it.
+        let claimed = tokio::select! {
+            claimed = server.claim(Some(config.lease_seconds)) => claimed,
+            _ = stopping.wait() => return Ok(()),
+        };
+
+        match claimed {
             Ok(Some(job)) => {
                 backoff.reset();
-                handle(server, cache, pipeline, config, job).await;
+                handle(server, cache, pipeline, config, job, stopping).await;
             }
             // An empty queue is the ordinary state of a Runner, not a fault.
             Ok(None) => {
@@ -202,7 +217,10 @@ pub async fn work(
                     }
                     last_beat = tokio::time::Instant::now();
                 }
-                backoff.wait().await;
+                tokio::select! {
+                    _ = backoff.wait() => {}
+                    _ = stopping.wait() => return Ok(()),
+                }
             }
             Err(e) if e.needs_handshake() => {
                 // Tokens live in the Server's memory, so this is what an
@@ -371,12 +389,32 @@ async fn measure_trial(
     }
 }
 
+/// Hands a job back because this Runner is stopping.
+///
+/// **A refusal here is not a failure to report.** The one that matters says the
+/// lease is gone, which means the reaper has already put the job back — the
+/// outcome this was asking for. Anything else leaves the lease to expire, which
+/// is where a Runner that could not say this at all always ended up.
+async fn give_back(server: &Arc<Server>, job: &ClaimedJob) {
+    match server.release(&job.job_id, &job.lease_token).await {
+        Ok(()) => tracing::info!(job = %job.job_id, "gave the job back"),
+        Err(e) if e.lease_lost() => {
+            tracing::info!(job = %job.job_id, "the job was already back")
+        }
+        Err(e) => tracing::warn!(
+            job = %job.job_id, %e,
+            "could not give the job back; it returns when the lease expires",
+        ),
+    }
+}
+
 async fn handle(
     server: &Arc<Server>,
     cache: &Arc<Cache>,
     pipeline: &Pipeline<aj_sandbox::Docker>,
     config: &Config,
     job: ClaimedJob,
+    stopping: &Stopping,
 ) {
     tracing::info!(
         job = %job.job_id,
@@ -404,7 +442,22 @@ async fn handle(
         config,
     );
 
-    let (report, attachments) = match evaluate(server, cache, pipeline, config, &job).await {
+    // **Stopped in the middle, the job goes back rather than being finished.**
+    // Nobody is waiting for a result from a Runner that is going away, and the
+    // work is redone from the start by whoever claims it next — which is what
+    // happens today anyway when the lease expires, ten minutes later.
+    let finished = tokio::select! {
+        finished = evaluate(server, cache, pipeline, config, &job) => finished,
+        _ = stopping.wait() => {
+            // The renewal stops first, so a renew cannot land after the release
+            // and be refused for a job that is no longer running.
+            drop(keeper);
+            give_back(server, &job).await;
+            return;
+        }
+    };
+
+    let (report, attachments) = match finished {
         Finished::Say(report, attachments) => (*report, attachments),
         Finished::Abandon => return,
     };
@@ -861,7 +914,7 @@ async fn report_with_retries(
             Ok(accepted) => {
                 tracing::info!(
                     job = %job.job_id,
-                    result = %accepted.result_id,
+                    result = accepted.result_id.as_deref().unwrap_or("(none stored)"),
                     state = %accepted.state,
                     duplicate = accepted.duplicate,
                     "reported",

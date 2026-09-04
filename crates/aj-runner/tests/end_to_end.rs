@@ -1151,3 +1151,172 @@ async fn an_assignments_own_limits_are_what_the_submission_is_judged_under() {
          milliseconds — the overlay was discarded: {judged}",
     );
 }
+
+/// **A Runner told to stop gives its job back, and the queue notices at once.**
+///
+/// The signal is the real one — `SIGTERM`, what `docker stop` and `compose
+/// down` send — delivered to the Runner in the stack while it is judging. What
+/// is asserted is what the Server sees: the submission is waiting again in
+/// seconds, not in the ten minutes its lease had left.
+///
+/// **The lease is what makes the number meaningful.** A Runner that simply died
+/// would also give the job back eventually; sixty seconds is a tenth of the
+/// deadline it would have waited for, so passing this cannot be the reaper.
+///
+/// Needs the daemon as well as the stack — `AJ_DOCKER_SOCKET=1` — because
+/// sending a process a signal is the one thing HTTP cannot do.
+#[tokio::test]
+#[ignore = "needs the development stack, the language images and the daemon"]
+async fn a_runner_told_to_stop_hands_its_job_back_at_once() {
+    let package = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/sum.zip"),
+    )
+    .expect("the committed package");
+
+    let admin = Session::as_("admin", "admin-development-only").await;
+    approve_the_runner(&admin).await;
+    let activity = publish(&admin, package).await;
+
+    let participant = Session::as_("student", "student-development-only").await;
+    participant
+        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .await;
+    wait_until_open(&participant, &activity).await;
+
+    // Long enough to still be running when the signal arrives: every test in
+    // the package outlives its limit, so the job spends its life being reaped
+    // one test at a time.
+    let sent = participant
+        .submit(
+            &activity,
+            "#include <iostream>\n#include <chrono>\nint main(){long long a,b;std::cin>>a>>b;auto t=std::chrono::steady_clock::now();while(std::chrono::steady_clock::now()-t<std::chrono::seconds(30)){}std::cout<<a+b;}\n",
+            "cpp",
+        )
+        .await;
+
+    let running = wait_for(&participant, &activity, &sent, "running", 120).await;
+    assert_eq!(running["state"], "running", "{running}");
+
+    let daemon = bollard::Docker::connect_with_local_defaults().expect("the daemon");
+    let container = std::env::var("AJ_TEST_RUNNER_CONTAINER")
+        .unwrap_or_else(|_| "algojudge-runner-dev-runner-1".to_owned());
+    daemon
+        .kill_container(
+            &container,
+            Some(
+                bollard::query_parameters::KillContainerOptionsBuilder::default()
+                    .signal("SIGTERM")
+                    .build(),
+            ),
+        )
+        .await
+        .expect("the signal reaches the Runner");
+
+    let began = std::time::Instant::now();
+    let back = wait_for(&participant, &activity, &sent, "queued", 120).await;
+    let took = began.elapsed();
+
+    assert_eq!(back["state"], "queued", "{back}");
+    assert!(
+        took < Duration::from_secs(60),
+        "it took {took:?} to come back, which is the lease expiring rather than          the Runner giving it back",
+    );
+
+    // **And the stack is handed on working.** A signal sent with `docker kill`
+    // counts as the operator stopping the container, so `restart: unless-stopped`
+    // leaves it down -- measured, after this case took the Runner away from every
+    // test that ran after it. Started again here, and the submission waited for,
+    // because a Runner that comes back and judges it is the only proof that it
+    // did come back. Generous: a start is a preflight and four image probes
+    // before it claims anything.
+    // **Waited out first.** A container in the middle of shutting down still
+    // reads as running and answers a start with "nothing changed", so asking
+    // "is it up?" straight after the signal is answered yes by the process on
+    // its way out -- and every test after this one then runs without a Runner,
+    // which is exactly how this was found. Twice.
+    let mut down = false;
+    for _ in 0..120 {
+        if !is_running(&daemon, &container).await {
+            down = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(down, "the Runner never finished shutting down");
+
+    let mut up = false;
+    for _ in 0..60 {
+        let _ = daemon
+            .start_container(
+                &container,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if is_running(&daemon, &container).await {
+            up = true;
+            break;
+        }
+    }
+    assert!(up, "the Runner never came back up");
+
+    let judged = settled_within(&participant, &activity, &sent, 720).await;
+    assert_eq!(
+        judged["state"], "completed",
+        "the Runner never came back to judge it: {judged}",
+    );
+}
+
+/// Whether the container is running *now* -- which a container in the middle of
+/// shutting down still is, and is the whole reason the caller waits it out.
+async fn is_running(daemon: &bollard::Docker, container: &str) -> bool {
+    daemon
+        .inspect_container(
+            container,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .ok()
+        .and_then(|seen| seen.state)
+        .and_then(|state| state.running)
+        .unwrap_or(false)
+}
+
+/// `settled`, with the patience named by the caller.
+async fn settled_within(
+    participant: &Session,
+    activity: &str,
+    submission: &str,
+    tries: usize,
+) -> Value {
+    for _ in 0..tries {
+        let seen = participant
+            .get(&format!("/activities/{activity}/submissions/{submission}"))
+            .await;
+        match seen["state"].as_str().unwrap_or("") {
+            "completed" | "failed" | "cancelled" => return seen,
+            _ => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    }
+    panic!("submission {submission} never settled");
+}
+
+/// Polls until a submission reads as `want`, and answers with it.
+async fn wait_for(
+    participant: &Session,
+    activity: &str,
+    submission: &str,
+    want: &str,
+    tries: usize,
+) -> Value {
+    for _ in 0..tries {
+        let seen = participant
+            .get(&format!("/activities/{activity}/submissions/{submission}"))
+            .await;
+        if seen["state"] == want {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("submission {submission} never reached {want}");
+}

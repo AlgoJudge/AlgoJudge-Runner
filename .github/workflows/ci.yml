@@ -116,6 +116,9 @@ jobs:
         env:
           AJ_DOCKER_NETWORK: algojudge-runner-dev_default
           AJ_TEST_SERVER: http://server:8080/api/v1
+          # One case sends the Runner a real SIGTERM, which is the one thing
+          # HTTP cannot do to it.
+          AJ_DOCKER_SOCKET: 1
         run: >
           ./x test -p aj-runner --test end_to_end
           -- --include-ignored --test-threads=1

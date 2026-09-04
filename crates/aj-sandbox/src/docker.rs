@@ -237,6 +237,20 @@ impl Docker {
         if swept > 0 {
             tracing::warn!(swept, "sandbox containers from a previous run were removed");
         }
+
+        // **After the containers, and not before.** A run's cgroup has the
+        // container's own as a child while the container exists, and a cgroup
+        // with a child cannot be removed.
+        let abandoned = self
+            .cgroups()
+            .map_or(0, |cgroups| cgroups.abandoned(&self.instance));
+        if abandoned > 0 {
+            tracing::warn!(
+                abandoned,
+                "cgroups of runs that were cut short were removed"
+            );
+        }
+
         Ok(swept)
     }
 
@@ -412,8 +426,8 @@ impl Sandbox for Docker {
         let nonce = shim.then(|| format!("{:016x}{:016x}", rand_suffix(), rand_suffix()));
 
         let name = format!(
-            "algojudge-{}-{}",
-            std::process::id(),
+            "{}{:016x}",
+            cgroups::run_prefix(&self.instance),
             Instant::now().elapsed().as_nanos() as u64 ^ rand_suffix(),
         );
 

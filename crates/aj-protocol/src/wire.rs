@@ -383,7 +383,11 @@ impl ReportResult {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReportAccepted {
-    pub result_id: String,
+    /// **Absent where nothing was stored.** An infrastructure failure the
+    /// Server is going to have judged again stores no result — one would make
+    /// the next Runner's honest work come back as a duplicate of the failure —
+    /// and `state` says `queued` there.
+    pub result_id: Option<String>,
     pub state: String,
     /// This report was a repeat and the stored result came back unchanged. Not
     /// an error — it is the whole point of reporting being idempotent.

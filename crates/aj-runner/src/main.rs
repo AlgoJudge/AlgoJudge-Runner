@@ -90,7 +90,25 @@ async fn main() -> anyhow::Result<()> {
     // race would otherwise exit before the other finished migrating.
     run::admitted(&server, &identity, &config).await?;
 
-    run::work(&server, &cache, &pipeline, &config).await
+    // **Listening starts before the first claim**, so a stop arriving while the
+    // Runner is still waiting to be approved is heard as well.
+    let stopping = aj_protocol::stopping::Stopping::listen();
+
+    let worked = run::work(&server, &cache, &pipeline, &config, &stopping).await;
+
+    // **What this Runner started, this Runner ends.** A job container is the
+    // daemon's child rather than the Runner's, so nothing else would stop one
+    // that is still computing for a job already given back — it would run to
+    // the end, on a host that has been told to stop, for an answer nobody will
+    // read. The next start sweeps whatever this could not.
+    if stopping.now() {
+        match pipeline.sandbox().sweep().await {
+            Ok(swept) => tracing::info!(swept, "cleared the containers this Runner had running"),
+            Err(e) => tracing::warn!(%e, "could not clear the containers; the next start will"),
+        }
+    }
+
+    worked
 }
 
 /// Whether a failed preflight is the one failure the development override is

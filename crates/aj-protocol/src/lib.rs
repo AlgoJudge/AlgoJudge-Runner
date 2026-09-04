@@ -17,6 +17,7 @@ pub mod cache;
 pub mod client;
 pub mod error;
 pub mod identity;
+pub mod stopping;
 pub mod wire;
 
 pub use backoff::Backoff;

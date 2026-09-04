@@ -225,6 +225,15 @@ impl<S: Sandbox> Pipeline<S> {
         }
     }
 
+    /// What this pipeline runs its steps in.
+    ///
+    /// Public so a Runner being stopped can clear up after itself: the job
+    /// containers are the daemon's children, not the Runner's, and nothing else
+    /// would end them before the next start swept them up.
+    pub fn sandbox(&self) -> &S {
+        &self.sandbox
+    }
+
     /// A timed run, confined to the processors this Runner was given.
     ///
     /// **Given, not chosen.** Where the Runner may use the whole machine this
