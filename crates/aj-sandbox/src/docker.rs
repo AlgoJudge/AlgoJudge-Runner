@@ -577,7 +577,11 @@ impl Docker {
                     waited_ms = started.elapsed().as_millis() as u64,
                     "stopped waiting for a run",
                 );
-                self.kill(name).await;
+                // **The kill belongs to the caller, not here.** `select!` polls
+                // every branch until one *completes*; awaiting inside this one
+                // leaves the other still able to win, and the container exiting
+                // under our own kill is exactly what makes it win. The run then
+                // reads as having finished on its own.
                 return stopped;
             }
         }
@@ -626,7 +630,12 @@ impl Docker {
 
         let stopped = tokio::select! {
             _ = waiter.next() => Stopped::OnItsOwn,
-            stopped = self.reap(name, profile, measuring) => stopped,
+            // Once this completes the branch is chosen and its block runs to the
+            // end, so the kill cannot hand the decision back to the waiter.
+            stopped = self.reap(name, profile, measuring) => {
+                self.kill(name).await;
+                stopped
+            }
         };
 
         let wall_time = started.elapsed();
