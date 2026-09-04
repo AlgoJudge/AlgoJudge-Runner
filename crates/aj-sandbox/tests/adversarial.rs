@@ -341,7 +341,9 @@ async fn a_small_run_after_a_large_one_reports_its_own_peak() {
 /// Under `cgroupfs` the run's directory is this Runner's from `mkdir` to
 /// `rmdir`. Under `systemd` a run creates no cgroup at all, and that is the
 /// point: a slice per run would be a systemd **unit** per run, and nothing
-/// collects those — two hundred cost 49 MB in pid 1, measured 2026-09-03.
+/// collects those — `CollectMode=inactive`, so they accumulate for the life of
+/// the host. Not a question of what one costs: measured 2026-09-04, freeing 238
+/// of them released nothing measurable. It is that nothing ever ends them.
 ///
 /// **Before and after, and over the whole family rather than the home.** A
 /// return to one slice per run leaks *beside* the Runner's slice rather than
