@@ -40,17 +40,40 @@ impl Stopping {
     /// takes the process down immediately, which is exactly what somebody
     /// sending it a second time is asking for.
     pub fn listen() -> Self {
+        let (stopping, teller) = Self::told();
+
+        tokio::spawn(async move {
+            wait_for_a_signal().await;
+            tracing::info!("told to stop; the work in hand goes back to the queue");
+            teller.stop();
+        });
+
+        stopping
+    }
+
+    /// A handle that hears the word from its own caller rather than from the
+    /// operating system, and the thing that says it.
+    ///
+    /// **Because raising a signal is not a test.** What a Runner does to the
+    /// jobs in hand when it is stopped is the whole point of this module, and
+    /// the only other way to reach it from a test in the same process is
+    /// `raise(SIGTERM)` — which arrives at the process rather than at the test,
+    /// and races the handler's own registration. Lose that race and the default
+    /// disposition takes the whole test binary down.
+    ///
+    /// `listen` is this plus a signal, so a test driving a loop through here
+    /// drives it down the path production uses rather than beside it.
+    pub fn told() -> (Self, Teller) {
         let (tell, told) = tokio::sync::watch::channel(false);
         let tell = Arc::new(tell);
 
-        let listener = Arc::clone(&tell);
-        tokio::spawn(async move {
-            wait_for_a_signal().await;
-            tracing::info!("told to stop; the job in hand goes back to the queue");
-            let _ = listener.send(true);
-        });
-
-        Self { _tell: tell, told }
+        (
+            Self {
+                _tell: Arc::clone(&tell),
+                told,
+            },
+            Teller(tell),
+        )
     }
 
     /// Whether the word has already come.
@@ -72,6 +95,17 @@ impl Stopping {
                 std::future::pending::<()>().await;
             }
         }
+    }
+}
+
+/// Says the word to every handle made alongside it.
+pub struct Teller(Arc<tokio::sync::watch::Sender<bool>>);
+
+impl Teller {
+    /// Says it, once and for good: a handle that starts waiting afterwards
+    /// still hears it.
+    pub fn stop(&self) {
+        let _ = self.0.send(true);
     }
 }
 
@@ -123,14 +157,10 @@ mod tests {
     /// Every holder hears it, and hears it however late it starts listening.
     #[tokio::test]
     async fn the_word_reaches_a_handle_that_was_not_waiting_yet() {
-        let (tell, told) = tokio::sync::watch::channel(false);
-        let stopping = Stopping {
-            _tell: Arc::new(tell),
-            told,
-        };
+        let (stopping, teller) = Stopping::told();
         let elsewhere = stopping.clone();
 
-        stopping._tell.send(true).expect("the channel is open");
+        teller.stop();
 
         assert!(stopping.now());
         assert!(elsewhere.now());

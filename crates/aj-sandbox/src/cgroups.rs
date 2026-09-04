@@ -214,6 +214,42 @@ impl Cgroups {
             })
     }
 
+    /// Removes the cgroups of runs that ended without anything removing theirs,
+    /// and answers how many.
+    ///
+    /// **A Runner stopped in the middle of a job leaves one.** The evaluation is
+    /// cancelled where it stands, so [`Measuring::finish`] — which is what
+    /// removes a run's directory — is never reached, and the directory sits in
+    /// the tree until somebody takes it away. This is that somebody, called
+    /// once the containers are gone, because a cgroup with a live child cannot
+    /// be removed at all.
+    ///
+    /// **This Runner's only**, matched on the name every run carries. Several
+    /// Runners share one `algojudge` directory, and inside a container every one
+    /// of them is pid 1 — so the name is the only thing that says whose a
+    /// leftover is.
+    ///
+    /// Nothing to do under `systemd`: one slice serves every run, and it is the
+    /// Runner's for its whole life rather than any one run's.
+    pub(crate) fn abandoned(&self, instance: &str) -> usize {
+        let Self::Cgroupfs { root } = self else {
+            return 0;
+        };
+        let prefix = run_prefix(instance);
+        let Ok(entries) = std::fs::read_dir(root.join(OURS)) else {
+            return 0;
+        };
+
+        entries
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            // `rmdir` refuses a cgroup that still holds a process or a child,
+            // and that refusal is the safety rather than a race to be avoided:
+            // what goes is what nothing was using.
+            .filter(|entry| std::fs::remove_dir(entry.path()).is_ok())
+            .count()
+    }
+
     /// Why peak memory cannot be reported on this host, where it cannot.
     /// `None` means it can.
     ///
@@ -505,6 +541,22 @@ fn probe_name(instance: &str) -> String {
     format!(".probe.{}", unit_safe(instance))
 }
 
+/// What everything one Runner makes for a run is named after.
+///
+/// **The Runner, not the process.** The name was the pid, which says nothing
+/// about whose a container or a cgroup is: several Runners share one host and
+/// one `algojudge` directory, and inside a container every one of them is pid 1.
+/// A sweep keyed on that would have removed a neighbour's live run. The
+/// fingerprint is this Runner's and survives a restart, which is what lets a
+/// Runner clear up after the process it used to be.
+///
+/// A leading `.` is what keeps [`probe_name`] out of this: the probe is made and
+/// removed within one call, and a sweep that caught one mid-flight would be
+/// racing `prepare` for no reason.
+pub(crate) fn run_prefix(instance: &str) -> String {
+    format!("{OURS}-{}-", unit_safe(instance))
+}
+
 /// An instance id as one component of a systemd unit name.
 ///
 /// A `-` in a unit name is a level of nesting rather than a character, so one
@@ -775,6 +827,66 @@ mod tests {
                 );
             }
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A Runner stopped mid-job leaves its run's cgroup**, and clears it at
+    /// the next sweep — its own, and nobody else's.
+    ///
+    /// Measured before it was written: CI's *No per-run cgroup was left behind*
+    /// step went red the first time a test stopped a Runner while it was
+    /// judging, on `algojudge/algojudge-1-14285993230047861089`. `finish` is
+    /// what removes a run's directory, and a cancelled evaluation never reaches
+    /// it.
+    ///
+    /// The neighbour is the other half. Several Runners share one `algojudge`
+    /// directory, so a sweep that took every leftover would take a running
+    /// evaluation's cgroup off a Runner that is busy.
+    #[test]
+    fn a_sweep_clears_this_runners_abandoned_runs_and_leaves_a_neighbours() {
+        let root = std::env::temp_dir().join(format!("aj-abandoned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("algojudge");
+        std::fs::create_dir_all(&home).expect("a scratch home");
+
+        let ours = home.join(format!("{}dead", run_prefix("ours")));
+        let neighbour = home.join(format!("{}live", run_prefix("theirs")));
+        let probe = home.join(probe_name("ours"));
+        for made in [&ours, &neighbour, &probe] {
+            std::fs::create_dir(made).expect("a scratch run");
+        }
+
+        let backend = Cgroups::Cgroupfs { root: root.clone() };
+        assert_eq!(backend.abandoned("ours"), 1);
+        assert!(!ours.is_dir(), "the abandoned run was left behind");
+        assert!(neighbour.is_dir(), "another Runner's run was swept");
+        assert!(probe.is_dir(), "a start-up probe was swept");
+
+        // And nothing is left to find on the second pass, so a sweep at every
+        // start and every stop stays quiet rather than reporting a number.
+        assert_eq!(backend.abandoned("ours"), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The `systemd` backend has nothing per run to sweep**, and must not go
+    /// looking: its one slice is the Runner's for its whole life, and removing
+    /// it would take the measurement away from the run in it.
+    #[test]
+    fn a_systemd_backend_sweeps_nothing() {
+        let root = std::env::temp_dir().join(format!("aj-abandoned-slice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let slice = root.join("algojudge.slice").join("algojudge-ours.slice");
+        std::fs::create_dir_all(&slice).expect("a scratch slice");
+
+        let backend = Cgroups::Systemd {
+            root: root.clone(),
+            slice: "algojudge-ours.slice".to_owned(),
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        assert_eq!(backend.abandoned("ours"), 0);
+        assert!(slice.is_dir(), "the Runner's own slice was removed");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
