@@ -474,8 +474,8 @@ async fn a_judged_solution_reports_what_memory_it_used() {
 /// `Time limit exceeded`. The same source, the same limit, the opposite verdict.
 ///
 /// **It also documents a real behaviour change rather than only proving one.**
-/// Waiting is free up to the reaping deadline, which is three times the limit
-/// and a second. Every judge that limits processor time works this way, and
+/// Waiting is free up to the reaping deadline, which is four times the limit
+/// and four seconds. Every judge that limits processor time works this way, and
 /// Codeforces gives it a verdict of its own — *Idleness limit exceeded* —
 /// precisely because it surprises people.
 ///
@@ -507,8 +507,8 @@ async fn a_program_that_waits_without_computing_is_inside_its_limit() {
 
 /// The other side of the same rule, so neither half can drift alone.
 ///
-/// Five seconds of waiting against a 300 ms limit passes the reaping deadline of
-/// 1.9 s, and a reaped program is `Time limit exceeded` — **the same verdict and
+/// Eight seconds of waiting against a 300 ms limit passes the reaping deadline
+/// of 5.2 s, and a reaped program is `Time limit exceeded` — **the same verdict and
 /// the same `reason` as one that computed too long**, deliberately. The
 /// vocabulary is shared with the Client, the documentation and every package on
 /// disk, and a new word for this would be a cross-repository change to say
@@ -516,7 +516,7 @@ async fn a_program_that_waits_without_computing_is_inside_its_limit() {
 #[tokio::test]
 #[ignore = "needs a container runtime and the language images"]
 async fn a_program_that_waits_past_the_backstop_is_still_a_time_limit() {
-    let document = waited_for("waiting-past", 300, 5).await;
+    let document = waited_for("waiting-past", 300, 8).await;
 
     assert_ne!(document["score"], document["maxScore"], "{document}");
     assert_eq!(

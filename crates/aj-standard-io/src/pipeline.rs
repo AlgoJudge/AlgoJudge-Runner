@@ -479,9 +479,10 @@ impl<S: Sandbox> Pipeline<S> {
                 Stopped::TimeLimit => Some(("Time limit exceeded".to_owned(), Reason::TimeLimit)),
 
                 // **Reaped rather than over its limit, and the note says so.**
-                // The deadline is three times the limit **without the processor
-                // time growing**, so a program that reaches it has stopped
-                // spending any — waiting, or wedged in an uninterruptible call.
+                // The deadline is four times the limit and four seconds
+                // **without the processor time growing**, so a program that
+                // reaches it has stopped spending any — waiting, or wedged in
+                // an uninterruptible call.
                 // The table would otherwise read "Time limit exceeded — 4 ms of
                 // 1000 ms" and teach a participant nothing. The verdict and the
                 // `reason` are deliberately the same: the vocabulary is shared
@@ -493,6 +494,15 @@ impl<S: Sandbox> Pipeline<S> {
                         "Time limit exceeded: no processor time for {:.1} s",
                         reaping_deadline(limits.time_ms).as_secs_f64()
                     ),
+                    Reason::TimeLimit,
+                )),
+                // **The other deadline, and it says something else.** This
+                // run never stopped spending processor time; it simply never
+                // finished, waking for a moment in every window it was given.
+                // No figure here: the cap is the sandbox's arithmetic, and
+                // restating it would be a second copy to drift.
+                Stopped::Overall => Some((
+                    "Time limit exceeded: the program kept running without finishing".to_owned(),
                     Reason::TimeLimit,
                 )),
                 // Refused above, before this match, because it is a statement
@@ -763,16 +773,25 @@ fn how_it_died(exit_code: i64) -> String {
 
 /// The deadline a test container is killed at — **not the limit**.
 ///
-/// **Three times the limit and a second.** A limit is processor time, and the
-/// only thing this deadline exists for is reaping something that is not
+/// **Four times the limit and four seconds.** A limit is processor time, and
+/// the only thing this deadline exists for is reaping something that is not
 /// spending any: a program wedged in an uninterruptible syscall, or one that
 /// waits rather than computes. A program that *is* computing may legitimately
 /// spend rather more wall clock than processor time before it has used its
 /// limit — the container's own start alone is a few hundred milliseconds — so a
 /// deadline near the limit would reap correct solutions.
 ///
+/// **Four times, because a starved program is indistinguishable from an idle
+/// one.** This measures *consecutive* time without progress, so four times the
+/// limit is roughly a host loaded four times past what it can carry. Measured
+/// 2026-09-04: an unpinned twelve-Runner fleet on sixteen processors put 80% of
+/// 8409 tests past the old three-times-and-a-second and produced five wrong
+/// verdicts in 150. The four seconds are what makes this also the guard against
+/// a program hung on input that never comes, at a limit small enough that four
+/// times it would not be.
+///
 /// `saturating_mul` because nothing bounds `timeMs` above: `Config::validated`
-/// refuses zero and nothing else, so three times a large one wraps.
+/// refuses zero and nothing else, so four times a large one wraps.
 fn reaping_deadline(time_ms: u64) -> Duration {
     Duration::from_millis(time_ms.saturating_mul(4)) + Duration::from_secs(4)
 }

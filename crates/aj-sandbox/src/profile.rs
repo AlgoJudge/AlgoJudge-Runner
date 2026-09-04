@@ -303,6 +303,16 @@ pub enum Stopped {
     /// spent any was never given the chance, and reporting that to a
     /// participant as "no processor time" reads as an accusation.
     NeverStarted,
+    /// **The absolute cap passed while the program was still making progress.**
+    /// Not [`Stopped::WallClock`]: that one says the processor time stopped
+    /// growing, and here it never did — this is the program that wakes for a
+    /// millisecond every tick, resetting the no-progress window for ever
+    /// without ever approaching its limit.
+    ///
+    /// A variant of its own because the note a participant reads states which
+    /// happened, and "no processor time for 8 s" is plainly false about a run
+    /// that spent some in every one of those seconds.
+    Overall,
 }
 
 #[derive(Debug, Clone)]
