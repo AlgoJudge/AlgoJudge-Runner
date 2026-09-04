@@ -168,14 +168,73 @@ impl Server {
     /// restart**: the Server updates the capabilities and keeps the identity,
     /// so this is safe to call on every start and is not a way to get a second
     /// approval.
-    pub async fn register(&self, register: &Register) -> Result<Registered> {
+    /// Registers, **signing for a key the Server already knows**.
+    ///
+    /// A first registration cannot be signed: `auth/challenge` has no row to
+    /// issue a nonce against and answers `404`, which is what tells the two
+    /// apart. Every registration after that one is a restart reporting itself,
+    /// and it proves the private key is present before the Server will let it
+    /// change what this Runner says it can do.
+    ///
+    /// **The extra round trip is on the restart path only**, and a restart has
+    /// just paid for a process start.
+    pub async fn register(&self, register: &Register, identity: &Identity) -> Result<Registered> {
+        /// A registration with the proof beside it.
+        ///
+        /// **Flattened rather than two more fields on `Register`.** Nothing that
+        /// builds one of those can fill these — they come from a round trip this
+        /// method makes — so putting them there would be two `None`s written out
+        /// at every construction site, including the conformance suite's, to say
+        /// nothing.
+        #[derive(serde::Serialize)]
+        struct Signed<'a> {
+            #[serde(flatten)]
+            register: &'a Register,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            nonce: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            signature: Option<String>,
+        }
+
+        let signed = match self.challenge(&identity.fingerprint()).await {
+            Ok(challenge) => Some((identity.sign(&challenge.nonce), challenge.nonce)),
+            // Never registered, so there is nothing to prove ownership of yet.
+            Err(e) if e.not_found() => None,
+            Err(e) => return Err(e),
+        };
+
         let response = self
             .http
             .post(self.url("runner/register"))
-            .json(register)
+            .json(&Signed {
+                nonce: signed.as_ref().map(|(_, nonce)| nonce.clone()),
+                signature: signed.map(|(signature, _)| signature),
+                register,
+            })
             .send()
             .await?;
         read(accept(response).await?).await
+    }
+
+    /// One nonce, for this fingerprint.
+    ///
+    /// Anonymous and deliberately not gated on approval: a Runner waiting to be
+    /// approved still registers again on every restart, and one that could not
+    /// ask for a nonce could not do that.
+    async fn challenge(&self, fingerprint: &str) -> Result<Challenge> {
+        read(
+            accept(
+                self.http
+                    .post(self.url("runner/auth/challenge"))
+                    .json(&ChallengeRequest {
+                        fingerprint: fingerprint.to_owned(),
+                    })
+                    .send()
+                    .await?,
+            )
+            .await?,
+        )
+        .await
     }
 
     /// Challenge, sign, token.
@@ -185,19 +244,7 @@ impl Server {
     /// once — it is spent by being used, and holding one for later is how a
     /// Runner earns `runner.nonce.unknown`.
     pub async fn authenticate(&self, identity: &Identity) -> Result<()> {
-        let challenge: Challenge = read(
-            accept(
-                self.http
-                    .post(self.url("runner/auth/challenge"))
-                    .json(&ChallengeRequest {
-                        fingerprint: identity.fingerprint(),
-                    })
-                    .send()
-                    .await?,
-            )
-            .await?,
-        )
-        .await?;
+        let challenge = self.challenge(&identity.fingerprint()).await?;
 
         let token: Token = read(
             accept(

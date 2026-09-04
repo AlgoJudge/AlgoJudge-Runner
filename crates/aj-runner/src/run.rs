@@ -40,7 +40,7 @@ pub async fn admitted(server: &Server, identity: &Identity, config: &Config) -> 
     let mut backoff = Backoff::new(config.poll_min, config.poll_max);
 
     loop {
-        match server.register(&register).await {
+        match server.register(&register, identity).await {
             Ok(registered) => {
                 if registered.fingerprint != identity.fingerprint() {
                     // Both sides hash the same 32 bytes. Disagreeing means
@@ -194,15 +194,50 @@ pub async fn work(
         // The claim itself waits on an empty queue, so it is where an idle
         // Runner spends nearly all its life and where a stop has to reach it.
         let asked = tokio::time::Instant::now();
+        let mut claim = std::pin::pin!(server.claim(
+            Some(config.lease_seconds),
+            // Zero means the Runner does not want to be held, which is what
+            // an operator behind a proxy that cuts silent requests sets.
+            (!config.poll_wait.is_zero()).then_some(config.poll_wait),
+        ));
         let claimed = tokio::select! {
-            claimed = server.claim(
-                Some(config.lease_seconds),
-                // Zero means the Runner does not want to be held, which is what
-                // an operator behind a proxy that cuts silent requests sets.
-                (!config.poll_wait.is_zero()).then_some(config.poll_wait),
-            ) => claimed,
-            _ = stopping.wait() => { beating.abort(); return Ok(()); },
+            // **`biased`, so an answer that has already arrived is taken.**
+            // With a random draw, a stop landing at the same moment as a job
+            // threw that job away about half the time — and the Server had
+            // already committed it.
+            biased;
+            claimed = &mut claim => claimed,
+            _ = stopping.wait() => {
+                // **Settled, not dropped.** Dropping the request aborts it, and
+                // the Server commits a claim before writing the answer to it:
+                // `Running`, a lease token, one of five attempts spent. What is
+                // dropped is therefore sometimes a job this Runner owns and
+                // cannot give back, because it never learned the token.
+                //
+                // Two seconds, and the number is not a guess about the network.
+                // At the instant a stop is heard there are only two states. The
+                // Server has committed and the response is in flight, which is
+                // the queries behind `DescribeAsync` plus a round trip —
+                // milliseconds. Or it has not, and the request is parked in the
+                // long poll, where the abort costs nothing and this timeout
+                // simply expires. Waiting out the *poll* instead would put
+                // twenty-five seconds, or three hundred, in front of every
+                // release this Runner still owes — inside a stop grace of
+                // thirty. That converts a rare loss into a certain SIGKILL.
+                // Anything else is nothing to hand back: no job, an error, or a
+                // Server still holding the poll open when the two seconds ran
+                // out.
+                if let Ok(Ok(Some(job))) = tokio::time::timeout(SETTLE, &mut claim).await {
+                    give_back(server, &job).await;
+                }
+                beating.abort();
+                return Ok(());
+            }
         };
+        // Measured around the claim alone. It used to be read at the bottom of
+        // this arm, with a trial claim in between, so a slow trial could pass
+        // for a Server that had held the poll open.
+        let waited = asked.elapsed();
 
         match claimed {
             Ok(Some(job)) => {
@@ -216,6 +251,19 @@ pub async fn work(
                 // grade. Asking for trials first would let a busy trial queue
                 // delay a verdict, which is the one thing the separate table
                 // exists to prevent.
+                // **Checked again here, and this is not belt and braces.** A
+                // trial is the longest work this Runner does — every model
+                // solution against every test — and there is no endpoint to
+                // hand one back. Starting one while stopping means work that
+                // cannot be released and a lease that has to expire. The claim
+                // above can return an empty queue at the same moment the stop
+                // arrives, and `biased` makes that the *likely* order rather
+                // than a coin flip.
+                if stopping.now() {
+                    beating.abort();
+                    return Ok(());
+                }
+
                 match server.claim_trial(Some(config.lease_seconds)).await {
                     Ok(Some(trial)) => {
                         backoff.reset();
@@ -238,8 +286,7 @@ pub async fn work(
                 // setting: a Server that does not know about `waitSeconds`
                 // answers at once, and so does one that is draining, and
                 // neither should be asked again immediately.
-                let held =
-                    config.poll_wait > Duration::ZERO && asked.elapsed() >= config.poll_wait / 2;
+                let held = config.poll_wait > Duration::ZERO && waited >= config.poll_wait / 2;
                 if !held {
                     tokio::select! {
                         _ = backoff.wait() => {}
@@ -1045,6 +1092,13 @@ fn total_memory_bytes() -> Option<u64> {
         // `MemTotal` is stated in kibibytes; everything here is bytes.
         .map(|kib| kib * 1024)
 }
+
+/// How long a stop waits for a claim already in flight to answer.
+///
+/// **Long enough for a response, far too short for a poll.** See the stopping
+/// arm in `work`, which is the only place it is used and where the argument
+/// for the number is written.
+const SETTLE: Duration = Duration::from_secs(2);
 
 const FIVE: Duration = Duration::from_secs(5);
 const THIRTY: Duration = Duration::from_secs(30);

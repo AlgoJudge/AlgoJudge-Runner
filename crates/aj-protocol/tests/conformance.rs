@@ -115,7 +115,7 @@ async fn approved(name: &str) -> (Server, Identity) {
     let server = Server::new(&base_url()).expect("a client");
 
     let registered = server
-        .register(&registration(&identity, name))
+        .register(&registration(&identity, name), &identity)
         .await
         .expect("registration");
 
@@ -134,6 +134,9 @@ async fn approved(name: &str) -> (Server, Identity) {
 #[ignore = "needs a Server"]
 async fn a_key_that_is_not_thirty_two_bytes_is_refused() {
     let server = Server::new(&base_url()).unwrap();
+    // Never registered, so `register` finds no challenge to sign and sends the
+    // key on its own — which is what puts the key in front of the check.
+    let identity = identity("bad-key");
 
     for (public_key, expected) in [
         ("dG9vLXNob3J0", "runner.key.length"),
@@ -149,7 +152,7 @@ async fn a_key_that_is_not_thirty_two_bytes_is_refused() {
                 problem_types: vec!["standard-io@1".into()],
                 tags: vec![],
                 machine: None,
-            })
+            }, &identity)
             .await
             .expect_err("a key that is not an Ed25519 key must not be accepted");
 
@@ -168,7 +171,7 @@ async fn the_server_and_the_runner_name_the_key_the_same_way() {
     let server = Server::new(&base_url()).unwrap();
 
     let registered = server
-        .register(&registration(&identity, "fingerprint"))
+        .register(&registration(&identity, "fingerprint"), &identity)
         .await
         .expect("registration");
 
@@ -185,7 +188,7 @@ async fn registering_again_is_the_same_runner() {
     let server = Server::new(&base_url()).unwrap();
 
     let first = server
-        .register(&registration(&identity, "restart"))
+        .register(&registration(&identity, "restart"), &identity)
         .await
         .expect("registration");
     Administrator::sign_in()
@@ -194,7 +197,7 @@ async fn registering_again_is_the_same_runner() {
         .await;
 
     let second = server
-        .register(&registration(&identity, "restart-renamed"))
+        .register(&registration(&identity, "restart-renamed"), &identity)
         .await
         .expect("re-registration");
 
@@ -211,7 +214,7 @@ async fn a_registered_but_unapproved_runner_is_refused_a_token() {
     let server = Server::new(&base_url()).unwrap();
 
     server
-        .register(&registration(&identity, "unapproved"))
+        .register(&registration(&identity, "unapproved"), &identity)
         .await
         .expect("registration");
 
@@ -241,7 +244,7 @@ async fn a_nonce_is_single_use() {
     let base = base_url();
 
     let registered = server
-        .register(&registration(&identity, "replay"))
+        .register(&registration(&identity, "replay"), &identity)
         .await
         .expect("registration");
     Administrator::sign_in()
@@ -301,7 +304,7 @@ async fn a_signature_from_the_wrong_key_is_refused() {
     let server = Server::new(&base).unwrap();
 
     let registered = server
-        .register(&registration(&genuine, "impostor"))
+        .register(&registration(&genuine, "impostor"), &genuine)
         .await
         .expect("registration");
     Administrator::sign_in()
