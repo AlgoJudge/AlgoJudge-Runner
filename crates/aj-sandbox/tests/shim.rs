@@ -44,6 +44,13 @@ int main(int argc, char **argv) {
         volatile unsigned long spun = 0;
         while (now_us() - began < want) spun++;
         printf("spun\n");
+    } else if (!strcmp(what, "burn")) {
+        /* Arithmetic and nothing else -- no clock, no syscall, so what it
+         * spends is the program's own. `spend` cannot serve: it asks the time
+         * on every pass and the kernel does that work. */
+        volatile unsigned long long sum = 0;
+        for (long long i = 0; i < atoll(argv[2]); i++) sum += (unsigned long long)i;
+        printf("burnt %llu\n", sum);
     } else if (!strcmp(what, "grow")) {
         long long mib = atoll(argv[2]);
         char *held = malloc((size_t)mib * 1024 * 1024);
@@ -439,8 +446,8 @@ fn a_program_named_without_a_path_is_found() {
 fn the_report_splits_the_total_into_the_program_and_the_kernel() {
     let built = built!();
 
-    // A busy loop is the program's own work and nothing else.
-    let spun = report_in(&run(built, &["spend", "50"], Some(NONCE))).expect("a report");
+    // Arithmetic is the program's own work and nothing else.
+    let spun = report_in(&run(built, &["burn", "200000000"], Some(NONCE))).expect("a report");
     assert_eq!(
         spun.user_us + spun.system_us,
         spun.cpu_us,
@@ -451,7 +458,7 @@ fn the_report_splits_the_total_into_the_program_and_the_kernel() {
     );
     assert!(
         spun.user_us > 0,
-        "fifty milliseconds of spinning is the program's own time, and it read {} user",
+        "two hundred million additions are the program's own time, and it read {} user",
         spun.user_us,
     );
 
