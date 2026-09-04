@@ -181,6 +181,14 @@ pub struct Token {
 pub struct ClaimRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_seconds: Option<u32>,
+    /// How long the Server may hold this open while the queue is empty.
+    ///
+    /// **Absent is the old behaviour**, which is why it is skipped rather than
+    /// sent as zero: a Server that has never heard of it reads exactly the body
+    /// it always read, and the trial claim — which does not offer this — sends
+    /// the same bytes it did before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_seconds: Option<u32>,
 }
 
 /// One trial: a package to time, belonging to no problem.

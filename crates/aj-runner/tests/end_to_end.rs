@@ -1052,6 +1052,9 @@ fn probe_config() -> Config {
         tags: vec![],
         poll_min: Duration::from_secs(1),
         poll_max: Duration::from_secs(5),
+        // No wait: these cases drive the claim loop directly and assert on when
+        // it comes back, which a held request would only make slower to read.
+        poll_wait: Duration::ZERO,
         heartbeat: Duration::from_secs(60),
         // Sixty is the Server's floor, so this is the fastest a lease can be
         // made to matter — and it makes the keeper's interval fifteen seconds.
@@ -1070,7 +1073,7 @@ fn probe_config() -> Config {
 /// on the request that created the submission.
 async fn claim_the_probe(server: &Server, config: &Config) -> aj_protocol::wire::ClaimedJob {
     for _ in 0..60 {
-        match server.claim(Some(config.lease_seconds)).await {
+        match server.claim(Some(config.lease_seconds), None).await {
             Ok(Some(job)) => return job,
             Ok(None) => tokio::time::sleep(Duration::from_secs(1)).await,
             Err(e) => panic!("claiming the probe was refused: {e}"),

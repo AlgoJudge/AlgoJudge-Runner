@@ -179,7 +179,12 @@ pub async fn work(
         // The claim itself waits on an empty queue, so it is where an idle
         // Runner spends nearly all its life and where a stop has to reach it.
         let claimed = tokio::select! {
-            claimed = server.claim(Some(config.lease_seconds)) => claimed,
+            claimed = server.claim(
+                Some(config.lease_seconds),
+                // Zero means the Runner does not want to be held, which is what
+                // an operator behind a proxy that cuts silent requests sets.
+                (!config.poll_wait.is_zero()).then_some(config.poll_wait),
+            ) => claimed,
             _ = stopping.wait() => return Ok(()),
         };
 
@@ -1224,6 +1229,7 @@ mod tests {
             tags: vec![],
             poll_min: FIVE,
             poll_max: THIRTY,
+            poll_wait: Duration::ZERO,
             heartbeat: THIRTY,
             lease_seconds: seconds,
             cache_path: "/dev/null".into(),

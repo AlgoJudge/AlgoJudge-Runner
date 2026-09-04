@@ -348,7 +348,7 @@ async fn an_empty_queue_is_not_an_error() {
     let (server, _identity) = approved("empty-queue").await;
 
     for _ in 0..50 {
-        match server.claim(Some(60)).await.expect("claiming") {
+        match server.claim(Some(60), None).await.expect("claiming") {
             None => return,
             // Drain whatever else is queued, then ask again.
             Some(job) => {
@@ -783,7 +783,7 @@ impl Participant {
 /// moment. Whatever comes back is ours to report on.
 async fn claim_ours(server: &Server) -> aj_protocol::wire::ClaimedJob {
     for _ in 0..60 {
-        if let Some(job) = server.claim(Some(600)).await.expect("claiming") {
+        if let Some(job) = server.claim(Some(600), None).await.expect("claiming") {
             return job;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
