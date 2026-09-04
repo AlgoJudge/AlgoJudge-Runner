@@ -245,7 +245,10 @@ impl Docker {
             .cgroups()
             .map_or(0, |cgroups| cgroups.abandoned(&self.instance));
         if abandoned > 0 {
-            tracing::warn!(abandoned, "cgroups of runs that were cut short were removed");
+            tracing::warn!(
+                abandoned,
+                "cgroups of runs that were cut short were removed"
+            );
         }
 
         Ok(swept)
