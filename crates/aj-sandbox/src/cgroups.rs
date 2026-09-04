@@ -370,6 +370,38 @@ impl Measuring {
         }
     }
 
+    /// How long something in here has been **runnable and waiting for a
+    /// processor**, cumulative, from `cpu.pressure`.
+    ///
+    /// **The one reading that tells starvation from idleness**, which
+    /// [`Self::so_far`] cannot: a program the kernel never scheduled and a
+    /// program that is not trying to run both spend no processor time, and the
+    /// deadline exists to reap only the second. Pressure separates them —
+    /// something waiting for a core is counted here and something asleep is
+    /// not.
+    ///
+    /// **`some`, not `full`.** `some` is the time at least one task was
+    /// stalled; `full` is the time they all were. A single-process submission
+    /// makes them nearly equal, but a program with threads loses a verdict to
+    /// the first long before the second, and it is the same program either way.
+    ///
+    /// Cumulative and unadjusted, because the caller compares one look with the
+    /// next and a difference needs no origin. That also makes the two backends
+    /// the same: under `systemd` the slice carries every run this Runner has
+    /// done, and one run at a time is in it, so the change across a look is
+    /// still this run's.
+    ///
+    /// `None` where the kernel carries no PSI — built without `CONFIG_PSI`, or
+    /// booted with `psi=0`. The caller must then behave exactly as it did
+    /// before this existed: an absent instrument may not change a verdict.
+    pub(crate) fn stalled(&self) -> Option<Duration> {
+        let here = match self {
+            Self::Own { here } => here,
+            Self::Shared { here, .. } => here,
+        };
+        stalled_usec(here).map(Duration::from_micros)
+    }
+
     /// What the run cost: peak memory, then processor time.
     ///
     /// Either may be absent and neither is ever guessed. This is measurement,
@@ -600,6 +632,22 @@ fn usage_usec(dir: &Path) -> Option<u64> {
         .lines()
         .find_map(|line| line.strip_prefix("usage_usec "))
         .and_then(|v| v.trim().parse().ok())
+}
+
+/// `some total=` from `cpu.pressure`: microseconds with something stalled on a
+/// processor.
+///
+/// The file's first line is `some avg10=… avg60=… avg300=… total=…`. The
+/// averages are decayed and describe the recent past; `total` is a counter and
+/// is the only field a difference can be taken from.
+fn stalled_usec(dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(dir.join("cpu.pressure"))
+        .ok()?
+        .lines()
+        .find(|line| line.starts_with("some "))?
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("total="))
+        .and_then(|v| v.parse().ok())
 }
 
 /// `oom_kill` and `oom` from `memory.events`, in that order.
