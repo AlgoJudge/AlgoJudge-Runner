@@ -1229,27 +1229,23 @@ async fn a_runner_told_to_stop_hands_its_job_back_at_once() {
     // because a Runner that comes back and judges it is the only proof that it
     // did come back. Generous: a start is a preflight and four image probes
     // before it claims anything.
-    // **Asked until it is actually running.** A container that is still shutting
-    // down answers a start with "nothing changed" rather than an error, so one
-    // call is a coin toss on whether the Runner had finished exiting -- and a
-    // lost toss leaves every test after this one without a Runner, which is
-    // exactly how this was found.
-    let mut up = false;
-    for _ in 0..60 {
-        let running = daemon
-            .inspect_container(
-                &container,
-                None::<bollard::query_parameters::InspectContainerOptions>,
-            )
-            .await
-            .ok()
-            .and_then(|seen| seen.state)
-            .and_then(|state| state.running)
-            .unwrap_or(false);
-        if running {
-            up = true;
+    // **Waited out first.** A container in the middle of shutting down still
+    // reads as running and answers a start with "nothing changed", so asking
+    // "is it up?" straight after the signal is answered yes by the process on
+    // its way out -- and every test after this one then runs without a Runner,
+    // which is exactly how this was found. Twice.
+    let mut down = false;
+    for _ in 0..120 {
+        if !is_running(&daemon, &container).await {
+            down = true;
             break;
         }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(down, "the Runner never finished shutting down");
+
+    let mut up = false;
+    for _ in 0..60 {
         let _ = daemon
             .start_container(
                 &container,
@@ -1257,14 +1253,33 @@ async fn a_runner_told_to_stop_hands_its_job_back_at_once() {
             )
             .await;
         tokio::time::sleep(Duration::from_millis(500)).await;
+        if is_running(&daemon, &container).await {
+            up = true;
+            break;
+        }
     }
     assert!(up, "the Runner never came back up");
 
-    let judged = settled_within(&participant, &activity, &sent, 360).await;
+    let judged = settled_within(&participant, &activity, &sent, 720).await;
     assert_eq!(
         judged["state"], "completed",
         "the Runner never came back to judge it: {judged}",
     );
+}
+
+/// Whether the container is running *now* -- which a container in the middle of
+/// shutting down still is, and is the whole reason the caller waits it out.
+async fn is_running(daemon: &bollard::Docker, container: &str) -> bool {
+    daemon
+        .inspect_container(
+            container,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .ok()
+        .and_then(|seen| seen.state)
+        .and_then(|state| state.running)
+        .unwrap_or(false)
 }
 
 /// `settled`, with the patience named by the caller.
