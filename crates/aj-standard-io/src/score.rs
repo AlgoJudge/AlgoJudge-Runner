@@ -73,8 +73,9 @@ pub struct TestOutcome {
     ///
     /// It was the wall clock until then, which charged a participant for the
     /// container's own start and made a verdict a property of the host as much
-    /// as of the submission. The wall clock survives as a reaping deadline and
-    /// in the Runner's log; it is not reported and decides nothing.
+    /// as of the submission. The wall clock survives in the Runner's log, and
+    /// as the deadline for a program that has stopped spending processor time
+    /// altogether; it is not reported and decides nothing.
     pub time_ms: u64,
     pub memory_bytes: Option<u64>,
     /// Reaches the participant, and originates beside untrusted code.

@@ -135,7 +135,7 @@ impl Docker {
         }
 
         let name = format!("algojudge-{}-shimprobe", self.instance);
-        let _ = self.remove(&name).await;
+        self.take_nothing(&name).await;
         let created = self
             .client
             .create_container(
@@ -469,7 +469,13 @@ impl Sandbox for Docker {
         }
 
         // From here on the container exists, so every path out removes it.
-        let mut outcome = self.supervise(&name, profile).await;
+        let mut outcome = self
+            .supervise(
+                &name,
+                profile,
+                cgroup.as_ref().map(|(measuring, _)| measuring),
+            )
+            .await;
         self.remove(&name).await;
 
         // Read after the container is gone: the child's own cgroup goes with it,
@@ -488,7 +494,50 @@ impl Sandbox for Docker {
 
         if let (Some(nonce), Ok(outcome)) = (nonce.as_deref(), outcome.as_mut()) {
             if let Some(said) = take_report(&mut outcome.stderr, nonce) {
-                outcome.cpu_time = Some(measured_time(said.cpu, outcome.cpu_time));
+                let whole = outcome.cpu_time;
+                let charged = measured_time(said.cpu, whole);
+
+                // **Both instruments, side by side, and nothing else records
+                // them.** What a run is charged is a `max` of the two, so a run
+                // charged more than it spent was charged by exactly one of them
+                // and the gap says which. The report is the program alone; the
+                // reading is the program plus the container it started in; and
+                // [`UNEXPLAINED_GAP`] is what a container may honestly cost
+                // container, measured on a host with nothing else to do. On a
+                // loaded one that constant is the likeliest thing to be wrong,
+                // and this line is how anybody would find out.
+                tracing::debug!(
+                    container = name,
+                    reported_us = said.cpu.as_micros() as u64,
+                    cgroup_us = whole.map(|whole| whole.as_micros() as u64),
+                    unexplained_gap_us = UNEXPLAINED_GAP.as_micros() as u64,
+                    charged_us = charged.as_micros() as u64,
+                    floored = charged > said.cpu,
+                    // **What the program did, against what was done for it.** A
+                    // total that grew under load says nothing about which of the
+                    // two grew, and they have different causes and different
+                    // cures: one is the program, the other is the host's memory
+                    // and its filesystem.
+                    user_us = said.user.as_micros() as u64,
+                    system_us = said.system.as_micros() as u64,
+                    "reconciled the program's own time with the container's",
+                );
+
+                if charged != said.cpu {
+                    // **Loud, because it is one of two things and both matter.**
+                    // Either this host's containers cost more than any measured
+                    // -- and correct programs are now being charged for them --
+                    // or a report was forged, which takes getting past the
+                    // nonce. Neither is a thing to find out from a verdict.
+                    tracing::warn!(
+                        container = name,
+                        reported_us = said.cpu.as_micros() as u64,
+                        cgroup_us = whole.map(|whole| whole.as_micros() as u64),
+                        charged_us = charged.as_micros() as u64,
+                        "the container's reading is too far above the program's own time to believe it",
+                    );
+                }
+                outcome.cpu_time = Some(charged);
                 // Memory needs no floor: understating it buys nothing, because
                 // the kernel and not this number decides the memory verdict. The
                 // shim's figure is the better one -- the program's own resident
@@ -502,7 +551,48 @@ impl Sandbox for Docker {
 }
 
 impl Docker {
-    async fn supervise(&self, name: &str, profile: &Profile) -> Result<Outcome> {
+    /// Waits for a run to stop being worth waiting for, and stops it.
+    ///
+    /// **A program spending processor time is never reaped**, however long it
+    /// takes in wall clock. That is the whole point: on a busy host a program
+    /// that is computing may be descheduled for most of its wall clock, and a
+    /// deadline that cannot tell that from a program doing nothing turns
+    /// contention into `Time limit exceeded` on work that was inside its limit.
+    async fn reap(
+        &self,
+        name: &str,
+        profile: &Profile,
+        measuring: Option<&crate::cgroups::Measuring>,
+    ) -> Stopped {
+        let started = Instant::now();
+        let mut reaper = Reaper::new(profile);
+        loop {
+            tokio::time::sleep(REAP_POLL).await;
+            let cpu = measuring.and_then(|measuring| measuring.so_far());
+            if let Some(stopped) = reaper.tick(REAP_POLL, started.elapsed(), cpu) {
+                tracing::debug!(
+                    container = name,
+                    ?stopped,
+                    cpu_us = cpu.map(|cpu| cpu.as_micros() as u64),
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "stopped waiting for a run",
+                );
+                // **The kill belongs to the caller, not here.** `select!` polls
+                // every branch until one *completes*; awaiting inside this one
+                // leaves the other still able to win, and the container exiting
+                // under our own kill is exactly what makes it win. The run then
+                // reads as having finished on its own.
+                return stopped;
+            }
+        }
+    }
+
+    async fn supervise(
+        &self,
+        name: &str,
+        profile: &Profile,
+        measuring: Option<&crate::cgroups::Measuring>,
+    ) -> Result<Outcome> {
         let started = Instant::now();
         self.client
             .start_container(name, None::<StartContainerOptions>)
@@ -540,10 +630,11 @@ impl Docker {
 
         let stopped = tokio::select! {
             _ = waiter.next() => Stopped::OnItsOwn,
-            _ = tokio::time::sleep(profile.wall_clock) => {
-                tracing::debug!(container = name, "killed at the wall clock");
+            // Once this completes the branch is chosen and its block runs to the
+            // end, so the kill cannot hand the decision back to the waiter.
+            stopped = self.reap(name, profile, measuring) => {
                 self.kill(name).await;
-                Stopped::WallClock
+                stopped
             }
         };
 
@@ -657,15 +748,33 @@ impl Docker {
     }
 
     async fn remove(&self, name: &str) {
-        let options = RemoveContainerOptionsBuilder::default()
-            .force(true)
-            .v(true)
-            .build();
-        if let Err(e) = self.client.remove_container(name, Some(options)).await {
+        if let Err(e) = self.take_away(name).await {
             // Worth a warning rather than a shrug: an evaluation host that
             // accumulates these runs out of disk on the busiest day of the year.
             tracing::warn!(container = name, %e, "a sandbox container was left behind");
         }
+    }
+
+    /// The same removal where **there is usually nothing to remove**, and the
+    /// absence is the ordinary case rather than a leak.
+    ///
+    /// Only the shim probe, which clears a name it is about to reuse in case a
+    /// killed Runner left one behind. Going through [`Self::remove`] there
+    /// reported `404: no such container` as a container left behind, on every
+    /// probe of every image — an operator being taught that this warning means
+    /// nothing, which is the whole of what it costs.
+    async fn take_nothing(&self, name: &str) {
+        if let Err(e) = self.take_away(name).await {
+            tracing::debug!(container = name, %e, "nothing to clear before the probe");
+        }
+    }
+
+    async fn take_away(&self, name: &str) -> std::result::Result<(), bollard::errors::Error> {
+        let options = RemoveContainerOptionsBuilder::default()
+            .force(true)
+            .v(true)
+            .build();
+        self.client.remove_container(name, Some(options)).await
     }
 }
 
@@ -787,39 +896,151 @@ fn container_user(measured: bool, shim: bool) -> &'static str {
     }
 }
 
-/// A run's processor time, from the precise instrument and the trusted one.
+/// A run's processor time, from the precise instrument and the coarse one.
 ///
-/// **The cgroup is a floor and the report may only lift it.** The reading covers
-/// the whole container, so it is never less than the program's own cost; the
-/// report is the program alone but arrives through a channel the submission
-/// shares. Allowing the report to explain away at most [`SHIM_ALLOWANCE`] gives
-/// an honest run its exact figure -- the floor sits well below what it really
-/// spent -- and bounds what a forged one is worth to that same constant.
+/// **The report is charged, and the reading is used to disbelieve it.** The two
+/// measure different things: the report is the program alone, the reading is the
+/// program plus the container it started in. Their difference is therefore the
+/// container's own cost, and a rule that charges the larger of the two charges
+/// the participant for that difference whenever it exceeds whatever constant
+/// stands in for it.
+///
+/// **Measured, and that is why this is the way round it is.** Across 7077 runs
+/// under load, 2026-09-04, the difference ran to a median of 77 ms and a
+/// maximum of 619 ms -- so a 120 ms allowance charged 5% of honest runs for work
+/// they did not do, by up to half a second, and six correct submissions in a
+/// hundred and fifty were failed for it. Above [`UNEXPLAINED_GAP`] the reading
+/// is no longer explicable as a container start and the report is not believed;
+/// below it, the precise instrument wins outright.
 fn measured_time(reported: Duration, whole: Option<Duration>) -> Duration {
     match whole {
-        Some(whole) => reported.max(whole.saturating_sub(SHIM_ALLOWANCE)),
         None => reported,
+        Some(whole) if whole.saturating_sub(reported) <= UNEXPLAINED_GAP => reported,
+        // Not the report and not the reading: the reading less everything a
+        // container could honestly have cost, which is the least this run can
+        // be shown to have spent.
+        Some(whole) => whole.saturating_sub(UNEXPLAINED_GAP),
     }
 }
 
-/// The most a shim's report may take off the cgroup's reading.
+/// How far the container's reading may stand above the program's own report
+/// before the report stops being believable.
 ///
-/// **The report is precise and untrusted; the cgroup is coarse and cannot be
-/// reached from inside a container.** So the second is kept as a floor under the
-/// first: an honest run is corrected exactly, because the floor sits below what
-/// it really cost, and a forged one cannot claim less than the cgroup's total
-/// less this. The most a lie is worth is therefore this constant, which is what
-/// subtracting a blanket average would have given away in every direction at
-/// once.
+/// **What it costs and what it buys, both stated.** A submission that could
+/// forge a report may understate by up to this much and be believed. What that
+/// takes is the nonce, which is scrubbed from the environment before the fork
+/// and sits in a process owned by root while the submission runs as nobody --
+/// so a forgery is downstream of a privilege escalation inside the container,
+/// and this bounds the damage rather than being the defence.
 ///
-/// Above the worst container start measured on any of the four images -- 74 ms,
-/// 2026-09-03, under load -- with room for a slower host.
-const SHIM_ALLOWANCE: Duration = Duration::from_millis(120);
+/// Against that: **every value below the measured maximum fails honest runs.**
+/// The largest difference across 7077 runs under load was 619 ms, so anything
+/// tighter than that charges correct programs for their container. A second is
+/// above it with room for a host slower than the one measured, and still
+/// catches the cheating worth doing -- a program spending seconds past its
+/// limit, which is what a limit of 100 to 600 ms makes worth attempting.
+const UNEXPLAINED_GAP: Duration = Duration::from_secs(1);
+
+/// How often a run's processor time is looked at while it runs.
+///
+/// One small file read per run per tick — a dozen Runners make a few dozen
+/// reads a second — and fine enough that progress is seen long before any
+/// deadline below could pass.
+const REAP_POLL: Duration = Duration::from_millis(250);
+
+/// How far past its limit a program may get before there is no point waiting.
+///
+/// **Generous on purpose, because being early here is the expensive mistake.**
+/// The verdict is decided afterwards on the precise measurement; the reading
+/// this is compared against is the cgroup's, which carries the container's own
+/// start as well as the program. Twice the limit plus the shim's allowance is
+/// far outside anything a program inside its budget produces, and still stops a
+/// runaway in a fraction of the wall clock it used to take.
+fn cpu_ceiling(limit: Duration) -> Duration {
+    limit * 2 + UNEXPLAINED_GAP
+}
+
+/// The longest a run may take however little processor time it spends.
+///
+/// Nothing else bounds a program that wakes for a millisecond every quarter of
+/// a second: it never stalls and never approaches its limit. Ten times the
+/// no-progress window is far outside anything contention produces, and still
+/// bounds what one submission can take from the queue.
+fn absolute_cap(window: Duration) -> Duration {
+    window * 10
+}
+
+/// When a run stops being worth waiting for.
+///
+/// **Progress, not elapsed time.** Every field is a duration rather than an
+/// instant so the decision is a function of its arguments: the deadline this
+/// implements is the one thing in the sandbox that must be provably right about
+/// a program that is running slowly rather than not running.
+struct Reaper {
+    /// How long without the processor time growing before giving up.
+    window: Duration,
+    /// Where "plainly past its budget" starts, when the step has a budget.
+    ceiling: Option<Duration>,
+    /// The end of it, whatever the program is doing.
+    cap: Duration,
+    best: Duration,
+    idle: Duration,
+}
+
+impl Reaper {
+    fn new(profile: &Profile) -> Self {
+        Self {
+            window: profile.wall_clock,
+            ceiling: profile.cpu_limit.map(cpu_ceiling),
+            cap: absolute_cap(profile.wall_clock),
+            best: Duration::ZERO,
+            idle: Duration::ZERO,
+        }
+    }
+
+    /// One look. `None` means keep waiting.
+    fn tick(
+        &mut self,
+        since: Duration,
+        elapsed: Duration,
+        cpu: Option<Duration>,
+    ) -> Option<Stopped> {
+        match cpu {
+            // **Progress only counts against a limit.** A step nobody is timed
+            // on — a build, a checker — has a cgroup like any other, so there is
+            // a reading; what there is not is anything for it to mean. Letting
+            // it hold the deadline open would give a build ten times the minute
+            // it is allowed, and an infinite loop in one would be reaped ten
+            // minutes late rather than at its deadline.
+            //
+            // The same arm takes a measured run on a host that could not be
+            // measured. Both keep the plain wall clock they always had.
+            Some(cpu) if self.ceiling.is_some() => {
+                if self.ceiling.is_some_and(|ceiling| cpu > ceiling) {
+                    return Some(Stopped::TimeLimit);
+                }
+                if cpu > self.best {
+                    self.best = cpu;
+                    self.idle = Duration::ZERO;
+                } else {
+                    self.idle += since;
+                }
+            }
+            _ => self.idle += since,
+        }
+
+        (self.idle >= self.window || elapsed >= self.cap).then_some(Stopped::WallClock)
+    }
+}
 
 /// What the shim said about the one process it was there to watch.
 struct Reported {
     cpu: Duration,
     peak_memory_bytes: u64,
+    /// The same total, split into the program's own work and the kernel's work
+    /// on its behalf.
+    user: Duration,
+    system: Duration,
 }
 
 /// Takes the shim's report out of the standard error it travelled on.
@@ -869,9 +1090,15 @@ fn take_report(stderr: &mut Vec<u8>, nonce: &str) -> Option<Reported> {
     let mut fields = said.strip_prefix("ok ")?.split_whitespace().skip(2);
     let cpu_us: u64 = fields.next()?.parse().ok()?;
     let peak: u64 = fields.next()?.parse().ok()?;
+    // The wall clock sits between them and is skipped: the sandbox keeps its
+    // own and does not read the shim's.
+    let user_us: u64 = fields.nth(1)?.parse().ok()?;
+    let system_us: u64 = fields.next()?.parse().ok()?;
     Some(Reported {
         cpu: Duration::from_micros(cpu_us),
         peak_memory_bytes: peak,
+        user: Duration::from_micros(user_us),
+        system: Duration::from_micros(system_us),
     })
 }
 
@@ -909,26 +1136,63 @@ mod tests {
         assert_eq!(time, Duration::from_micros(221_812));
     }
 
-    /// **The bound is the point.** Whatever a forged report claims, the answer
-    /// cannot fall below the cgroup's own reading less the allowance -- which is
-    /// the same amount subtracting a blanket average would have given away, and
-    /// no more.
+    /// **A gap no container could have cost is not believed.** Whatever the
+    /// report claims, the answer cannot then fall below the reading less
+    /// everything a container start could honestly account for.
     #[test]
-    fn a_forged_report_cannot_buy_more_than_the_allowance() {
-        let whole = Duration::from_millis(500);
+    fn a_report_the_reading_cannot_explain_is_not_believed() {
+        let whole = Duration::from_secs(5);
         for claimed in [0, 1, 10, 379] {
             let time = measured_time(Duration::from_millis(claimed), Some(whole));
-            assert_eq!(time, whole - SHIM_ALLOWANCE, "claiming {claimed} ms");
+            assert_eq!(time, whole - UNEXPLAINED_GAP, "claiming {claimed} ms");
         }
-        assert!(measured_time(Duration::ZERO, Some(whole)) >= whole - SHIM_ALLOWANCE);
     }
 
-    /// A run shorter than the allowance has nothing to subtract from, and a
-    /// floor below zero is zero rather than a panic.
+    /// **And the cost of that, said out loud rather than left to be discovered.**
+    /// A forged report inside the gap is charged as it stands. Nothing here
+    /// stops it; what stops it is the nonce, and this bounds what getting past
+    /// the nonce is worth.
     #[test]
-    fn a_run_shorter_than_the_allowance_keeps_what_the_shim_said() {
+    fn a_lie_smaller_than_a_containers_own_cost_is_charged_as_it_stands() {
+        let time = measured_time(Duration::ZERO, Some(Duration::from_millis(900)));
+        assert_eq!(time, Duration::ZERO);
+    }
+
+    /// A run shorter than the gap has nothing to subtract from, and a floor
+    /// below zero is zero rather than a panic.
+    #[test]
+    fn a_run_shorter_than_the_gap_keeps_what_the_shim_said() {
         let time = measured_time(Duration::from_millis(5), Some(Duration::from_millis(60)));
         assert_eq!(time, Duration::from_millis(5));
+    }
+
+    /// **The measured population, and none of it moves the charge.** These are
+    /// the percentiles of the difference between the two instruments across
+    /// 7077 runs under load, 2026-09-04: what a container cost on top of the
+    /// program, from the median to the worst single run. Every one of them is
+    /// explicable, so every one of them leaves the program charged with its own
+    /// time -- which under the previous rule it was not, for the 5% above
+    /// 120 ms.
+    #[test]
+    fn no_container_cost_ever_measured_moves_what_the_program_is_charged() {
+        let reported = Duration::from_millis(150);
+        for gap in [77u64, 98, 120, 219, 275, 476, 619] {
+            let whole = reported + Duration::from_millis(gap);
+            assert_eq!(
+                measured_time(reported, Some(whole)),
+                reported,
+                "a container costing {gap} ms",
+            );
+        }
+    }
+
+    /// The worst difference in the measured population, still believed. Below
+    /// this the constant would be failing honest runs again.
+    #[test]
+    fn the_largest_container_cost_ever_measured_is_still_explicable() {
+        let reported = Duration::from_millis(100);
+        let whole = reported + Duration::from_millis(619);
+        assert_eq!(measured_time(reported, Some(whole)), reported);
     }
 
     /// Nothing to floor it with: a host the Runner could not read a cgroup on
@@ -948,6 +1212,20 @@ mod tests {
     fn a_report_larger_than_the_whole_container_is_taken() {
         let time = measured_time(Duration::from_millis(300), Some(Duration::from_millis(271)));
         assert_eq!(time, Duration::from_millis(300));
+    }
+
+    /// **The split is read where a shim writes it**, and the total stays what
+    /// it always was rather than being recomputed from the halves: the total is
+    /// what a participant is judged on, and two numbers that must agree are two
+    /// chances to disagree.
+    #[test]
+    fn a_report_carrying_the_split_gives_both_halves() {
+        let mut stderr =
+            format!("{NONCE} aj-shim1 ok 0 0 221812 9342976 232932 51000 170812\n").into_bytes();
+        let said = take_report(&mut stderr, NONCE).expect("a report");
+        assert_eq!(said.cpu, Duration::from_micros(221_812));
+        assert_eq!(said.user, Duration::from_micros(51_000));
+        assert_eq!(said.system, Duration::from_micros(170_812));
     }
 
     fn stderr_of(text: &str) -> Vec<u8> {
@@ -974,7 +1252,7 @@ mod tests {
 
     #[test]
     fn a_report_with_nothing_before_it_is_read() {
-        let mut stderr = format!("{NONCE} aj-shim1 ok 0 0 5 6 7\n").into_bytes();
+        let mut stderr = format!("{NONCE} aj-shim1 ok 0 0 5 6 7 2 3\n").into_bytes();
         assert_eq!(
             take_report(&mut stderr, NONCE).unwrap().cpu,
             Duration::from_micros(5)
@@ -992,8 +1270,8 @@ mod tests {
     /// everything else, so the real one is last however many precede it.
     #[test]
     fn every_forgery_is_removed_however_many_there_are() {
-        let real = format!("{NONCE} aj-shim1 ok 0 0 99 98 97\n");
-        let forged = |us: u64| format!("{NONCE} aj-shim1 ok 0 0 {us} {us} {us}\n");
+        let real = format!("{NONCE} aj-shim1 ok 0 0 99 98 97 40 59\n");
+        let forged = |us: u64| format!("{NONCE} aj-shim1 ok 0 0 {us} {us} {us} {us} {us}\n");
         let mut stderr = format!(
             "{}first\n{}second\n{}{}",
             forged(1),
@@ -1014,7 +1292,7 @@ mod tests {
         let mut stderr = Vec::new();
         stderr.extend_from_slice(&[0xff, 0xfe, b'a', 0x80, b'B', 10]);
         let untouched = stderr.clone();
-        stderr.extend_from_slice(format!("{NONCE} aj-shim1 ok 0 0 5 6 7\n").as_bytes());
+        stderr.extend_from_slice(format!("{NONCE} aj-shim1 ok 0 0 5 6 7 2 3\n").as_bytes());
 
         let said = take_report(&mut stderr, NONCE).expect("a report");
         assert_eq!(said.cpu, Duration::from_micros(5));
@@ -1027,7 +1305,7 @@ mod tests {
     #[test]
     fn a_report_is_read_and_taken_out_of_what_the_participant_wrote() {
         let mut stderr = stderr_of(&format!(
-            "a warning the program printed\n{NONCE} aj-shim1 ok 0 0 221812 9342976 232932\n"
+            "a warning the program printed\n{NONCE} aj-shim1 ok 0 0 221812 9342976 232932 51000 170812\n"
         ));
         let said = take_report(&mut stderr, NONCE).expect("a report");
 
@@ -1045,7 +1323,7 @@ mod tests {
     #[test]
     fn the_last_report_wins_and_a_forged_one_is_removed() {
         let mut stderr = stderr_of(&format!(
-            "{NONCE} aj-shim1 ok 0 0 1 1 1\noutput\n{NONCE} aj-shim1 ok 0 11 45174 14446592 59615\n"
+            "{NONCE} aj-shim1 ok 0 0 1 1 1 1 0\noutput\n{NONCE} aj-shim1 ok 0 11 45174 14446592 59615 20000 25174\n"
         ));
         let said = take_report(&mut stderr, NONCE).expect("a report");
 
@@ -1055,11 +1333,11 @@ mod tests {
 
     #[test]
     fn a_line_carrying_someone_elses_nonce_is_not_a_report() {
-        let mut stderr = stderr_of("ffff aj-shim1 ok 0 0 1 1 1\n");
+        let mut stderr = stderr_of("ffff aj-shim1 ok 0 0 1 1 1 1 0\n");
         assert!(take_report(&mut stderr, NONCE).is_none());
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
-            "ffff aj-shim1 ok 0 0 1 1 1\n"
+            "ffff aj-shim1 ok 0 0 1 1 1 1 0\n"
         );
     }
 
@@ -1080,11 +1358,192 @@ mod tests {
         }
     }
 
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// A timed run: a 200 ms limit and the deadline the pipeline sets with it.
+    fn timed() -> Reaper {
+        Reaper::new(
+            &Profile::new("image", vec!["run".to_owned()])
+                .wall_clock(ms(1600))
+                .cpu_limit(ms(200)),
+        )
+    }
+
+    /// **The case the whole thing exists for.** A program that keeps spending
+    /// processor time is never reaped, however long the host makes it wait: it
+    /// is descheduled, not stuck, and the two were indistinguishable while the
+    /// deadline counted wall clock alone.
+    #[test]
+    fn a_program_that_keeps_computing_is_never_reaped_for_being_slow() {
+        let mut reaper = timed();
+        let mut cpu = ms(0);
+        // A 200 ms budget spent over ten seconds -- a fiftieth of a processor,
+        // which is what a badly oversubscribed host leaves a program. Every
+        // look is progress, so the 1.6 s window never starts.
+        for tick in 1..=40u64 {
+            cpu += ms(5);
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu)),
+                None,
+                "tick {tick}, {cpu:?} of processor time"
+            );
+        }
+        assert_eq!(cpu, ms(200), "it spent its whole limit and was left alone");
+    }
+
+    /// And one that stops spending it is reaped, which is what the deadline was
+    /// always for: waiting, or wedged in an uninterruptible call.
+    #[test]
+    fn a_program_that_stops_computing_is_reaped_after_the_window() {
+        let mut reaper = timed();
+        // It runs for a moment, and then spends nothing at all.
+        assert_eq!(reaper.tick(ms(250), ms(250), Some(ms(30))), None);
+        for tick in 2..=7u64 {
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), Some(ms(30))),
+                None,
+                "tick {tick}",
+            );
+        }
+        // The seventh quiet look puts the idle time past the 1.6 s window.
+        assert_eq!(
+            reaper.tick(ms(250), ms(2000), Some(ms(30))),
+            Some(Stopped::WallClock),
+        );
+    }
+
+    /// **Progress puts the window back**, so a program that computes in bursts
+    /// is not reaped for the pauses between them.
+    #[test]
+    fn every_step_forward_starts_the_window_again() {
+        let mut reaper = timed();
+        for round in 0..4u64 {
+            // Quiet for six ticks — 1.5 s, just inside the window.
+            for tick in 0..6 {
+                assert_eq!(
+                    reaper.tick(ms(250), ms(250 * (round * 7 + tick)), Some(ms(10))),
+                    None,
+                );
+            }
+            // Then a step forward, which must clear it.
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * (round * 7 + 6)), Some(ms(11 + round))),
+                None,
+            );
+        }
+    }
+
+    /// Plainly past its budget is stopped rather than left to run.
+    ///
+    /// **The ceiling carries the container's own cost too**, because the
+    /// reading it is compared against is the cgroup's: twice the limit plus
+    /// [`UNEXPLAINED_GAP`], so 1.4 s for a 200 ms limit. Anything tighter would
+    /// stop a correct program whose container was expensive -- the same mistake
+    /// the reconciliation above exists to avoid, made at the other end.
+    #[test]
+    fn a_runaway_is_stopped_well_past_its_limit() {
+        assert_eq!(
+            timed().tick(ms(250), ms(250), Some(ms(1401))),
+            Some(Stopped::TimeLimit)
+        );
+    }
+
+    /// And the case that makes the ceiling generous: a program inside its limit
+    /// whose container cost the worst ever measured is nowhere near it.
+    #[test]
+    fn a_correct_program_in_an_expensive_container_is_not_stopped() {
+        assert_eq!(timed().tick(ms(250), ms(250), Some(ms(180 + 619))), None);
+    }
+
+    /// **And a program inside its budget is not**, which is the mistake that
+    /// would cost a correct submission its verdict. The reading is the cgroup's
+    /// and carries the container's own start, so a program at its limit reads
+    /// well above it and must still be left alone.
+    #[test]
+    fn a_program_at_its_limit_is_left_alone() {
+        for cpu in [200u64, 250, 274, 320] {
+            assert_eq!(
+                timed().tick(ms(250), ms(250), Some(ms(cpu))),
+                None,
+                "{cpu} ms"
+            );
+        }
+    }
+
+    /// A step nobody times keeps the deadline it always had.
+    #[test]
+    fn a_run_with_nothing_to_measure_keeps_the_plain_wall_clock() {
+        let mut reaper =
+            Reaper::new(&Profile::new("image", vec!["build".to_owned()]).wall_clock(ms(1000)));
+        for tick in 1..4u64 {
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), None),
+                None,
+                "tick {tick}"
+            );
+        }
+        assert_eq!(
+            reaper.tick(ms(250), ms(1000), None),
+            Some(Stopped::WallClock)
+        );
+    }
+
+    /// **A step nobody is timed on is reaped at its deadline while computing.**
+    /// The case CI caught: a build has a cgroup like every other container, so
+    /// the reading is there — and taking it as progress gave an infinite loop
+    /// in a build ten times the minute a build is allowed. The reading is not
+    /// the question; having a limit for it to mean something is.
+    #[test]
+    fn a_step_with_no_limit_is_reaped_at_its_deadline_even_while_it_computes() {
+        let mut reaper =
+            Reaper::new(&Profile::new("image", vec!["build".to_owned()]).wall_clock(ms(1000)));
+        let mut cpu = ms(0);
+        for tick in 1..4u64 {
+            cpu += ms(250);
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu)),
+                None,
+                "tick {tick}",
+            );
+        }
+        cpu += ms(250);
+        assert_eq!(
+            reaper.tick(ms(250), ms(1000), Some(cpu)),
+            Some(Stopped::WallClock),
+            "a build that spins is stopped at a minute, not at ten",
+        );
+    }
+
+    /// The end of it, however busy the program looks. Without this a program
+    /// waking for a millisecond every quarter-second never stalls and never
+    /// approaches its limit, and holds a Runner for ever.
+    #[test]
+    fn a_trickle_still_ends_at_the_cap() {
+        let mut reaper = timed();
+        let mut cpu = ms(0);
+        let mut verdict = None;
+        for tick in 1..=100u64 {
+            cpu += ms(1);
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(cpu));
+            if verdict.is_some() {
+                assert!(
+                    ms(250 * tick) >= ms(16_000),
+                    "ended at {tick} ticks, before the cap"
+                );
+                break;
+            }
+        }
+        assert_eq!(verdict, Some(Stopped::WallClock));
+    }
+
     /// Nothing the kernel did not count changes what a run was stopped by.
     #[test]
     fn no_kill_leaves_the_runtimes_answer_alone() {
         for stopped in [
             Stopped::OnItsOwn,
+            Stopped::TimeLimit,
             Stopped::WallClock,
             Stopped::Output,
             Stopped::Memory,

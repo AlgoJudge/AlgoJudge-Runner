@@ -43,8 +43,10 @@ correctly.
 | `--user 65534:65534` | never root, even inside |
 | `--memory` **with `--memory-swap` equal** | without the second the limit means nothing: the process swaps instead of being killed. **Two sources say a kill happened** and either is enough — see below |
 | `--pids-limit` | a fork bomb hits a wall |
-| `--cpus` **and `--cpuset-cpus`** | capping CPU is not pinning it. The threading hole is closed by the accounting — `cpu.stat` sums the subtree — and the pin keeps a run reproducible and keeps processor time close to wall clock, which is what makes the deadline below mean anything |
-| wall clock = **three times the limit plus one second** | not a limit anybody is judged against: a time limit is processor time, so this reaps what is *not* spending any — one stuck in an uninterruptible syscall, or one that waits rather than computes |
+| `--cpus` | one processor's worth per second. The threading hole is closed by the accounting as well — `cpu.stat` sums the subtree, so threads spend the budget faster rather than escaping it |
+| `--cpuset-cpus`, **only where the Runner was given a set** | an operator's division of the host, carried to the job containers, which inherit no affinity of their own. Given the whole machine the Runner pins nothing: several Runners choosing processors with nothing coordinating them is worse than letting the host place the work |
+| wall clock = **three times the limit plus one second without progress** | not a limit anybody is judged against: a time limit is processor time, so this reaps what is *not* spending any — one stuck in an uninterruptible syscall, or one that waits rather than computes. The deadline stops counting whenever the processor time grows, so a program descheduled on a busy host is never reaped for it |
+| processor time past **twice the limit plus a second** | there is no reason to keep waiting; the verdict is still decided afterwards on the measurement, and the second is what a container may itself have cost |
 | an output cap enforced **while it runs** | read afterwards, a flooding program fills the host's disk first |
 
 **No step that runs a submission is given a tmpfs.** The two profiles that ask

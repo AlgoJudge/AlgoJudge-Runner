@@ -317,6 +317,23 @@ pub(crate) enum Measuring {
 }
 
 impl Measuring {
+    /// Processor time so far, **without ending the measurement**.
+    ///
+    /// The same arithmetic as [`Self::finish`] does for processor time, and it
+    /// has to stay the same: this is what decides whether a program is making
+    /// progress, and a reading on a different basis would answer a different
+    /// question. `cpu.stat` is live, so there is nothing to arrange — the file
+    /// is simply read again.
+    pub(crate) fn so_far(&self) -> Option<Duration> {
+        match self {
+            Self::Own { here } => usage_usec(here).map(Duration::from_micros),
+            Self::Shared {
+                here, cpu_before, ..
+            } => usage_usec(here)
+                .map(|now| Duration::from_micros(now.checked_sub(*cpu_before).unwrap_or(now))),
+        }
+    }
+
     /// What the run cost: peak memory, then processor time.
     ///
     /// Either may be absent and neither is ever guessed. This is measurement,
