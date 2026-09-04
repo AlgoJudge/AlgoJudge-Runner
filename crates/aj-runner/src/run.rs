@@ -167,17 +167,33 @@ pub async fn work(
     stopping: &Stopping,
 ) -> anyhow::Result<()> {
     let mut backoff = Backoff::new(config.poll_min, config.poll_max);
-    let mut last_beat = tokio::time::Instant::now();
+
+    // **Liveness on a timer of its own, because it is not the loop's
+    // business.** The beat used to be a threshold checked at the bottom of this
+    // loop, which was fine while an iteration was a second or two. A held claim
+    // made the iteration tens of seconds, so a sixty-second threshold fired
+    // every second or third pass — an effective beat of ninety-five to a
+    // hundred and twenty-two seconds, against a Server that calls a Runner
+    // disconnected after a hundred and twenty. A healthy idle Runner could show
+    // as gone, and an operator who *lowered* the interval got half the effect
+    // they asked for.
+    //
+    // It also covers the case the loop never could: a Runner judging a long
+    // submission is inside `handle` and does not reach the bottom of the loop
+    // at all.
+    let beating = heartbeat(Arc::clone(server), config.heartbeat, stopping.clone());
 
     loop {
         // **Asked before every claim**, so a Runner told to stop while it was
         // finishing one job does not take another.
         if stopping.now() {
+            beating.abort();
             return Ok(());
         }
 
         // The claim itself waits on an empty queue, so it is where an idle
         // Runner spends nearly all its life and where a stop has to reach it.
+        let asked = tokio::time::Instant::now();
         let claimed = tokio::select! {
             claimed = server.claim(
                 Some(config.lease_seconds),
@@ -185,7 +201,7 @@ pub async fn work(
                 // an operator behind a proxy that cuts silent requests sets.
                 (!config.poll_wait.is_zero()).then_some(config.poll_wait),
             ) => claimed,
-            _ = stopping.wait() => return Ok(()),
+            _ = stopping.wait() => { beating.abort(); return Ok(()); },
         };
 
         match claimed {
@@ -210,21 +226,25 @@ pub async fn work(
                     Err(e) => tracing::warn!(%e, "could not ask for a trial"),
                 }
 
-                if last_beat.elapsed() >= config.heartbeat {
-                    match server.heartbeat().await {
-                        Ok(()) => {}
-                        // Expected during a window rather than worth a warning:
-                        // the Server has withdrawn and already knows.
-                        Err(e) if e.unavailable() => {
-                            tracing::debug!(%e, "the Server is not taking heartbeats")
-                        }
-                        Err(e) => tracing::warn!(%e, "the heartbeat did not land"),
+                // **No backoff after a claim the Server held.** The wait
+                // *was* the interval: sleeping again would leave this Runner
+                // deaf for the thirty seconds the backoff has climbed to,
+                // and a nudge landing in that window is lost — the old
+                // latency, on the new machinery. Measured against the shape
+                // this replaces: roughly one nudge in two reached a given
+                // idle Runner's ear.
+                //
+                // **Told apart by how long the claim took**, not by the
+                // setting: a Server that does not know about `waitSeconds`
+                // answers at once, and so does one that is draining, and
+                // neither should be asked again immediately.
+                let held =
+                    config.poll_wait > Duration::ZERO && asked.elapsed() >= config.poll_wait / 2;
+                if !held {
+                    tokio::select! {
+                        _ = backoff.wait() => {}
+                        _ = stopping.wait() => { beating.abort(); return Ok(()); },
                     }
-                    last_beat = tokio::time::Instant::now();
-                }
-                tokio::select! {
-                    _ = backoff.wait() => {}
-                    _ = stopping.wait() => return Ok(()),
                 }
             }
             Err(e) if e.needs_handshake() => {
@@ -243,9 +263,46 @@ pub async fn work(
                 tracing::warn!(%e, "could not ask for work");
                 tokio::time::sleep(how_long(&e, &mut backoff)).await;
             }
-            Err(e) => anyhow::bail!("claiming was refused: {e}"),
+            Err(e) => {
+                beating.abort();
+                anyhow::bail!("claiming was refused: {e}");
+            }
         }
     }
+}
+
+/// Says this Runner is alive, on its own timer, until it is told to stop.
+///
+/// **Not tied to the loop, and not to the lease.** The Server calls a Runner
+/// disconnected when what it last heard is two minutes old, and neither the
+/// claim loop's period nor a lease's quarter is a number anybody chose against
+/// that. This one is.
+///
+/// A failure is not retried faster: the next tick is soon enough, and the
+/// Server already knows when it is the one that is unavailable.
+fn heartbeat(
+    server: Arc<Server>,
+    every: Duration,
+    stopping: Stopping,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(every) => {}
+                _ = stopping.wait() => return,
+            }
+
+            match server.heartbeat().await {
+                Ok(()) => {}
+                // Expected during a window rather than worth a warning: the
+                // Server has withdrawn and already knows.
+                Err(e) if e.unavailable() => {
+                    tracing::debug!(%e, "the Server is not taking heartbeats")
+                }
+                Err(e) => tracing::warn!(%e, "the heartbeat did not land"),
+            }
+        }
+    })
 }
 
 /// Measures a package's own model solutions and says what they cost.

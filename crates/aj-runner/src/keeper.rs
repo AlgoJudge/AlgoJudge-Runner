@@ -52,25 +52,20 @@ impl Keeper {
         let seconds = config.lease_seconds;
         let logged = job_id.clone();
 
-        Self::spawn(
-            "job",
-            logged,
-            every(config.lease_granted(), config.heartbeat),
-            move || {
-                // Cloned per attempt rather than borrowed, so each future owns
-                // everything it needs and nothing is tied to this call.
-                let server = Arc::clone(&server);
-                let job_id = job_id.clone();
-                let lease_token = lease_token.clone();
+        Self::spawn("job", logged, every(config.lease_granted()), move || {
+            // Cloned per attempt rather than borrowed, so each future owns
+            // everything it needs and nothing is tied to this call.
+            let server = Arc::clone(&server);
+            let job_id = job_id.clone();
+            let lease_token = lease_token.clone();
 
-                async move {
-                    server
-                        .renew(&job_id, &lease_token, Some(seconds))
-                        .await
-                        .map(|lease| lease.lease_expires_at)
-                }
-            },
-        )
+            async move {
+                server
+                    .renew(&job_id, &lease_token, Some(seconds))
+                    .await
+                    .map(|lease| lease.lease_expires_at)
+            }
+        })
     }
 
     /// Holds a **trial's** lease. Same deadline, same reason, its own path.
@@ -87,23 +82,18 @@ impl Keeper {
         let seconds = config.lease_seconds;
         let logged = trial_id.clone();
 
-        Self::spawn(
-            "trial",
-            logged,
-            every(config.lease_granted(), config.heartbeat),
-            move || {
-                let server = Arc::clone(&server);
-                let trial_id = trial_id.clone();
-                let lease_token = lease_token.clone();
+        Self::spawn("trial", logged, every(config.lease_granted()), move || {
+            let server = Arc::clone(&server);
+            let trial_id = trial_id.clone();
+            let lease_token = lease_token.clone();
 
-                async move {
-                    server
-                        .renew_trial(&trial_id, &lease_token, Some(seconds))
-                        .await
-                        .map(|lease| lease.lease_expires_at)
-                }
-            },
-        )
+            async move {
+                server
+                    .renew_trial(&trial_id, &lease_token, Some(seconds))
+                    .await
+                    .map(|lease| lease.lease_expires_at)
+            }
+        })
     }
 
     /// The loop both of the above run, with the endpoint left to the caller so
@@ -166,8 +156,12 @@ impl Drop for Keeper {
 ///
 /// The floor is for a caller that passes nothing sensible; a real configuration
 /// cannot reach it, because the granted lease is itself floored at a minute.
-/// **And never longer than a heartbeat**, because a renewal is also what tells
-/// the Server this Runner is alive.
+/// **Liveness is not this timer's business any more.** A renewal does refresh
+/// `LastSeenAt` as a side effect, and for a while this was capped at the
+/// heartbeat interval to keep a judging Runner from being shown as
+/// disconnected. The Runner now beats on a timer of its own — see
+/// `run::heartbeat` — so the cap is gone and the interval is the lease's again,
+/// which is the only thing it was ever about.
 ///
 /// The two are different questions sharing one write: `LastSeenAt` is refreshed
 /// by a renewal, and the manager panel calls a Runner connected only while that
@@ -182,8 +176,8 @@ impl Drop for Keeper {
 /// minutes for every Runner, and the interval it has to survive is a property
 /// of whatever lease each one was granted — at the ceiling of an hour a quarter
 /// is fifteen minutes, so no fixed window could ever be right.
-pub fn every(granted: Duration, heartbeat: Duration) -> Duration {
-    (granted / 4).clamp(Duration::from_secs(5), heartbeat)
+pub fn every(granted: Duration) -> Duration {
+    (granted / 4).max(Duration::from_secs(5))
 }
 
 #[cfg(test)]
@@ -208,22 +202,13 @@ mod tests {
     /// Three renewals inside every lease, so two may fail in a row.
     #[test]
     fn a_lease_is_renewed_well_before_it_would_expire() {
-        // A minute apart, because the panel's window is two.
-        assert_eq!(
-            every(Duration::from_secs(600), Duration::from_secs(60)),
-            Duration::from_secs(60)
-        );
-        // And a short lease still renews on its own quarter.
-        assert_eq!(
-            every(Duration::from_secs(120), Duration::from_secs(60)),
-            Duration::from_secs(30)
-        );
+        assert_eq!(every(Duration::from_secs(600)), Duration::from_secs(150));
 
         // The margin, stated as the property that matters rather than as the
         // number that happens to satisfy it today.
         let granted = Duration::from_secs(600);
         assert!(
-            every(granted, Duration::from_secs(60)) * 3 < granted,
+            every(granted) * 3 < granted,
             "three intervals must fit inside the lease they are protecting",
         );
     }

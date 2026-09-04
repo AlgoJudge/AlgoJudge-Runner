@@ -66,10 +66,16 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// test, an upload, an attach and a report — paying for a new connection each
 /// time would spend more on cryptography than on judging.
 ///
-/// Long enough to cover an idle Runner's whole cycle: the claim is held open by
-/// the Server for as long as the Runner asked, and the gap between one answer
-/// and the next request is the backoff floor. Nothing here should ever find a
-/// cold pool.
+/// **Not what governs reuse, and worth saying so.** Whichever peer gives up
+/// first is what actually closes an idle connection, and both are far under
+/// this: nginx's client keep-alive defaults to 75 s, and Kestrel's to 130. A
+/// larger number here can only hold sockets the other end has already dropped.
+///
+/// What keeps the connection warm is the claim loop's own cadence — a held
+/// claim answers within about the wait, and the next one goes out immediately —
+/// so nothing here should ever find a cold pool whatever this says. It is set
+/// generously and deliberately does not try to guess a peer's timeout, because
+/// a number chosen against one deployment's proxy would be wrong in the next.
 const POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How often to remind the network that an idle connection is still wanted.
