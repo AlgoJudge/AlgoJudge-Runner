@@ -20,6 +20,22 @@ pub struct Server {
     /// serves nothing outside that prefix — a guard returns an empty 404 before
     /// routing — so a base URL without it fails on every call with no clue as
     /// to why.
+    /// The same client **without** [`READ_TIMEOUT`], for the one call that is
+    /// silent on purpose.
+    ///
+    /// **A per-request `timeout` does not lift the client's read timeout**, and
+    /// assuming it did was the defect this exists to fix.
+    /// `RequestBuilder::timeout` writes into the request's extensions, which
+    /// reqwest reads for its *total* timeout alone — the read timeout is taken
+    /// from the client and armed when the request is dispatched, and it is
+    /// polled before the response has arrived. A `claim` held longer than sixty
+    /// seconds was therefore killed by this Runner rather than answered by the
+    /// Server, and the aborted request took its connection out of the pool with
+    /// it.
+    ///
+    /// So the guard against silence stays on everything else, and the one call
+    /// whose whole purpose is silence carries a total timeout of its own.
+    waiting: reqwest::Client,
     base: String,
     token: RwLock<Option<String>>,
 }
@@ -81,17 +97,20 @@ const WAIT_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl Server {
     pub fn new(base_url: &str) -> Result<Self> {
-        Ok(Self {
-            http: reqwest::Client::builder()
+        // **Stated rather than inherited.** Both have library defaults that
+        // would mostly do; neither is a default worth discovering from a
+        // latency graph after somebody changes it.
+        let shared = || {
+            reqwest::Client::builder()
                 .user_agent(concat!("AlgoJudge-Runner/", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(CONNECT_TIMEOUT)
-                .read_timeout(READ_TIMEOUT)
-                // **Stated rather than inherited.** Both have library defaults
-                // that would mostly do; neither is a default worth discovering
-                // from a latency graph after somebody changes it.
                 .pool_idle_timeout(POOL_IDLE)
                 .tcp_keepalive(TCP_KEEPALIVE)
-                .build()?,
+        };
+
+        Ok(Self {
+            http: shared().read_timeout(READ_TIMEOUT).build()?,
+            waiting: shared().build()?,
             base: base_url.trim_end_matches('/').to_owned(),
             token: RwLock::new(None),
         })
@@ -216,19 +235,21 @@ impl Server {
         lease_seconds: Option<u32>,
         wait: Option<std::time::Duration>,
     ) -> Result<Option<ClaimedJob>> {
-        let asking = self
-            .bearer(self.http.post(self.url("runner/jobs/claim")))
-            .json(&ClaimRequest {
-                lease_seconds,
-                wait_seconds: wait.map(|wait| wait.as_secs() as u32),
-            });
+        // The waiting client only where a wait was asked for: an immediate
+        // claim is an ordinary call and keeps the ordinary guard.
+        let post = match wait {
+            Some(_) => self.waiting.post(self.url("runner/jobs/claim")),
+            None => self.http.post(self.url("runner/jobs/claim")),
+        };
+        let asking = self.bearer(post).json(&ClaimRequest {
+            lease_seconds,
+            wait_seconds: wait.map(|wait| wait.as_secs() as u32),
+        });
 
-        // **The client's own guard has to be lifted for this one call.**
-        // [`READ_TIMEOUT`] exists to refuse silence, and a held claim is silence
-        // by design — so a wait longer than sixty seconds would be cut short by
-        // this Runner rather than by the Server. A per-request timeout replaces
-        // it here and nowhere else, so a hung Server is still noticed on every
-        // other call.
+        // **A total timeout, on a client that has no read timeout to fight.**
+        // See `waiting` for why the two are not interchangeable. This one is
+        // the whole of what bounds a held claim on this side, so it may not be
+        // omitted.
         //
         // Longer than the wait, never equal: the Server answers at its own
         // deadline, and a client that gives up at the same instant turns an
