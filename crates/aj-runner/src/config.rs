@@ -25,6 +25,12 @@ pub struct Config {
 
     pub poll_min: Duration,
     pub poll_max: Duration,
+    /// How long the Server may hold a `claim` open while the queue is empty.
+    ///
+    /// `0` asks for none, which is what this Runner did before the Server could
+    /// hold one. Anything else makes the two numbers above matter only after a
+    /// failure: on an empty queue the wait *is* the interval.
+    pub poll_wait: Duration,
     pub heartbeat: Duration,
 
     /// A request. The Server clamps it to `[60, 3600]` and answers with the
@@ -106,6 +112,15 @@ impl Config {
 
             poll_min: Duration::from_secs(number("Poll__MinSeconds", 1)),
             poll_max: Duration::from_secs(number("Poll__MaxSeconds", 30)),
+            // **Twenty-five, and the ceiling is somebody else's proxy.** RFC
+            // 6202 puts the safe figure for a long poll at about thirty
+            // seconds; a stock nginx and an AWS ALB cut a silent request at
+            // sixty, Cloudflare answers 524 at a hundred and twenty-five, and
+            // an Azure Application Gateway gives up at twenty. An installation
+            // that owns its whole network path can raise this to the Server's
+            // ceiling of three hundred; one behind somebody else's proxy may
+            // have to lower it.
+            poll_wait: Duration::from_secs(number("Poll__WaitSeconds", 25)),
             heartbeat: Duration::from_secs(number("Heartbeat__Seconds", 60)),
 
             lease_seconds: number("Lease__RequestSeconds", 600) as u32,

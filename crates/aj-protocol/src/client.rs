@@ -41,6 +41,44 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// abandoned — and that is what this bounds.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long an unused connection is kept for the next call.
+///
+/// **Reuse is not an optimisation here; it is most of the cost.** Every call
+/// this Runner makes is to one host over TLS, and a handshake is two round
+/// trips and an asymmetric operation before a byte of the request is sent. A
+/// submission is a claim, a progress note, a package download, one file per
+/// test, an upload, an attach and a report — paying for a new connection each
+/// time would spend more on cryptography than on judging.
+///
+/// Long enough to cover an idle Runner's whole cycle: the claim is held open by
+/// the Server for as long as the Runner asked, and the gap between one answer
+/// and the next request is the backoff floor. Nothing here should ever find a
+/// cold pool.
+const POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How often to remind the network that an idle connection is still wanted.
+///
+/// A held `claim` sends nothing for as long as it waits, and a NAT or a
+/// stateful firewall between the Runner and the Server keeps a table entry that
+/// it drops after an idle period — after which the answer, when it finally
+/// comes, arrives at a mapping that no longer exists. A keepalive probe is a
+/// real packet, so the entry is not idle and is not dropped.
+///
+/// **This is not what bounds the wait.** A conformant NAT keeps an established
+/// connection for at least two hours four minutes (RFC 5382, REQ-5); what cuts
+/// a silent request short is an HTTP intermediary, which counts *request*
+/// silence and cannot be fooled by a TCP probe. This defends the layer it can.
+const TCP_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How much longer than the wait this Runner is willing to hold on.
+///
+/// The Server takes a sixteenth off its own deadline as jitter, so it always
+/// answers early rather than late; this covers the network and a busy Server on
+/// top of that. The rule is the one Amazon states for the same shape: the
+/// client's timeout must exceed the wait it asked for, or an ordinary empty
+/// answer arrives as a failure.
+const WAIT_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
+
 impl Server {
     pub fn new(base_url: &str) -> Result<Self> {
         Ok(Self {
@@ -48,6 +86,11 @@ impl Server {
                 .user_agent(concat!("AlgoJudge-Runner/", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(CONNECT_TIMEOUT)
                 .read_timeout(READ_TIMEOUT)
+                // **Stated rather than inherited.** Both have library defaults
+                // that would mostly do; neither is a default worth discovering
+                // from a latency graph after somebody changes it.
+                .pool_idle_timeout(POOL_IDLE)
+                .tcp_keepalive(TCP_KEEPALIVE)
                 .build()?,
             base: base_url.trim_end_matches('/').to_owned(),
             token: RwLock::new(None),
@@ -162,14 +205,40 @@ impl Server {
     /// **`None` is the ordinary state and not an error.** The Server answers
     /// `204`, and a Runner that treats an empty queue as a fault spends its life
     /// logging that there is no work.
-    pub async fn claim(&self, lease_seconds: Option<u32>) -> Result<Option<ClaimedJob>> {
-        let response = accept(
-            self.bearer(self.http.post(self.url("runner/jobs/claim")))
-                .json(&ClaimRequest { lease_seconds })
-                .send()
-                .await?,
-        )
-        .await?;
+    /// `wait` asks the Server to hold the request open while the queue is empty,
+    /// rather than answering `204` and being asked again a moment later.
+    ///
+    /// **`None` is what this did before, byte for byte.** The field is omitted
+    /// from the body, so a Server that does not know about it is not being sent
+    /// anything new.
+    pub async fn claim(
+        &self,
+        lease_seconds: Option<u32>,
+        wait: Option<std::time::Duration>,
+    ) -> Result<Option<ClaimedJob>> {
+        let asking = self
+            .bearer(self.http.post(self.url("runner/jobs/claim")))
+            .json(&ClaimRequest {
+                lease_seconds,
+                wait_seconds: wait.map(|wait| wait.as_secs() as u32),
+            });
+
+        // **The client's own guard has to be lifted for this one call.**
+        // [`READ_TIMEOUT`] exists to refuse silence, and a held claim is silence
+        // by design — so a wait longer than sixty seconds would be cut short by
+        // this Runner rather than by the Server. A per-request timeout replaces
+        // it here and nowhere else, so a hung Server is still noticed on every
+        // other call.
+        //
+        // Longer than the wait, never equal: the Server answers at its own
+        // deadline, and a client that gives up at the same instant turns an
+        // ordinary `204` into a failed request.
+        let asking = match wait {
+            Some(wait) => asking.timeout(wait + WAIT_MARGIN),
+            None => asking,
+        };
+
+        let response = accept(asking.send().await?).await?;
 
         if response.status() == reqwest::StatusCode::NO_CONTENT {
             return Ok(None);
@@ -185,7 +254,14 @@ impl Server {
     pub async fn claim_trial(&self, lease_seconds: Option<u32>) -> Result<Option<ClaimedTrial>> {
         let response = accept(
             self.bearer(self.http.post(self.url("runner/trials/claim")))
-                .json(&ClaimRequest { lease_seconds })
+                .json(&ClaimRequest {
+                    lease_seconds,
+                    // A trial is a manager waiting for a calibration, not a
+                    // participant waiting for a mark, and it has its own queue.
+                    // Holding this open would keep a connection for the rarer
+                    // of the two and buy nobody anything.
+                    wait_seconds: None,
+                })
                 .send()
                 .await?,
         )
