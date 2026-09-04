@@ -507,14 +507,66 @@ async fn an_infrastructure_failure_carries_no_score() {
         .await
         .expect("the report");
 
-    assert_eq!(accepted.state, "failed");
+    // **The first one is a reason to try again, not a verdict** (§6): a Runner
+    // cannot tell a broken package from a torn download. Nothing is stored, so
+    // nothing is named.
+    assert_eq!(accepted.state, "queued");
+    assert!(accepted.result_id.is_none(), "{:?}", accepted.result_id);
     assert!(!accepted.duplicate);
+
+    // It stops travelling once the deliveries run out, and only then is there a
+    // result — which still carries no score, because a failure is not an answer.
+    let mut last = accepted;
+    for _ in 0..8 {
+        if last.state == "failed" {
+            break;
+        }
+        let again = claim_ours(&server).await;
+        last = server
+            .report(
+                &again.job_id,
+                &ReportResult::failed(&again.lease_token, "package checksum mismatch"),
+            )
+            .await
+            .expect("the report");
+    }
+    assert_eq!(last.state, "failed", "the deliveries never ran out");
 
     let submission = participant.submission(&job.submission_id).await;
     assert!(
         submission["result"].get("score").is_none() || submission["result"]["score"].is_null(),
         "a failure must not be scored: {submission}",
     );
+}
+
+/// **A Runner being stopped gives the job back, and it is claimable at once.**
+/// §5.1. The alternative is going quiet and letting the lease expire, which
+/// costs a participant ten minutes while idle Runners wait for a deadline
+/// nobody is going to miss.
+#[tokio::test]
+#[ignore = "needs a Server"]
+async fn a_runner_that_is_stopping_gives_the_job_back() {
+    let (server, _identity) = approved("release").await;
+    let participant = Participant::enrolled().await;
+    participant.submit("print('release')\n").await;
+
+    let job = claim_ours(&server).await;
+
+    server
+        .release(&job.job_id, &job.lease_token)
+        .await
+        .expect("the release");
+
+    // Back in the queue this instant, and it is the same job: nothing about it
+    // was wrong and nothing was recorded against the submission.
+    let again = claim_ours(&server).await;
+    assert_eq!(again.job_id, job.job_id);
+    assert_ne!(again.lease_token, job.lease_token, "a new lease, not the old");
+
+    // And the lease it was let go of is gone, so a late renewal from the Runner
+    // that stopped cannot reach past the one now holding it.
+    let stale = server.renew(&job.job_id, &job.lease_token, None).await;
+    assert!(stale.is_err(), "the old lease still renewed");
 }
 
 // ── §7 files ────────────────────────────────────────────────────────────────
