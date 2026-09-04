@@ -320,7 +320,10 @@ mod tests {
             ["uva@1", "standard-io@1"]
         );
         // The one an operator actually types: a trailing comma from a paste.
-        assert_eq!(problem_types(Some("standard-io@1,".into())), ["standard-io@1"]);
+        assert_eq!(
+            problem_types(Some("standard-io@1,".into())),
+            ["standard-io@1"]
+        );
 
         assert!(problem_types(Some(",".into())).is_empty());
         assert!(problem_types(Some(" , , ".into())).is_empty());

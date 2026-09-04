@@ -143,16 +143,19 @@ async fn a_key_that_is_not_thirty_two_bytes_is_refused() {
         ("not base64 at all !!", "runner.key.malformed"),
     ] {
         let error = server
-            .register(&Register {
-                name: "bad-key".into(),
-                product: "AlgoJudge-Runner-Conformance".into(),
-                version: "0.0.1".into(),
-                public_key: public_key.into(),
-                external: false,
-                problem_types: vec!["standard-io@1".into()],
-                tags: vec![],
-                machine: None,
-            }, &identity)
+            .register(
+                &Register {
+                    name: "bad-key".into(),
+                    product: "AlgoJudge-Runner-Conformance".into(),
+                    version: "0.0.1".into(),
+                    public_key: public_key.into(),
+                    external: false,
+                    problem_types: vec!["standard-io@1".into()],
+                    tags: vec![],
+                    machine: None,
+                },
+                &identity,
+            )
             .await
             .expect_err("a key that is not an Ed25519 key must not be accepted");
 
