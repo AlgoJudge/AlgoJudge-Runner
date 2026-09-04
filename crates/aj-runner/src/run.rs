@@ -19,7 +19,12 @@ use aj_protocol::stopping::Stopping;
 /// None of the waiting here is a failure. A Runner announces itself and an
 /// administrator approves it, possibly tomorrow; a process that exited because
 /// nobody had got to it yet would have to be watched by something else.
-pub async fn admitted(server: &Server, identity: &Identity, config: &Config) -> anyhow::Result<()> {
+pub async fn admitted(
+    server: &Server,
+    identity: &Identity,
+    config: &Config,
+    stopping: &Stopping,
+) -> anyhow::Result<()> {
     let register = Register {
         name: config.name.clone(),
         product: "AlgoJudge-Runner".into(),
@@ -67,13 +72,21 @@ pub async fn admitted(server: &Server, identity: &Identity, config: &Config) -> 
                 // decisions for a person, not a retry loop.
                 anyhow::bail!("this key has been revoked; register a new one: {e}");
             }
-            Err(e) if e.unavailable() => wait_out(server, &e, &mut backoff).await,
+            Err(e) if e.unavailable() => {
+                if !wait_out(server, &e, &mut backoff, stopping).await {
+                    return Ok(());
+                }
+            }
             Err(e) if e.retryable() => {
-                pause(
+                if !pause(
                     &format!("the Server is not answering ({e})"),
                     how_long(&e, &mut backoff),
+                    stopping,
                 )
                 .await
+                {
+                    return Ok(());
+                }
             }
             Err(e) => anyhow::bail!("registration was refused: {e}"),
         }
@@ -89,20 +102,36 @@ pub async fn admitted(server: &Server, identity: &Identity, config: &Config) -> 
                 // than seconds — but it still backs off, because a room of
                 // Runners registered together would otherwise ask in one burst
                 // for however long it takes somebody to get to the panel.
-                pause(
+                // **And a stop is heard through it.** Waiting for a person
+                // is the longest wait this loop has, and a Runner that had to
+                // be killed to stop waiting for approval left nothing behind
+                // but a container the runtime shot.
+                if !pause(
                     "this Runner has not been approved yet",
                     how_long(&e, &mut backoff),
-                )
-                .await;
-            }
-            Err(e) if e.revoked() => anyhow::bail!("this key has been revoked: {e}"),
-            Err(e) if e.unavailable() => wait_out(server, &e, &mut backoff).await,
-            Err(e) if e.retryable() => {
-                pause(
-                    &format!("the handshake failed ({e})"),
-                    how_long(&e, &mut backoff),
+                    stopping,
                 )
                 .await
+                {
+                    return Ok(());
+                }
+            }
+            Err(e) if e.revoked() => anyhow::bail!("this key has been revoked: {e}"),
+            Err(e) if e.unavailable() => {
+                if !wait_out(server, &e, &mut backoff, stopping).await {
+                    return Ok(());
+                }
+            }
+            Err(e) if e.retryable() => {
+                if !pause(
+                    &format!("the handshake failed ({e})"),
+                    how_long(&e, &mut backoff),
+                    stopping,
+                )
+                .await
+                {
+                    return Ok(());
+                }
             }
             Err(e) => anyhow::bail!("the handshake was refused: {e}"),
         }
@@ -124,20 +153,30 @@ fn how_long(e: &aj_protocol::Error, backoff: &mut Backoff) -> Duration {
 
 /// Waits out a Server that is up and declining to serve, and says which it is.
 ///
+/// **Answers `false` when the word came instead**, which is not the same as the
+/// window having ended: the caller is going away, and a maintenance window that
+/// advertises `Retry-After: 300` used to hold a stopping Runner for five
+/// minutes against a thirty-second grace.
+///
 /// Asks `/health` rather than guessing, because that is the one path a window
 /// leaves open and because the answer carries the operator's own words. Waiting
 /// in silence would be indistinguishable from a Runner that had stopped.
 ///
 /// Returns as soon as the window has ended, without sleeping: the question is
 /// asked before the wait, so a window that closed in between costs nothing.
-async fn wait_out(server: &Server, e: &aj_protocol::Error, backoff: &mut Backoff) {
+async fn wait_out(
+    server: &Server,
+    e: &aj_protocol::Error,
+    backoff: &mut Backoff,
+    stopping: &Stopping,
+) -> bool {
     let delay = how_long(e, backoff);
 
     match server.health().await {
         Ok(health) if health.open() => {
             tracing::info!("the Server is serving again");
             backoff.reset();
-            return;
+            return true;
         }
         Ok(health) => tracing::info!(
             level = health.level(),
@@ -155,7 +194,7 @@ async fn wait_out(server: &Server, e: &aj_protocol::Error, backoff: &mut Backoff
         ),
     }
 
-    tokio::time::sleep(delay).await;
+    stopping.sleep(delay).await
 }
 
 /// Claim, evaluate, report. For ever.
@@ -300,12 +339,16 @@ pub async fn work(
                 tracing::info!("the token is no longer known; shaking hands again");
                 server.forget_token();
                 let identity = Identity::load_or_create(&config.key_path)?;
-                admitted(server, &identity, config).await?;
+                admitted(server, &identity, config, stopping).await?;
             }
             // **Not a fault, and not a reason to exit.** At `draining` the
             // Server answers an empty queue instead, so this is the deeper
             // level — everything closed but health.
-            Err(e) if e.unavailable() => wait_out(server, &e, &mut backoff).await,
+            Err(e) if e.unavailable() => {
+                if !wait_out(server, &e, &mut backoff, stopping).await {
+                    return Ok(());
+                }
+            }
             Err(e) if e.retryable() => {
                 tracing::warn!(%e, "could not ask for work");
                 tokio::time::sleep(how_long(&e, &mut backoff)).await;
@@ -576,7 +619,7 @@ async fn handle(
     // wrong and the log explaining a failure is the thing that goes missing.
     attach(server, &job, attachments).await;
 
-    report_with_retries(server, &job, &report, config).await;
+    report_with_retries(server, &job, &report, config, stopping).await;
 
     drop(keeper);
 }
@@ -1015,6 +1058,7 @@ async fn report_with_retries(
     job: &ClaimedJob,
     report: &ReportResult,
     config: &Config,
+    stopping: &Stopping,
 ) {
     let mut keep = KeepTrying::for_a_lease(config);
 
@@ -1045,7 +1089,23 @@ async fn report_with_retries(
                         maintenance = e.in_maintenance(),
                         "the report did not land; holding on to it",
                     );
-                    tokio::time::sleep(delay).await;
+
+                    // **And letting go of it when the word comes.** This wait
+                    // is bounded by the lease — ten minutes at the shipped
+                    // default — and it used to sleep straight through a stop,
+                    // which turns a thirty-second grace into a `SIGKILL`. A
+                    // kill drops this answer too, and takes the sandbox sweep
+                    // and every other release with it; the lease requeues the
+                    // job either way. So the choice is not between keeping the
+                    // work and losing it, only between losing it cleanly and
+                    // losing more.
+                    if !stopping.sleep(delay).await {
+                        tracing::warn!(
+                            job = %job.job_id,
+                            "told to stop while carrying an answer; the lease will requeue the job",
+                        );
+                        return;
+                    }
                 }
                 None => {
                     tracing::error!(
