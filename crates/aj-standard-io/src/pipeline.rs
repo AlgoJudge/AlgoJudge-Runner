@@ -151,9 +151,12 @@ pub struct Places {
 ///
 /// **The forbidden-identifier dictionary already refuses `fopen` and `ifstream`
 /// to a submission**, so this was never the only thing standing there — which is
-/// also why the hole was invisible. That dictionary is a *policy* control by
-/// decision (D-10) and a package may turn it off; a rule this load-bearing does
-/// not rest on one.
+/// also why the hole was invisible. It is not enough on its own for the reason
+/// `docs/SECURITY.md` §4 gives: it is a *policy* control by decision (D-10) and
+/// **every rule in it is expected to be bypassable**. `open` and `read` are not
+/// on it at all, deliberately, so a submission that declares them itself reads
+/// whatever it is given — which is exactly what
+/// `a_judged_submission_cannot_read_the_answer_key` does.
 ///
 /// A function rather than a chain at the call site, because this is the one
 /// place the rule is stated and it can then be asserted without a container.

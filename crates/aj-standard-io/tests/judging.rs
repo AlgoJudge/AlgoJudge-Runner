@@ -1189,6 +1189,164 @@ int main(int argc, char** argv) {
     }
 }
 
+/// A submission that tries to open every test file there is and says what it
+/// found.
+///
+/// **`open` and `read` are deliberately not on the forbidden list**, pinned as
+/// intended by `policy.rs`'s `ordinary_words_that_are_also_syscalls_are_not_matched`
+/// — so nothing has to be switched off for this, and the probe exercises the
+/// real defence rather than a weakened one. `<fcntl.h>` *is* denied, which is
+/// why the three functions are declared here and `O_RDONLY` is spelled `0`.
+///
+/// **A reachable file's bytes go into the report.** If the answer key is ever
+/// readable, the failing assertion's message contains the answer key.
+const PROBE: &str = r#"
+extern "C" int open(const char* path, int flags);
+extern "C" long read(int fd, void* into, unsigned long how_many);
+extern "C" int close(int fd);
+#include <cstdio>
+
+static void probe(const char* path) {
+    int fd = open(path, 0);
+    if (fd < 0) { std::printf(" %s=absent", path); return; }
+    char seen[16] = {0};
+    long got = read(fd, seen, 8);
+    close(fd);
+    std::printf(" %s=OPEN(%ld:", path, got);
+    for (long i = 0; i < got; i++) {
+        std::putchar(seen[i] < 32 || seen[i] > 126 ? '.' : seen[i]);
+    }
+    std::putchar(')');
+}
+
+int main() {
+    std::printf("PROBE");
+    probe("/in");
+    probe("/in/0a.in"); probe("/in/0a.out");
+    probe("/in/1a.in"); probe("/in/1a.out");
+    probe("/in/2a.in"); probe("/in/2a.out");
+    std::putchar('\n');
+    std::fflush(stdout);
+    return 0;
+}
+"#;
+
+/// Reads one line of the participant's answer and hands it back as the note.
+///
+/// It keeps the `argc < 4` guard an SIO2 checker has, so the shape of the
+/// contract is exercised as well as the report carried.
+const ECHOING_CHECKER: &str = r#"
+#include <cstdio>
+#include <cstring>
+int main(int argc, char** argv) {
+    if (argc < 4) { std::printf("WRONG\nno arguments\n"); return 0; }
+    std::FILE* answer = std::fopen(argv[2], "r");
+    if (!answer) { std::printf("WRONG\nno answer channel\n"); return 0; }
+    char line[4096] = {0};
+    if (!std::fgets(line, sizeof line, answer)) {
+        std::printf("WRONG\nnothing was said\n");
+        return 0;
+    }
+    std::fclose(answer);
+    for (std::size_t n = std::strlen(line); n && (line[n-1]=='\n' || line[n-1]=='\r'); n--) {
+        line[n-1] = 0;
+    }
+    std::printf("OK\n%s\n", line);
+    return 0;
+}
+"#;
+
+/// The same, from the other side: one line off the conversation, written where
+/// the verdict goes.
+const ECHOING_INTERACTOR: &str = r#"
+#include <cstdio>
+#include <cstring>
+int main(int argc, char** argv) {
+    if (argc < 4) return 1;
+    std::FILE* say = std::fopen(argv[2], "w");
+    if (!say) return 1;
+    char line[4096] = {0};
+    if (!std::fgets(line, sizeof line, stdin)) {
+        std::fprintf(say, "WRONG\nnothing was said\n");
+        std::fclose(say);
+        return 0;
+    }
+    for (std::size_t n = std::strlen(line); n && (line[n-1]=='\n' || line[n-1]=='\r'); n--) {
+        line[n-1] = 0;
+    }
+    std::fprintf(say, "OK\n%s\n", line);
+    std::fclose(say);
+    return 0;
+}
+"#;
+
+/// **A judged submission is given its own test's input and nothing else — and
+/// this is the proof from inside the container.**
+///
+/// `judged_mounts` states the rule and a unit test asserts the list it returns,
+/// which is the cheap half. This is the expensive half: a program that actually
+/// calls `open` on every test file the package has, and reports what it got.
+///
+/// Three things at once, per test: the running test's `.out` is unreachable,
+/// **every other** test's `.out` is unreachable, and every other test's `.in` is
+/// unreachable. That last one is `docs/SECURITY.md` §2 rule 2 — "one test, one
+/// input" — which had no proof of its own either.
+///
+/// `/in` opens and refuses to be read: the mount binds a single **file** at
+/// `/in/<test>.in`, so the runtime synthesises the directory around it, and
+/// `read` on a directory is `EISDIR`.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_judged_submission_cannot_read_the_answer_key() {
+    let judged = verdict(judge_with_checker("cpp-probe-batch", PROBE, ECHOING_CHECKER).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+
+    for (index, name, seen) in [
+        (0, "0a", "OPEN(4:1 2.)"),
+        (1, "1a", "OPEN(6:10 20.)"),
+        (2, "2a", "OPEN(8:1000000 )"),
+    ] {
+        let mut expected = String::from("PROBE /in=OPEN(-1:)");
+        for test in ["0a", "1a", "2a"] {
+            expected.push_str(&format!(
+                " /in/{test}.in={}",
+                if test == name { seen } else { "absent" }
+            ));
+            expected.push_str(&format!(" /in/{test}.out=absent"));
+        }
+        assert_eq!(
+            document["tests"][index]["note"], expected,
+            "judging {name}, the submission reached something it must not: {document}",
+        );
+    }
+}
+
+/// **An interactive submission is given no file at all**, `/in` included.
+///
+/// Everything it reads is what the interactor decided to send. The format says
+/// it is given nothing at the start; until 2026-09-05 that was prose and the
+/// mount was applied to every judged run, interactive or not — for a guessing
+/// problem, whose secret is the input, the file *is* the answer.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn an_interactive_submission_is_given_no_file_at_all() {
+    let judged =
+        verdict(judge_interactive("cpp-probe-interactive", PROBE, ECHOING_INTERACTOR).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+
+    let mut expected = String::from("PROBE /in=absent");
+    for test in ["0a", "1a", "2a"] {
+        expected.push_str(&format!(" /in/{test}.in=absent /in/{test}.out=absent"));
+    }
+
+    for index in 0..3 {
+        assert_eq!(
+            document["tests"][index]["note"], expected,
+            "an interactive submission reached a file: {document}",
+        );
+    }
+}
+
 // ── Every other outcome a participant can get ───────────────────────────────
 
 /// Wrong on one test of one group. The group rule then takes that group to

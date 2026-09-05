@@ -124,7 +124,12 @@ has a test rather than a paragraph.
    `<name>.in`, mounted read-only and opened by the measuring shim, which is
    handed exactly two paths — what to read and what to write. Mounting the whole
    `tests/` directory would put `<name>.out` — the answer — inside the
-   submission's own container. See `pipeline.rs::input_mount`.
+   submission's own container. See `pipeline.rs::input_mount`, and
+   `judging.rs::a_judged_submission_cannot_read_the_answer_key`, which proves it
+   from **inside** a container: a submission that calls `open` on every test file
+   the package has reaches its own `.in` and nothing else — not its own `.out`,
+   and not another test's anything. Its interactive twin reaches nothing at all,
+   `/in` included.
 3. **Nothing a program writes reaches the next test.** Asserted in
    `adversarial.rs::nothing_survives_from_one_run_to_the_next`, for the scratch
    tmpfs **and** for `/dev/shm`.
