@@ -17,11 +17,30 @@
  * a container costs a program nothing it can be charged for, and measurement
  * showed that charging the larger of the two failed correct submissions.
  *
- *   aj-shim <input-file> <program> [args...]
+ *   aj-shim <input-file> <output-file> <program> [args...]
  *
  * The input file becomes the child's stdin. `sh -c "exec prog < input"` did
  * that before and is what this replaces; a shell would otherwise be a second
  * process in the accounting, and its own start is part of what is being removed.
+ *
+ * **The output file becomes the child's stdout, and that is a disk measurement
+ * rather than a taste.** Left on the container's own stdout, everything a
+ * submission prints is written by the daemon to its `*-json.log` -- JSON-escaped
+ * and stamped per line -- and read back through a socket. Measured 2026-09-05 on
+ * a twelve-Runner burst: one flooding submission produced a **76 MB** log for a
+ * 64 MiB cap, and the daemon wrote at 72 MB/s throughout. Here the bytes go
+ * straight to the file the Runner already has open a directory to.
+ *
+ * **The submission never gets a writable path, only the descriptor.** This runs
+ * as root and opens the file before forking; the directory it sits in is root's,
+ * so the submission -- which is uid 65534 by the time it runs -- cannot create,
+ * rename or read anything there. It is the same trick already used for the
+ * input, in the other direction.
+ *
+ * `AJ_SHIM_MAX_OUTPUT` is the cap, in bytes, applied as `RLIMIT_FSIZE` before
+ * privileges are dropped. **The kernel stops the program at the byte**, where
+ * the Runner used to count a stream and notice afterwards; a submission over it
+ * dies of `SIGXFSZ`, which the report carries out like any other signal.
  */
 
 #define _GNU_SOURCE
@@ -99,6 +118,33 @@ static void take_nonce(void) {
     fatal("no AJ_SHIM_NONCE in the environment");
 }
 
+/* The output cap, taken from the environment and then removed from it.
+ *
+ * **Scrubbed like the nonce, and for a weaker reason.** Knowing the cap tells a
+ * submission nothing it could not learn by writing until it dies, but the
+ * environment it is handed should carry only what it needs, and leaving one of
+ * ours in there invites the next one to be left too.
+ *
+ * Absent means no cap, which is what every unmeasured step wants. */
+static rlim_t take_output_cap(void) {
+    static const char key[] = "AJ_SHIM_MAX_OUTPUT=";
+    for (char **entry = environ; *entry != NULL; entry++) {
+        if (strncmp(*entry, key, sizeof key - 1) != 0) continue;
+
+        char *value = *entry + sizeof key - 1;
+        errno = 0;
+        char *end = NULL;
+        unsigned long long bytes = strtoull(value, &end, 10);
+        if (errno != 0 || end == value || *end != '\0') {
+            errno = EINVAL;
+            fatal("AJ_SHIM_MAX_OUTPUT is not a number of bytes");
+        }
+        unsetenv("AJ_SHIM_MAX_OUTPUT");
+        return (rlim_t)bytes;
+    }
+    return 0;
+}
+
 /* **Verified, and fatal if it did not take.** A drop that silently fails would
  * run a submission as root, so every failure here has to stop the run rather
  * than continue into `execve`. Where this already runs unprivileged the calls
@@ -148,15 +194,22 @@ static void kill_the_rest(pid_t group) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3) {
+    if (argc < 4) {
         errno = EINVAL;
-        fatal("usage: aj-shim <input-file> <program> [args...]");
+        fatal("usage: aj-shim <input-file> <output-file> <program> [args...]");
     }
 
     take_nonce();
+    rlim_t cap = take_output_cap();
 
     int input = open(argv[1], O_RDONLY | O_CLOEXEC);
     if (input < 0) fatal("cannot open the input file");
+
+    /* **Opened here, as root, and never named to the submission.** 0600 so that
+     * nothing else in the container can read back what was written -- a checker
+     * runs in a container of its own and gets the file from the Runner. */
+    int output = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (output < 0) fatal("cannot open the output file");
 
     struct timeval began;
     gettimeofday(&began, NULL);
@@ -169,17 +222,29 @@ int main(int argc, char **argv) {
          * kill without reaching past this run. */
         setpgid(0, 0);
         if (dup2(input, STDIN_FILENO) < 0) fatal("dup2 the input onto stdin");
+        if (dup2(output, STDOUT_FILENO) < 0) fatal("dup2 the output onto stdout");
+
+        /* **Before the drop, so it cannot be raised again.** A limit set as root
+         * and then inherited across `setuid` is a limit the submission has no
+         * way back over: `RLIMIT_FSIZE` may only be raised towards the hard
+         * limit, and this sets both. `SIGXFSZ` then arrives on the write that
+         * would have crossed it. */
+        if (cap > 0) {
+            struct rlimit fsize = {.rlim_cur = cap, .rlim_max = cap};
+            if (setrlimit(RLIMIT_FSIZE, &fsize) != 0) fatal("setrlimit RLIMIT_FSIZE");
+        }
+
         become_the_submission();
         /* **`execvp`, because the catalogue names `python3` and not a path.**
          * The shell this replaces searched `PATH`; `execve` does not, and every
          * interpreted language in the catalogue would come back as a program
          * that is not there. The environment is the one already scrubbed of the
          * nonce, which `execvp` passes on as it stands. */
-        execvp(argv[2], &argv[2]);
+        execvp(argv[3], &argv[3]);
         /* Only reachable when `execve` did not happen. */
         char line[512];
         snprintf(line, sizeof line, "%s aj-shim1 failed exec %s: %s\n",
-                 nonce, argv[2], strerror(errno));
+                 nonce, argv[3], strerror(errno));
         say(line);
         /* 127 and 126 are the shell's own split -- not found, against found and
          * not runnable -- so a submission naming a program that is not there

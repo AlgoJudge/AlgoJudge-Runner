@@ -21,7 +21,7 @@ pub mod profile;
 
 pub use cgroups::Cgroups;
 pub use docker::Docker;
-pub use profile::{Mount, Outcome, Profile, Stopped, SHIM};
+pub use profile::{Mount, Outcome, Profile, StdoutDirectory, Stopped, SHIM};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

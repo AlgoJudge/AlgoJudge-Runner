@@ -119,6 +119,12 @@ pub const SOURCE: &str = "/src";
 pub const BUILD_OUTPUT: &str = "/out";
 pub const PROGRAM: &str = "/program";
 pub const INPUT: &str = "/in";
+/// Where the directory holding the run's own stdout is mounted.
+///
+/// One directory per run, holding one file, and root's: the submission
+/// runs as `nobody` and cannot create, rename or read anything in it. What
+/// it gets is the descriptor the shim opened before dropping privileges.
+pub const OUTPUT: &str = "/aj-out";
 
 // ── the images, by key ──────────────────────────────────────────────────────
 
@@ -518,15 +524,23 @@ fn quoted(word: &str) -> String {
 /// The shim is not probed for. An image may be an operator's own -- the
 /// catalogue lets a toolchain name one -- so the absence has to be handled where
 /// the command is built rather than by a capability the Runner remembers.
-pub fn with_input(start: &[String], test: &str) -> Vec<String> {
+pub fn with_input(start: &[String], test: &str, output: &str) -> Vec<String> {
     let program = start
         .iter()
         .map(|part| quoted(part))
         .collect::<Vec<_>>()
         .join(" ");
     let input = quoted(&format!("{INPUT}/{test}.in"));
+    let output = quoted(output);
+    // **The two branches differ in where stdout goes, and the difference is
+    // legible afterwards.** With the shim it is a file the Runner reads back —
+    // which keeps a flooding submission out of the daemon's log, where it was
+    // measured writing 76 MB against a 64 MiB cap. Without one, stdout stays on
+    // the container's stream and the collector counts it exactly as it always
+    // did. Which happened is not guessed at: the shim creates the file even for
+    // a program that printed nothing, so the file's existence is the answer.
     shell(&format!(
-        "if [ -x {SHIM} ]; then exec {SHIM} {input} {program}; \
+        "if [ -x {SHIM} ]; then exec {SHIM} {input} {output} {program}; \
          else exec {program} < {input}; fi"
     ))
 }
@@ -672,17 +686,25 @@ mod tests {
 
     #[test]
     fn the_shim_is_given_the_input_and_the_fallback_redirects_it() {
-        let wrapped = with_input(&["python3".into(), "/program/program.py".into()], "1a");
+        let wrapped = with_input(
+            &["python3".into(), "/program/program.py".into()],
+            "1a",
+            "/aj-out/stdout",
+        );
         let script = wrapped.last().unwrap();
 
-        // Through the shim the input is an argument, because the shim opens it.
-        assert!(
-            script.contains(
-                "exec /usr/local/bin/aj-shim '/in/1a.in' 'python3' '/program/program.py'"
-            ),
-            "got {script}"
+        // Through the shim both files are arguments, because the shim opens
+        // both -- the input to read and the output to write. **Their order is
+        // the assertion**: swapped, the shim would truncate the test's input
+        // and feed the submission its own empty output, which is a wrong answer
+        // rather than an error anybody would see.
+        let through_the_shim = concat!(
+            "exec /usr/local/bin/aj-shim ",
+            "'/in/1a.in' '/aj-out/stdout' 'python3' '/program/program.py'",
         );
-        // Without one it is a redirect, which is what it has always been.
+        assert!(script.contains(through_the_shim), "got {script}");
+        // Without one the input is a redirect and the output stays on the
+        // container's stream, which is what it has always been.
         assert!(
             script.contains("exec 'python3' '/program/program.py' < '/in/1a.in'"),
             "got {script}"
@@ -694,7 +716,7 @@ mod tests {
     /// aimed at the submission would reach the shell instead.
     #[test]
     fn neither_arm_leaves_a_shell_behind() {
-        let script = with_input(&["/program/program".into()], "0a")
+        let script = with_input(&["/program/program".into()], "0a", "/aj-out/stdout")
             .pop()
             .unwrap();
 

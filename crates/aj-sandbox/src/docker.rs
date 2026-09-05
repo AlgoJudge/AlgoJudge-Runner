@@ -307,12 +307,24 @@ impl Docker {
                 profile
                     .mounts
                     .iter()
-                    .map(|m| {
+                    .map(|m| (m.from.clone(), m.to.clone(), m.writable))
+                    // **Added here rather than by the caller, so it cannot be
+                    // forgotten.** A profile that names a stdout directory and
+                    // does not mount it would have the shim fail to open the
+                    // file, which is a run that produced nothing rather than a
+                    // configuration mistake anybody could see.
+                    .chain(
+                        profile
+                            .stdout_directory
+                            .iter()
+                            .map(|out| (out.on_host.clone(), out.at.clone(), true)),
+                    )
+                    .map(|(from, to, writable)| {
                         format!(
                             "{}:{}:{}",
-                            m.from.display(),
-                            m.to,
-                            if m.writable { "rw" } else { "ro" }
+                            from.display(),
+                            to,
+                            if writable { "rw" } else { "ro" }
                         )
                     })
                     .collect(),
@@ -451,9 +463,18 @@ impl Sandbox for Docker {
             // The nonce reaches the shim and nothing else: it scrubs the bytes
             // before forking, and the submission runs as a different user that
             // cannot read `/proc/1/environ` in any case.
-            env: nonce
-                .as_ref()
-                .map(|nonce| vec![format!("AJ_SHIM_NONCE={nonce}")]),
+            //
+            // **The cap travels the same way, and only with the nonce.** It is
+            // the shim that applies it, as `RLIMIT_FSIZE` on the child before
+            // dropping privileges — so it is meaningless without one, and the
+            // shim scrubs both.
+            env: nonce.as_ref().map(|nonce| {
+                let mut env = vec![format!("AJ_SHIM_NONCE={nonce}")];
+                if profile.stdout_directory.is_some() {
+                    env.push(format!("AJ_SHIM_MAX_OUTPUT={}", profile.max_output_bytes));
+                }
+                env
+            }),
             labels: Some(self.labels()),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
@@ -697,6 +718,18 @@ impl Docker {
         let exit_code = state.exit_code.unwrap_or(-1);
         let stopped = if state.oom_killed.unwrap_or(false) {
             Stopped::Memory
+        } else {
+            stopped
+        };
+
+        // **`SIGXFSZ` is the cap, not a crash.** Where stdout goes to a file the
+        // shim applies the cap as `RLIMIT_FSIZE`, so the kernel stops the
+        // program on the write that would cross it rather than the collector
+        // noticing afterwards — and the child dies of signal 25, which every
+        // other path here would read as a runtime error. It is the same outcome
+        // the counting produced, reached by a better instrument.
+        let stopped = if profile.stdout_directory.is_some() && exit_code == 128 + SIGXFSZ {
+            Stopped::Output
         } else {
             stopped
         };
@@ -965,6 +998,13 @@ fn measured_time(reported: Duration, whole: Option<Duration>) -> Duration {
 /// catches the cheating worth doing -- a program spending seconds past its
 /// limit, which is what a limit of 100 to 600 ms makes worth attempting.
 const UNEXPLAINED_GAP: Duration = Duration::from_secs(1);
+
+/// The signal a program gets on the write that would cross `RLIMIT_FSIZE`.
+///
+/// Named rather than written as 25 at the one place it is used: `128 + n` is
+/// how a shell reports a fatal signal, and `153` is not a number anybody
+/// reading this file would recognise.
+const SIGXFSZ: i64 = 25;
 
 /// How often a run's processor time is looked at while it runs.
 ///

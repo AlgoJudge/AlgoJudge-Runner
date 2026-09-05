@@ -12,12 +12,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aj_package::{Config, TestSet};
-use aj_sandbox::{Mount, Profile, Sandbox, Stopped};
+use aj_sandbox::{Mount, Profile, Sandbox, StdoutDirectory, Stopped};
 
 use crate::checker::{checker_said, Broken};
 use crate::compare::compare;
 use crate::details::{compiled, failed_to_compile, Compilation, Details, Limits};
-use crate::language::{self, Images, BUILD_OUTPUT, INPUT, PROGRAM, SOURCE};
+use crate::language::{self, Images, BUILD_OUTPUT, INPUT, OUTPUT, PROGRAM, SOURCE};
 use crate::score::{judge, Judgement, Reason, Status, TestOutcome};
 
 /// The scratch a compiler is given, for **every** build.
@@ -417,13 +417,30 @@ impl<S: Sandbox> Pipeline<S> {
         for test in job.tests.iter() {
             let limits = job.config.effective(test.group, &language.keys());
 
+            // **Where this test's stdout goes, instead of the daemon's log.**
+            // One directory per test, made by the Runner and root's, so the
+            // submission — which runs as `nobody` — cannot create, rename or
+            // read anything in it. The shim opens the file inside it before it
+            // drops privileges and hands over the descriptor alone.
+            let outputs = job.work.join("out").join(&test.name);
+            std::fs::create_dir_all(&outputs.here).map_err(|e| {
+                format!(
+                    "test {}: the output directory could not be made: {e}",
+                    test.name
+                )
+            })?;
+
             let run = self
                 .sandbox
                 .run(
                     &self.pinned(
                         Profile::new(
                             &language.image,
-                            language::with_input(&language.start, &test.name),
+                            language::with_input(
+                                &language.start,
+                                &test.name,
+                                &format!("{OUTPUT}/{}", StdoutDirectory::FILE),
+                            ),
                         )
                         .memory_bytes(limits.memory_bytes)
                         .pids(16)
@@ -435,6 +452,7 @@ impl<S: Sandbox> Pipeline<S> {
                         // What the deadline above measures progress against,
                         // and what "plainly past its budget" is measured from.
                         .cpu_limit(Duration::from_millis(limits.time_ms))
+                        .stdout_directory(&outputs.on_host, OUTPUT)
                         .mount(Mount::read_only(&artefacts.on_host, PROGRAM))
                         .mount(input_mount(&job.package.on_host, &test.name)),
                     ),
@@ -442,6 +460,26 @@ impl<S: Sandbox> Pipeline<S> {
                 .await
                 .map_err(|e| format!("a test could not be run: {e}"))?;
 
+            // **From the file where there is one, from the stream where there
+            // is not, and the file's existence is what decides.** The shim
+            // creates it even for a program that printed nothing, so its
+            // absence means this image carries no shim and stdout stayed on the
+            // container's stream — where the collector counted it exactly as it
+            // always did. Nothing here guesses which happened.
+            let produced = match std::fs::read(outputs.here.join(StdoutDirectory::FILE)) {
+                Ok(bytes) => bytes,
+                Err(_) => run.stdout.clone(),
+            };
+
+            // **Taken away as soon as it is read, and that is not tidiness.**
+            // The cap is per file, so a package of two hundred tests would
+            // otherwise leave two hundred of them — up to 64 MiB each — in an
+            // operator's own work directory, which is a host path and not the
+            // daemon's. The flood used to land in the daemon's log area; moving
+            // it here without this would have moved the problem rather than
+            // fixed it. Found by `a_flooding_submission_is_an_output_limit`,
+            // whose second and third tests could not open a file at all.
+            let _ = std::fs::remove_dir_all(&outputs.here);
             let measured = Measured::of(&run).map_err(|e| format!("test {}: {e}", test.name))?;
             let time_ms = measured.time_ms;
 
@@ -543,7 +581,7 @@ impl<S: Sandbox> Pipeline<S> {
             }
 
             let answer = answers.here.join(format!("{}.out", test.name));
-            std::fs::write(&answer, &run.stdout).map_err(|e| e.to_string())?;
+            std::fs::write(&answer, &produced).map_err(|e| e.to_string())?;
 
             let (status, percentage, note) = match &checker {
                 Some(built) => {
@@ -567,7 +605,7 @@ impl<S: Sandbox> Pipeline<S> {
                 None => {
                     let found = compare(
                         &std::fs::read(&test.expected).map_err(|e| e.to_string())?,
-                        &run.stdout,
+                        &produced,
                     );
                     if found.equal() {
                         (Status::Ok, 100, String::new())

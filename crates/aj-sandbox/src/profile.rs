@@ -86,6 +86,26 @@ pub struct Profile {
 
     pub max_output_bytes: u64,
 
+    /// A directory the shim writes the submission's stdout into, instead of
+    /// leaving it on the container's own stream.
+    ///
+    /// **This is a disk measurement, not a preference.** Left on the container's
+    /// stdout, every byte a submission prints is written by the daemon to its
+    /// `*-json.log` — JSON-escaped, stamped per line — and read back through a
+    /// socket. Measured 2026-09-05 across a twelve-Runner burst: a single
+    /// flooding submission left a **76 MB** log against a 64 MiB cap, and the
+    /// daemon wrote at 72 MB/s for the length of the run.
+    ///
+    /// **The submission is handed a descriptor and never a path.** The shim runs
+    /// as root, opens the file before it forks, and only then drops to the
+    /// submission's user — which cannot create, rename or read anything in a
+    /// directory that is root's. It is what is already done for the input,
+    /// pointing the other way.
+    ///
+    /// `None` leaves stdout where it was, which is what every step that is not
+    /// judging a submission wants: a build's output *is* its compiler log.
+    pub stdout_directory: Option<StdoutDirectory>,
+
     pub mounts: Vec<Mount>,
 
     /// A writable scratch area, mounted `noexec`.
@@ -171,6 +191,35 @@ pub struct Profile {
 // every image has a shell, which is a requirement it has no business having,
 // and `exec` keeps the process tree the same size either way.
 
+/// Where a measured run's stdout is written, on both sides of the mount.
+///
+/// One file per run and the name is fixed, because the directory is one
+/// run's: a name carried from the test would be a second thing to keep in
+/// step for nothing.
+#[derive(Debug, Clone)]
+pub struct StdoutDirectory {
+    /// The directory on the host. The Runner makes it; the shim writes in
+    /// it; nothing else is ever put there.
+    pub on_host: PathBuf,
+    /// Where it is mounted inside the container.
+    pub at: String,
+}
+
+impl StdoutDirectory {
+    /// What the file is called, inside and out.
+    pub const FILE: &'static str = "stdout";
+
+    /// The path the command must name, as the container sees it.
+    pub fn inside(&self) -> String {
+        format!("{}/{}", self.at, Self::FILE)
+    }
+
+    /// The path the Runner reads back afterwards.
+    pub fn on_disk(&self) -> PathBuf {
+        self.on_host.join(Self::FILE)
+    }
+}
+
 impl Profile {
     /// A profile with everything closed, to be opened deliberately.
     ///
@@ -187,6 +236,7 @@ impl Profile {
             wall_clock: Duration::from_secs(10),
             cpu_limit: None,
             max_output_bytes: 64 * 1024 * 1024,
+            stdout_directory: None,
             mounts: Vec::new(),
             measured: false,
             tmpfs_bytes: None,
@@ -221,6 +271,18 @@ impl Profile {
 
     pub fn max_output_bytes(mut self, bytes: u64) -> Self {
         self.max_output_bytes = bytes;
+        self
+    }
+
+    /// Send the submission's stdout to a file in `on_host`, mounted at `at`.
+    ///
+    /// The file is [`StdoutDirectory::FILE`] inside it, and the caller wants
+    /// [`StdoutDirectory::inside`] to build the path the command must name.
+    pub fn stdout_directory(mut self, on_host: impl Into<PathBuf>, at: impl Into<String>) -> Self {
+        self.stdout_directory = Some(StdoutDirectory {
+            on_host: on_host.into(),
+            at: at.into(),
+        });
         self
     }
 

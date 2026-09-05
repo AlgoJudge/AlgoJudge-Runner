@@ -574,6 +574,47 @@ async fn waited_for(name: &str, limit_ms: u64, seconds: u64) -> serde_json::Valu
     serde_json::from_slice(&judged.details.to_bytes()).unwrap()
 }
 
+/// **A submission that floods is stopped by the kernel, and it is still an
+/// output limit.**
+///
+/// Since 2026-09-05 a judged run's stdout goes to a file the shim opens, so the
+/// cap is `RLIMIT_FSIZE` on the child rather than a count of the stream — the
+/// kernel stops the program on the write that would cross it. That means the
+/// child dies of `SIGXFSZ`, and **every other path in the pipeline reads a
+/// fatal signal as a runtime error**. This is the test that says which it is,
+/// and it went red the first time it was run.
+///
+/// The cap a judged run carries is 64 MiB, so this writes until it is stopped
+/// rather than counting to a number of its own: a test that knew the figure
+/// would pass on a cap that had quietly moved.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_flooding_submission_is_an_output_limit_and_not_a_crash() {
+    let flooding = r#"
+#include <cstdio>
+int main() {
+    long long a, b;
+    if (scanf("%lld %lld", &a, &b) != 2) return 1;
+    for (;;) puts("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+}
+"#;
+    let judged = verdict(judge("cpp-flooding", "cpp", flooding).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+
+    assert_eq!(
+        document["tests"][0]["reason"], "outputLimit",
+        "a flood is an output limit and not a crash: {document}"
+    );
+    assert!(
+        document["tests"][0]["note"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Output limit exceeded"),
+        "the note says so in the words the Client and every package share: {document}"
+    );
+    assert_ne!(judged.judgement.score, judged.judgement.max_score);
+}
+
 // ── Every other outcome a participant can get ───────────────────────────────
 
 /// Wrong on one test of one group. The group rule then takes that group to
