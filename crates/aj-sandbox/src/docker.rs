@@ -32,7 +32,7 @@ use futures_util::StreamExt as _;
 
 use crate::cgroups::{self, Cgroups};
 use crate::profile::{Outcome, Profile, Stopped};
-use crate::{Error, Result, Sandbox};
+use crate::{Beside, Enough, Error, Result, Sandbox};
 
 pub struct Docker {
     client: bollard::Docker,
@@ -430,7 +430,7 @@ impl Sandbox for Docker {
         decided.map(|_| ())
     }
 
-    async fn run(&self, profile: &Profile) -> Result<Outcome> {
+    async fn run_beside(&self, profile: &Profile, beside: &Beside) -> Result<Outcome> {
         // Asked before anything is created: the user a container starts as
         // cannot be changed afterwards, and an image with no shim must not be
         // handed a root one.
@@ -509,6 +509,7 @@ impl Sandbox for Docker {
                 &name,
                 profile,
                 cgroup.as_ref().map(|(measuring, _)| measuring),
+                beside,
             )
             .await;
         self.remove(&name).await;
@@ -598,6 +599,7 @@ impl Docker {
         name: &str,
         profile: &Profile,
         measuring: Option<&crate::cgroups::Measuring>,
+        beside: &Beside,
     ) -> Stopped {
         let started = Instant::now();
         let mut reaper = Reaper::new(profile);
@@ -609,7 +611,9 @@ impl Docker {
             // readings taken at different moments would not describe one
             // interval.
             let stalled = measuring.and_then(|measuring| measuring.stalled());
-            if let Some(stopped) = reaper.tick(REAP_POLL, started.elapsed(), cpu, stalled) {
+            if let Some(stopped) =
+                reaper.tick(REAP_POLL, started.elapsed(), cpu, stalled, beside.so_far())
+            {
                 tracing::debug!(
                     container = name,
                     ?stopped,
@@ -638,6 +642,7 @@ impl Docker {
         name: &str,
         profile: &Profile,
         measuring: Option<&crate::cgroups::Measuring>,
+        beside: &Beside,
     ) -> Result<Outcome> {
         let started = Instant::now();
         self.client
@@ -678,9 +683,20 @@ impl Docker {
             _ = waiter.next() => Stopped::OnItsOwn,
             // Once this completes the branch is chosen and its block runs to the
             // end, so the kill cannot hand the decision back to the waiter.
-            stopped = self.reap(name, profile, measuring) => {
+            stopped = self.reap(name, profile, measuring, beside) => {
                 self.kill(name).await;
                 stopped
+            }
+            // **Somebody watching has decided.** The same shape as the reaper's
+            // branch and for the same reason: once this completes the block runs
+            // to the end, so the kill cannot hand the decision back to the
+            // waiter and have the run read as finished on its own.
+            why = beside.asked() => {
+                self.kill(name).await;
+                match why {
+                    Enough::Decided => Stopped::Decided,
+                    Enough::Output => Stopped::Output,
+                }
             }
         };
 
@@ -1095,6 +1111,13 @@ struct Reaper {
     /// The last pressure reading, to take a difference against. `None` until
     /// the first look, and on a kernel that carries no PSI.
     stalled: Option<Duration>,
+    /// The most that had crossed between this run and whatever is checking it.
+    ///
+    /// **The second half of "idle".** A program talking to an interactor spends
+    /// almost no processor time and raises no pressure — it is blocked on a
+    /// read, which looks exactly like a program that has given up. What tells
+    /// the two apart is whether anything is still passing between them.
+    moved: u64,
 }
 
 impl Reaper {
@@ -1106,6 +1129,7 @@ impl Reaper {
             best: Duration::ZERO,
             idle: Duration::ZERO,
             stalled: None,
+            moved: 0,
         }
     }
 
@@ -1131,8 +1155,15 @@ impl Reaper {
         elapsed: Duration,
         cpu: Option<Duration>,
         stalled: Option<Duration>,
+        moved: u64,
     ) -> Option<Stopped> {
         let waiting = self.waited_for_a_processor(stalled);
+        // **Talking is working.** Counted before the processor time, and on the
+        // same footing: a byte crossing between the two sides is progress by
+        // the only measure that means anything for a pair of programs waiting
+        // on each other.
+        let talked = moved > self.moved;
+        self.moved = moved;
 
         match cpu {
             // **Progress only counts against a limit.** A step nobody is timed
@@ -1149,8 +1180,8 @@ impl Reaper {
                 if self.ceiling.is_some_and(|ceiling| cpu > ceiling) {
                     return Some(Stopped::TimeLimit);
                 }
-                if cpu > self.best {
-                    self.best = cpu;
+                if cpu > self.best || talked {
+                    self.best = self.best.max(cpu);
                     self.idle = Duration::ZERO;
                 } else if !waiting {
                     // **Not scheduled is not idle**, so the window only runs
@@ -1178,6 +1209,7 @@ impl Reaper {
                     self.idle += since;
                 }
             }
+            _ if talked => self.idle = Duration::ZERO,
             _ => self.idle += since,
         }
 
@@ -1190,7 +1222,10 @@ impl Reaper {
         // slowly and did not wedge: it never began. Only a step that is timed
         // can say this — a build or a checker has no budget to be measured
         // against and keeps the answer it always had.
-        if self.ceiling.is_some() && self.best.is_zero() {
+        // A run that moved bytes plainly started, whatever the cgroup says —
+        // telling a participant "no processor time was ever recorded" about a
+        // program that was answering an interactor would be false.
+        if self.ceiling.is_some() && self.best.is_zero() && self.moved == 0 {
             return Some(Stopped::NeverStarted);
         }
 
@@ -1560,7 +1595,7 @@ mod tests {
         for tick in 1..=40u64 {
             cpu += ms(5);
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(cpu), None),
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu), None, 0),
                 None,
                 "tick {tick}, {cpu:?} of processor time"
             );
@@ -1583,13 +1618,13 @@ mod tests {
         // in its cgroup was runnable and waiting the whole time.
         let mut stalled = ms(0);
         assert_eq!(
-            reaper.tick(ms(250), ms(250), Some(ms(30)), Some(stalled)),
+            reaper.tick(ms(250), ms(250), Some(ms(30)), Some(stalled), 0),
             None
         );
         for tick in 2..=40u64 {
             stalled += ms(200);
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), Some(stalled)),
+                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), Some(stalled), 0),
                 None,
                 "tick {tick}: it was waiting for a core, not idle",
             );
@@ -1608,7 +1643,7 @@ mod tests {
         let mut verdict = None;
         for tick in 1..=300u64 {
             stalled += ms(200);
-            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), Some(stalled));
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), Some(stalled), 0);
             if verdict.is_some() {
                 // Five times the 2.2 s ceiling this test builds.
                 assert_eq!(ms(250 * tick), ms(11000), "it stopped at the cap");
@@ -1626,16 +1661,16 @@ mod tests {
         let mut reaper = timed();
         // A reading that is present and never moves: nothing was waiting.
         let quiet = Some(ms(7));
-        assert_eq!(reaper.tick(ms(250), ms(250), Some(ms(30)), quiet), None);
+        assert_eq!(reaper.tick(ms(250), ms(250), Some(ms(30)), quiet, 0), None);
         for tick in 2..=7u64 {
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), quiet),
+                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), quiet, 0),
                 None,
                 "tick {tick}",
             );
         }
         assert_eq!(
-            reaper.tick(ms(250), ms(2000), Some(ms(30)), quiet),
+            reaper.tick(ms(250), ms(2000), Some(ms(30)), quiet, 0),
             Some(Stopped::WallClock),
         );
     }
@@ -1654,7 +1689,7 @@ mod tests {
             cpu += ms(20);
             stalled += ms(100);
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(cpu), Some(stalled)),
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu), Some(stalled), 0),
                 None,
             );
         }
@@ -1662,13 +1697,13 @@ mod tests {
         // Six quiet looks are 1.5 s, just inside the 1.6 s window.
         for tick in 5..=10u64 {
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(cpu), Some(stalled)),
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu), Some(stalled), 0),
                 None,
                 "tick {tick}",
             );
         }
         assert_eq!(
-            reaper.tick(ms(250), ms(3000), Some(cpu), Some(stalled)),
+            reaper.tick(ms(250), ms(3000), Some(cpu), Some(stalled), 0),
             Some(Stopped::WallClock),
             "the window ran out on a program that was doing nothing",
         );
@@ -1680,17 +1715,17 @@ mod tests {
     fn a_program_that_stops_computing_is_reaped_after_the_window() {
         let mut reaper = timed();
         // It runs for a moment, and then spends nothing at all.
-        assert_eq!(reaper.tick(ms(250), ms(250), Some(ms(30)), None), None);
+        assert_eq!(reaper.tick(ms(250), ms(250), Some(ms(30)), None, 0), None);
         for tick in 2..=7u64 {
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), None),
+                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), None, 0),
                 None,
                 "tick {tick}",
             );
         }
         // The seventh quiet look puts the idle time past the 1.6 s window.
         assert_eq!(
-            reaper.tick(ms(250), ms(2000), Some(ms(30)), None),
+            reaper.tick(ms(250), ms(2000), Some(ms(30)), None, 0),
             Some(Stopped::WallClock),
         );
     }
@@ -1704,7 +1739,7 @@ mod tests {
             // Quiet for six ticks — 1.5 s, just inside the window.
             for tick in 0..6 {
                 assert_eq!(
-                    reaper.tick(ms(250), ms(250 * (round * 7 + tick)), Some(ms(10)), None),
+                    reaper.tick(ms(250), ms(250 * (round * 7 + tick)), Some(ms(10)), None, 0),
                     None,
                 );
             }
@@ -1714,7 +1749,8 @@ mod tests {
                     ms(250),
                     ms(250 * (round * 7 + 6)),
                     Some(ms(11 + round)),
-                    None
+                    None,
+                    0
                 ),
                 None,
             );
@@ -1731,11 +1767,14 @@ mod tests {
     #[test]
     fn a_runaway_is_stopped_well_past_its_limit() {
         assert_eq!(
-            timed().tick(ms(250), ms(250), Some(ms(2201)), None),
+            timed().tick(ms(250), ms(250), Some(ms(2201)), None, 0),
             Some(Stopped::TimeLimit)
         );
         // And a program at its ceiling is not.
-        assert_eq!(timed().tick(ms(250), ms(250), Some(ms(2200)), None), None);
+        assert_eq!(
+            timed().tick(ms(250), ms(250), Some(ms(2200)), None, 0),
+            None
+        );
     }
 
     /// **The cap may never be the first thing to fire**, or the window it is
@@ -1759,7 +1798,7 @@ mod tests {
     #[test]
     fn a_correct_program_in_an_expensive_container_is_not_stopped() {
         assert_eq!(
-            timed().tick(ms(250), ms(250), Some(ms(180 + 619)), None),
+            timed().tick(ms(250), ms(250), Some(ms(180 + 619)), None, 0),
             None
         );
     }
@@ -1772,7 +1811,7 @@ mod tests {
     fn a_program_at_its_limit_is_left_alone() {
         for cpu in [200u64, 250, 274, 320] {
             assert_eq!(
-                timed().tick(ms(250), ms(250), Some(ms(cpu)), None),
+                timed().tick(ms(250), ms(250), Some(ms(cpu)), None, 0),
                 None,
                 "{cpu} ms"
             );
@@ -1786,13 +1825,13 @@ mod tests {
             Reaper::new(&Profile::new("image", vec!["build".to_owned()]).wall_clock(ms(1000)));
         for tick in 1..4u64 {
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), None, None),
+                reaper.tick(ms(250), ms(250 * tick), None, None, 0),
                 None,
                 "tick {tick}"
             );
         }
         assert_eq!(
-            reaper.tick(ms(250), ms(1000), None, None),
+            reaper.tick(ms(250), ms(1000), None, None, 0),
             Some(Stopped::WallClock)
         );
     }
@@ -1811,14 +1850,14 @@ mod tests {
         for tick in 1..4u64 {
             cpu += ms(250);
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(cpu), None),
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu), None, 0),
                 None,
                 "tick {tick}",
             );
         }
         cpu += ms(250);
         assert_eq!(
-            reaper.tick(ms(250), ms(1000), Some(cpu), None),
+            reaper.tick(ms(250), ms(1000), Some(cpu), None, 0),
             Some(Stopped::WallClock),
             "a build that spins is stopped at its own deadline",
         );
@@ -1834,7 +1873,7 @@ mod tests {
         let mut reaper = timed();
         let mut verdict = None;
         for tick in 1..=40u64 {
-            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(0)), None);
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(0)), None, 0);
             if verdict.is_some() {
                 break;
             }
@@ -1850,12 +1889,69 @@ mod tests {
         let mut verdict = None;
         for tick in 1..=40u64 {
             // One microsecond, once, and never again.
-            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(1)), None);
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(1)), None, 0);
             if verdict.is_some() {
                 break;
             }
         }
         assert_eq!(verdict, Some(Stopped::WallClock));
+    }
+
+    /// **Talking is working, and this is the whole of the rule.**
+    ///
+    /// A program in conversation with an interactor spends almost no processor
+    /// time: it writes a line and blocks on a read, which to a cgroup looks
+    /// exactly like a program that has given up. Reaping it would fail every
+    /// interactive submission that thinks for longer than the window, and the
+    /// participant would be told their program stopped computing while it was
+    /// waiting for an answer to a question it had asked.
+    ///
+    /// Nothing else in the reaper can tell the two apart. The pressure reading
+    /// cannot: a task blocked on a read is not runnable, so it raises none.
+    #[test]
+    fn a_program_that_only_talks_to_its_interactor_is_not_reaped() {
+        let mut reaper = timed();
+        let mut moved = 0u64;
+        for tick in 1..=40u64 {
+            // A few bytes each way, and the processor time never moves.
+            moved += 12;
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), None, moved),
+                None,
+                "tick {tick}: it was answering, not idle",
+            );
+        }
+    }
+
+    /// **And when the conversation stops, both sides are reaped together.**
+    ///
+    /// Two programs deadlocked against each other — each blocked on a read the
+    /// other will never satisfy — are the case the window exists for, and the
+    /// rule above must not exempt them. What separates this from the test
+    /// before it is a single fact: nothing is crossing any more.
+    #[test]
+    fn a_seam_that_stops_moving_is_reaped_like_a_silent_program() {
+        let mut reaper = timed();
+        let mut moved = 0u64;
+        for tick in 1..=4u64 {
+            moved += 12;
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), None, moved),
+                None,
+                "tick {tick}: still talking",
+            );
+        }
+
+        // The window is 1.6 s here, so seven quiet ticks reach it.
+        let mut verdict = None;
+        for tick in 5..=11u64 {
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), None, moved);
+        }
+        assert_eq!(
+            verdict,
+            Some(Stopped::WallClock),
+            "a deadlocked pair is still a pair that stopped making progress",
+        );
     }
 
     /// The end of it, however busy the program looks. Without this a program
@@ -1868,7 +1964,7 @@ mod tests {
         let mut verdict = None;
         for tick in 1..=300u64 {
             cpu += ms(1);
-            verdict = reaper.tick(ms(250), ms(250 * tick), Some(cpu), None);
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(cpu), None, 0);
             if verdict.is_some() {
                 assert!(
                     ms(250 * tick) >= ms(11_000),

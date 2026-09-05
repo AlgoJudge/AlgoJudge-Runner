@@ -15,10 +15,12 @@
 //! command and limits, and reports what happened.
 
 pub mod affinity;
-pub mod cgroups;
+pub mod beside;
+mod cgroups;
 pub mod docker;
 pub mod profile;
 
+pub use beside::{Beside, Enough};
 pub use cgroups::Cgroups;
 pub use docker::Docker;
 pub use profile::{Mount, Outcome, Profile, StdoutDirectory, Stopped, SHIM};
@@ -53,5 +55,16 @@ pub trait Sandbox: Send + Sync {
     /// enforce a limit produces wrong verdicts rather than errors.
     async fn preflight(&self) -> Result<()>;
 
-    async fn run(&self, profile: &Profile) -> Result<Outcome>;
+    /// Runs it with nothing beside it, which is what most callers want.
+    async fn run(&self, profile: &Profile) -> Result<Outcome> {
+        self.run_beside(profile, &Beside::alone()).await
+    }
+
+    /// Runs it while somebody watches, and stops it when they have decided.
+    ///
+    /// **The sandbox never sees a byte.** [`Beside`] carries two facts and no
+    /// content: how much has crossed between this run and whatever is checking
+    /// it, and whether that checking is finished. What is being checked, and
+    /// how, stays entirely outside this crate.
+    async fn run_beside(&self, profile: &Profile, beside: &Beside) -> Result<Outcome>;
 }

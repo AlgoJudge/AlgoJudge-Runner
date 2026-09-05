@@ -375,6 +375,13 @@ pub enum Stopped {
     /// happened, and "no processor time for 8 s" is plainly false about a run
     /// that spent some in every one of those seconds.
     Overall,
+    /// **Whatever was reading this run's output had already decided.**
+    ///
+    /// The exit code and any signal are the kill's doing and say nothing about
+    /// the program — a run stopped here must be reported as what the reader
+    /// decided, never as the runtime error a `SIGKILL` would otherwise look
+    /// like. It is the one stop whose meaning lives outside the sandbox.
+    Decided,
 }
 
 #[derive(Debug, Clone)]

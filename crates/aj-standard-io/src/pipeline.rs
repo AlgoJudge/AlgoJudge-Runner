@@ -563,6 +563,14 @@ impl<S: Sandbox> Pipeline<S> {
                 // Refused above, before this match, because it is a statement
                 // about the host rather than a verdict about a submission.
                 Stopped::NeverStarted => unreachable!("a run that never started is not judged"),
+                // **Nothing here asks for a run to be stopped yet.** It will:
+                // a judged run is going to be watched while it produces, and
+                // the watcher's answer is the verdict. Until the pipeline holds
+                // that watcher, this cannot arrive — and when it can, this arm
+                // does not become another `(note, reason)`; the whole ordering
+                // below it changes, because a decided run's exit code says
+                // nothing about the program.
+                Stopped::Decided => unreachable!("nothing is watching this run yet"),
 
                 Stopped::Memory => Some(("Memory limit exceeded".to_owned(), Reason::MemoryLimit)),
                 Stopped::Output => Some(("Output limit exceeded".to_owned(), Reason::OutputLimit)),
