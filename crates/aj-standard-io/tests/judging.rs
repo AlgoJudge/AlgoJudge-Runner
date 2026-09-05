@@ -1347,6 +1347,162 @@ async fn an_interactive_submission_is_given_no_file_at_all() {
     }
 }
 
+/// **A checker package need not ship `.out` at all**, and this judges one.
+///
+/// The checker is handed `argv[3]` whether or not a file is behind it — the
+/// argument keeps its place so that a checker carried over from SIO2, which
+/// does `if (argc < 4) return WRONG`, keeps working. Whether it opens it is
+/// between the author and their own checker; this one does not.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_checker_package_judges_with_no_expected_output() {
+    let name = "cpp-checker-no-out";
+    let pipeline = pipeline().await;
+    let (package, _, _) = package(name);
+
+    // The reference answers, deleted. The checker below knows the sum itself.
+    for test in ["0a", "1a", "2a"] {
+        std::fs::remove_file(package.here.join(format!("tests/{test}.out"))).unwrap();
+    }
+
+    let adding = r#"
+#include <cstdio>
+int main(int argc, char** argv) {
+    if (argc < 4) { std::printf("WRONG\nno arguments\n"); return 0; }
+    std::FILE* in = std::fopen(argv[1], "r");
+    long long a = 0, b = 0;
+    if (!in || std::fscanf(in, "%lld %lld", &a, &b) != 2) {
+        std::printf("WRONG\nthe input could not be read\n");
+        return 0;
+    }
+    std::FILE* answer = std::fopen(argv[2], "r");
+    long long theirs = 0;
+    if (!answer || std::fscanf(answer, "%lld", &theirs) != 1) {
+        std::printf("WRONG\nno number\n");
+        return 0;
+    }
+    if (theirs != a + b) { std::printf("WRONG\nnot the sum\n"); return 0; }
+    std::printf("OK\n");
+    return 0;
+}
+"#;
+    std::fs::create_dir_all(package.here.join("checker")).unwrap();
+    std::fs::write(package.here.join("checker/checker.cpp"), adding).unwrap();
+    let declared = format!("{CONFIG}checker:\n  source: checker/checker.cpp\n  language: cpp\n");
+    std::fs::write(package.here.join("config.yml"), &declared).unwrap();
+
+    let config = Config::parse(&declared).unwrap();
+    let tests = TestSet::read(&package.here, &config).expect("a package with no .out files");
+    assert_eq!(tests.len(), 3, "the .in files are still the census");
+
+    let judged = verdict(
+        pipeline
+            .evaluate(&Job {
+                config: &config,
+                tests: &tests,
+                language: "cpp",
+                file_name: "main.cpp",
+                source: CORRECT_CPP.as_bytes(),
+                package,
+                work: work(name),
+                pipes: None,
+            })
+            .await,
+    );
+
+    assert_eq!(judged.judgement.verdict, "Accepted");
+    assert_eq!(judged.judgement.score, judged.judgement.max_score);
+}
+
+/// **An interactive package may ship no test files at all**, naming its tests
+/// by a count, and this judges one.
+///
+/// It is also what proves the count reaches the scoring: three tests are
+/// declared and none exists on disk, so the divisor for each test's share of
+/// the group's points can only have come from the declaration.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn an_interactive_package_judges_tests_that_are_only_declared() {
+    let name = "cpp-counted-interactive";
+    let pipeline = pipeline().await;
+    let (here, on_the_host) = fixture(name);
+
+    // No `tests/` at all: the interactor is the whole of every test.
+    let declared = "type: \"standard-io@1\"\n\
+                    limits:\n  timeMs: 2000\n  memoryBytes: 268435456\n\
+                    interactor:\n  source: interactor/talk.cpp\n  language: cpp\n\
+                    groups:\n  - group: 1\n    points: 100\n    tests: 3\n";
+    std::fs::write(here.join("config.yml"), declared).unwrap();
+
+    // Says a number, expects it doubled, and tells the Runner which test it was.
+    let doubling = r#"
+#include <cstdio>
+#include <cstdlib>
+int main(int argc, char** argv) {
+    if (argc < 4) return 1;
+    std::FILE* say = std::fopen(argv[2], "w");
+    if (!say) return 1;
+    const char* which = std::getenv("AJ_TEST");
+    std::printf("21\n");
+    std::fflush(stdout);
+    long long theirs = 0;
+    if (std::scanf("%lld", &theirs) != 1 || theirs != 42) {
+        std::fprintf(say, "WRONG\nexpected 42 on %s\n", which ? which : "?");
+    } else {
+        std::fprintf(say, "OK\ndoubled on %s\n", which ? which : "?");
+    }
+    std::fclose(say);
+    return 0;
+}
+"#;
+    std::fs::create_dir_all(here.join("interactor")).unwrap();
+    std::fs::write(here.join("interactor/talk.cpp"), doubling).unwrap();
+
+    let doubler = r#"
+#include <cstdio>
+int main() { long long n; if (std::scanf("%lld", &n) != 1) return 1; std::printf("%lld\n", n * 2); std::fflush(stdout); return 0; }
+"#;
+
+    let config = Config::parse(declared).unwrap();
+    let tests = TestSet::read(&here, &config).expect("a package whose tests are declared");
+    assert_eq!(tests.len(), 3, "three tests, and not one file among them");
+
+    let judged = verdict(
+        pipeline
+            .evaluate(&Job {
+                config: &config,
+                tests: &tests,
+                language: "cpp",
+                file_name: "main.cpp",
+                source: doubler.as_bytes(),
+                package: Places {
+                    here,
+                    on_host: on_the_host,
+                },
+                work: work(name),
+                pipes: None,
+            })
+            .await,
+    );
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+
+    assert_eq!(
+        judged.judgement.verdict, "Accepted",
+        "three declared tests judged: {document}"
+    );
+    assert_eq!(
+        judged.judgement.score, 100.0,
+        "and the group is whole: {document}"
+    );
+    for (index, test) in ["1a", "1b", "1c"].iter().enumerate() {
+        assert_eq!(
+            document["tests"][index]["note"],
+            format!("doubled on {test}"),
+            "the declared names reach the interactor: {document}"
+        );
+    }
+}
+
 // ── Every other outcome a participant can get ───────────────────────────────
 
 /// Wrong on one test of one group. The group rule then takes that group to
