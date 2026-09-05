@@ -19,8 +19,24 @@
 
 name: algojudge-runner-dev
 
+# **Bounded, and the same driver an installation uses.** Docker left to itself
+# keeps an unbounded `json-file`, which on a machine that judges all afternoon is
+# a full disk. `AlgoJudge-Ops` pins `local` on every service it ships; this file
+# does the same so that what a developer runs behaves like what an operator runs.
+#
+# Literal values rather than `${...}`: an example that needs an `.env` before it
+# starts is an example that does not.
+x-logging: &logging
+  driver: local
+  options:
+    max-size: "10m"
+    max-file: "3"
+    # `local` compresses what it rotates unless told otherwise, and the daemon
+    # refuses compression beside a single file. Three files, so it may stand.
+
 services:
   postgres:
+    logging: *logging
     image: postgres:18
     restart: unless-stopped
     # One level above PGDATA on purpose: PostgreSQL 18 keeps its data in
@@ -39,6 +55,7 @@ services:
       retries: 5
 
   server:
+    logging: *logging
     build:
       # A sibling checkout by default, which is how the workspace is laid out.
       # Overridable because GitHub Actions cannot check a repository out above
@@ -99,6 +116,7 @@ services:
       AJ_Storage__Stores__objects__Kind: postgres
 
   runner:
+    logging: *logging
     build:
       context: .
     restart: unless-stopped
