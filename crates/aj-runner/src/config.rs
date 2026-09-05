@@ -52,6 +52,25 @@ pub struct Config {
     pub work_path: PathBuf,
     pub work_host_path: PathBuf,
 
+    /// Where a judged run's stdout file goes, when it should not go to a disk.
+    ///
+    /// **Both or neither**, and for the same reason the pair above exists: the
+    /// daemon resolves the bind mount, so the Runner's view and the daemon's
+    /// have to be given separately wherever the Runner is itself in a
+    /// container. Absent leaves the file in the job's own scratch, which is
+    /// what it always did.
+    ///
+    /// Point it at a **host** tmpfs and a submission's output never reaches a
+    /// disk: it is written once by the program and read once by the Runner, and
+    /// nothing about it needs to outlive the test. A `tmpfs:` entry on the
+    /// Runner's own service will not do -- that is private to its mount
+    /// namespace, and the daemon would make an empty directory instead.
+    ///
+    /// Budget the size: one file per running job, capped by the profile's
+    /// output limit. Twelve Runners at 64 MiB is 768 MiB in the worst case.
+    pub output_path: Option<PathBuf>,
+    pub output_host_path: Option<PathBuf>,
+
     pub images: aj_standard_io::Images,
 
     /// Starts anyway on a host this Runner cannot measure on.
@@ -148,6 +167,10 @@ impl Config {
 
             work_path: work.clone().into(),
             work_host_path: var("Work__HostPath").unwrap_or(work).into(),
+            output_path: var("Work__OutputPath").map(Into::into),
+            output_host_path: var("Work__OutputHostPath")
+                .or_else(|| var("Work__OutputPath"))
+                .map(Into::into),
 
             // Either name. The old one is not deprecated so much as narrower
             // than what it always did, and a development `.env` that has it

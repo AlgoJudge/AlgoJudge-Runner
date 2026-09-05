@@ -1065,6 +1065,8 @@ fn probe_config() -> Config {
         cache_max_bytes: 0,
         work_path: scratch.join("work"),
         work_host_path: scratch.join("work"),
+        output_path: None,
+        output_host_path: None,
         // Never used: nothing here evaluates anything.
         images: aj_standard_io::Images::default(),
         allow_unmeasured: false,

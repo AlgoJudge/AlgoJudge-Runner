@@ -169,6 +169,19 @@ pub struct Job<'a> {
     pub package: Places,
     /// Scratch for this job alone, and empty. Removed by the caller afterwards.
     pub work: Places,
+    /// Where this job's per-test stdout files go, when that is not the scratch.
+    ///
+    /// **A tmpfs of the host's, where an operator has one.** The file is
+    /// written by the submission and read once by the Runner, and nothing about
+    /// it needs to survive the test — so it is the one thing in the loop that
+    /// can be kept out of a disk entirely. `None` puts it in the job's own
+    /// scratch, which is where it was before anybody could choose.
+    ///
+    /// It has to be the **host's** tmpfs and not the Runner's own: the daemon
+    /// resolves the bind mount, and a path only the Runner's mount namespace
+    /// knows produces an empty directory rather than an error — every test
+    /// would then be compared against nothing.
+    pub outputs: Option<Places>,
 }
 
 /// The package's checker, built and ready to be run over a test.
@@ -422,7 +435,11 @@ impl<S: Sandbox> Pipeline<S> {
             // submission — which runs as `nobody` — cannot create, rename or
             // read anything in it. The shim opens the file inside it before it
             // drops privileges and hands over the descriptor alone.
-            let outputs = job.work.join("out").join(&test.name);
+            let outputs = job
+                .outputs
+                .clone()
+                .unwrap_or_else(|| job.work.join("out"))
+                .join(&test.name);
             std::fs::create_dir_all(&outputs.here).map_err(|e| {
                 format!(
                     "test {}: the output directory could not be made: {e}",

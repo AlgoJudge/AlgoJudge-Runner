@@ -176,6 +176,7 @@ async fn judge(name: &str, language: &str, source: &str) -> Evaluated {
             source: source.as_bytes(),
             package,
             work: work(name),
+            outputs: None,
         })
         .await
 }
@@ -256,6 +257,7 @@ groups:
                 source: CORRECT_CPP.as_bytes(),
                 package: Places { here, on_host },
                 work: work("excluded-language"),
+                outputs: None,
             })
             .await,
     );
@@ -381,6 +383,7 @@ async fn a_file_the_chosen_toolchain_does_not_accept_is_a_compilation_error() {
                 source: CORRECT_PYTHON.as_bytes(),
                 package,
                 work: work("wrong-extension"),
+                outputs: None,
             })
             .await,
     );
@@ -567,11 +570,100 @@ async fn waited_for(name: &str, limit_ms: u64, seconds: u64) -> serde_json::Valu
                 source: waiting.as_bytes(),
                 package: Places { here, on_host },
                 work: work(name),
+                outputs: None,
             })
             .await,
     );
 
     serde_json::from_slice(&judged.details.to_bytes()).unwrap()
+}
+
+/// **The stdout file follows where it is pointed, and a wrong path is a wrong
+/// answer rather than an error.**
+///
+/// `Job::outputs` exists so an operator can put the one file in the loop that
+/// nothing needs to keep — a submission's own output — on a host tmpfs, and
+/// keep it off a disk entirely. This drives that path with a directory of its
+/// own and judges a correct solution through it.
+///
+/// **It bites for the reason the field is dangerous.** The daemon resolves the
+/// bind mount, so a path it cannot open produces an *empty directory* rather
+/// than an error; the shim then writes into nothing, the Runner reads nothing,
+/// and every test is compared against an empty answer. That is a wrong verdict
+/// with no error anywhere — so the assertion here is the score, not the plumbing.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn the_stdout_file_follows_where_the_outputs_are_pointed() {
+    let name = "cpp-outputs-elsewhere";
+    let correct = r#"
+#include <iostream>
+int main() { long long a, b; std::cin >> a >> b; std::cout << a + b << "\n"; }
+"#;
+
+    // A root of its own, and deliberately not under `work`: on a real host this
+    // is where a tmpfs would be mounted.
+    // **Through `fixture`, and that is the lesson this test paid for.** The
+    // first version pointed at this process's own `temp_dir()`, which the
+    // daemon cannot open -- so it made an empty directory, the shim wrote into
+    // nothing, and the verdict came back `Wrong answer` with no error anywhere.
+    // Exactly the failure the doc comment above predicts.
+    let (out_here, out_on_host) = fixture(&format!("{name}-outputs"));
+    let elsewhere = Places {
+        here: out_here,
+        on_host: out_on_host,
+    };
+
+    let pipeline = pipeline().await;
+    let (here, on_host) = fixture(name);
+    std::fs::create_dir_all(here.join("tests")).unwrap();
+    let config_yml = "type: \"standard-io@1\"
+limits:
+  timeMs: 2000
+  memoryBytes: 268435456
+groups:
+  - group: 1
+    points: 100
+"
+    .to_owned();
+    std::fs::write(here.join("config.yml"), &config_yml).unwrap();
+    std::fs::write(
+        here.join("tests/1a.in"),
+        "2 3
+",
+    )
+    .unwrap();
+    std::fs::write(
+        here.join("tests/1a.out"),
+        "5
+",
+    )
+    .unwrap();
+
+    let config = Config::parse(&config_yml).unwrap();
+    let tests = TestSet::read(&here, &config).unwrap();
+
+    let judged = verdict(
+        pipeline
+            .evaluate(&Job {
+                config: &config,
+                tests: &tests,
+                language: "cpp",
+                file_name: "main.cpp",
+                source: correct.as_bytes(),
+                package: Places { here, on_host },
+                work: work(name),
+                outputs: Some(elsewhere.clone()),
+            })
+            .await,
+    );
+
+    assert_eq!(
+        judged.judgement.verdict, "Accepted",
+        "the answer came back through the directory it was pointed at",
+    );
+    assert_eq!(judged.judgement.score, judged.judgement.max_score);
+
+    let _ = std::fs::remove_dir_all(&elsewhere.here);
 }
 
 /// **A submission that floods is stopped by the kernel, and it is still an
@@ -904,6 +996,7 @@ async fn the_committed_package_judges_a_correct_solution() {
                 on_host: on_the_host.join("package"),
             },
             work: work("archive"),
+            outputs: None,
         })
         .await;
 
@@ -1078,6 +1171,7 @@ groups:
                 source: b"a, b = map(int, input().split())\nprint(a + b)\n",
                 package: Places { here, on_host },
                 work: work("limits-reported"),
+                outputs: None,
             })
             .await,
     );
@@ -1152,6 +1246,7 @@ groups:
                 source: slow.as_bytes(),
                 package: Places { here, on_host },
                 work: work("overrun"),
+                outputs: None,
             })
             .await,
     );
