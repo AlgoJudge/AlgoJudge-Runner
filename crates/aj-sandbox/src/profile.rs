@@ -159,6 +159,33 @@ pub struct Profile {
     /// container is removed, which is immediately.
     pub writable_root: bool,
 
+    /// Nothing reaches this container's stdio, and the daemon keeps no log.
+    ///
+    /// **A disk measurement, not tidiness.** The `json-file` driver writes every
+    /// byte a container prints, JSON-escaped and stamped per line, and one
+    /// flooding submission left a **76 MB** file against a 64 MiB cap while the
+    /// daemon wrote at 72 MB/s — measured 2026-09-05. A run whose output travels
+    /// on a pipe the Runner holds has no use for a second copy of it on a disk.
+    ///
+    /// Off for a build and for a checker: those two are read through
+    /// [`Outcome::stdout`] and [`Outcome::stderr`], and a driver of `none`
+    /// refuses the endpoint that reads them.
+    pub silent: bool,
+
+    /// This container runs **beside** a measured one, and opens no measurement.
+    ///
+    /// **Without it a checker deadlocks against the submission it is checking**,
+    /// and only where Docker puts most installations. Under the `systemd` cgroup
+    /// driver one slice serves every run, so a second run in it waits for a gate
+    /// the first holds — and the first is waiting for the second to read its
+    /// output. It would pass every unit test and the whole `cgroupfs` leg of CI.
+    ///
+    /// Such a container is placed wherever the daemon puts it and is measured by
+    /// nothing. It needs no measurement: anything that stops a checker other
+    /// than its own exit already makes it a *broken* checker rather than a
+    /// verdict.
+    pub alongside: bool,
+
     /// A path inside the container to read back after it exits.
     ///
     /// **This is how a build hands over what it made**, instead of being given
@@ -244,6 +271,8 @@ impl Profile {
             max_file_bytes: 256 * 1024 * 1024,
             cpuset: None,
             writable_root: false,
+            silent: false,
+            alongside: false,
             collect: None,
             max_collected_bytes: 0,
         }
@@ -325,6 +354,16 @@ impl Profile {
 
     /// What to read back, and the most of it that will be held. **One call for
     /// both**, so a caller cannot ask for the first and forget the second.
+    pub fn silent(mut self) -> Self {
+        self.silent = true;
+        self
+    }
+
+    pub fn alongside(mut self) -> Self {
+        self.alongside = true;
+        self
+    }
+
     pub fn collect(mut self, path: impl Into<String>, max_bytes: u64) -> Self {
         self.collect = Some(path.into());
         self.max_collected_bytes = max_bytes;

@@ -612,6 +612,100 @@ async fn there_is_no_network() {
 
 // ── A6 — it floods ──────────────────────────────────────────────────────────
 
+/// **A silent run's output does not come back**, which is the half of silence a
+/// test can see.
+///
+/// `Profile::silent` does two things and this asserts one of them. It stops the
+/// daemon attaching to the container's stdio, so nothing is captured and the
+/// collector is not started — and that is what this proves, against a control,
+/// because "the output was empty" is also what a broken run looks like.
+///
+/// **The other half is not observable from here** and was measured on the host
+/// instead: the same container under the default driver leaves a 95-byte
+/// `*-json.log`, and under `none` leaves none at all (2026-09-05). That is the
+/// half the 76 MB was, and it is the daemon's own behaviour rather than
+/// something this code can assert.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn a_silent_runs_output_does_not_come_back() {
+    let docker = sandbox().await;
+
+    let loud = docker
+        .run(&shell("echo the-daemon-kept-this"))
+        .await
+        .expect("the control run");
+    assert_eq!(
+        String::from_utf8_lossy(&loud.stdout).trim(),
+        "the-daemon-kept-this",
+        "the control must come back, or this test proves nothing",
+    );
+
+    let quiet = docker
+        .run(&shell("echo the-daemon-kept-this").silent())
+        .await
+        .expect("the silent run");
+    assert!(
+        quiet.stdout.is_empty() && quiet.stderr.is_empty(),
+        "a silent run is read by nobody: {:?}",
+        String::from_utf8_lossy(&quiet.stdout),
+    );
+    assert_eq!(
+        quiet.stopped,
+        Stopped::OnItsOwn,
+        "and it still ran to the end",
+    );
+    assert_eq!(quiet.exit_code, 0);
+    assert_eq!(leftovers(&docker).await, 0);
+}
+
+/// **Two runs at once must not wait for each other**, and on the driver most
+/// installations have they would.
+///
+/// A checker reads the submission's output while the submission is producing
+/// it, so both containers are alive at once. Under the `systemd` cgroup
+/// driver — Docker's own default wherever cgroup v2 and systemd are both
+/// present — one slice serves every run and `Cgroups::begin` holds its gate for
+/// the whole of the run that took it. A second run asking for one would wait
+/// for a gate the first holds while the first waits for the second to read, and
+/// that is a hard deadlock, not slow scheduling.
+///
+/// `Profile::alongside` is what closes it: such a run opens no measurement.
+///
+/// **This test is meaningless on `cgroupfs` and CI is where it counts.** There
+/// is no gate there, so both arrangements pass; only the `systemd` leg can fail
+/// it. The timeout is what turns the deadlock into a failure rather than a
+/// suite that never finishes.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn two_runs_at_once_do_not_wait_for_each_other() {
+    let docker = sandbox().await;
+
+    // Bound before the futures, so neither profile is a temporary the future
+    // outlives.
+    let slow = shell("sleep 2; echo first").measured();
+    let quick = shell("echo second").alongside();
+    let measured = docker.run(&slow);
+    let beside = docker.run(&quick);
+
+    let both = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(measured, beside)
+    })
+    .await
+    .expect("neither run may wait for the other; on systemd this is the gate");
+
+    let (measured, beside) = both;
+    let measured = measured.expect("the measured run");
+    let beside = beside.expect("the run beside it");
+
+    assert_eq!(String::from_utf8_lossy(&measured.stdout).trim(), "first");
+    assert_eq!(String::from_utf8_lossy(&beside.stdout).trim(), "second");
+    assert_eq!(
+        beside.cpu_time, None,
+        "a run beside another opens no measurement of its own",
+    );
+    assert_eq!(leftovers(&docker).await, 0);
+}
+
 #[tokio::test]
 #[ignore = "needs a container runtime"]
 async fn flooding_output_is_stopped_at_the_cap() {

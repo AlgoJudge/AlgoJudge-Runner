@@ -330,6 +330,17 @@ impl Docker {
                     .collect(),
             ),
 
+            // **Nothing is written about a silent container.** `none` is the
+            // one driver that stores nothing; it also refuses the endpoint
+            // `collect` reads, which is why only a run nobody reads that way
+            // may ask for it.
+            log_config: profile
+                .silent
+                .then(|| bollard::models::HostConfigLogConfig {
+                    typ: Some("none".to_owned()),
+                    config: None,
+                }),
+
             tmpfs: profile.tmpfs_bytes.map(|bytes| {
                 HashMap::from([(
                     "/tmp".to_owned(),
@@ -448,6 +459,11 @@ impl Sandbox for Docker {
         // that has to have a beginning. Failure here is not an error: the run
         // proceeds unmeasured.
         let cgroup = match self.cgroups() {
+            // **A run beside another one opens nothing.** Under `systemd` the
+            // gate `begin` takes is held for the whole of the run that owns it,
+            // so asking for one here is how a checker comes to wait for the
+            // submission that is waiting for the checker.
+            _ if profile.alongside => None,
             Some(cgroups) => cgroups.begin(&name).await,
             None => None,
         };
@@ -476,8 +492,10 @@ impl Sandbox for Docker {
                 env
             }),
             labels: Some(self.labels()),
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
+            // Asked for only where something reads them back. A silent
+            // container's stdio carries nothing and is attached by nobody.
+            attach_stdout: Some(!profile.silent),
+            attach_stderr: Some(!profile.silent),
             network_disabled: Some(true),
             host_config: Some(self.host_config(
                 profile,
@@ -668,12 +686,21 @@ impl Docker {
         // is read before it is raised — and the truncated log is then scored as
         // the participant's wrong answer instead of an output-limit verdict.
         let flooded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let collector = tokio::spawn(collect(
-            self.client.clone(),
-            name.to_owned(),
-            profile.max_output_bytes,
-            std::sync::Arc::clone(&flooded),
-        ));
+        // **Not spawned at all for a silent run**, because there is nothing for
+        // it to read: nothing is attached and the daemon keeps no log.
+        //
+        // Skipping it is an economy and not a correctness rule — measured, a
+        // collector left running against such a container comes back empty and
+        // harmless rather than failing. It is a task and a `logs` subscription
+        // per test, and 8409 of those a burst is worth not starting.
+        let collector = (!profile.silent).then(|| {
+            tokio::spawn(collect(
+                self.client.clone(),
+                name.to_owned(),
+                profile.max_output_bytes,
+                std::sync::Arc::clone(&flooded),
+            ))
+        });
 
         let mut waiter = self
             .client
@@ -709,9 +736,12 @@ impl Docker {
             None => None,
             Some(path) => self.take(name, path, profile.max_collected_bytes).await?,
         };
-        let (stdout, stderr) = collector
-            .await
-            .map_err(|e| Error::Refused(format!("the output collector did not finish: {e}")))??;
+        let (stdout, stderr) = match collector {
+            None => (Vec::new(), Vec::new()),
+            Some(collector) => collector.await.map_err(|e| {
+                Error::Refused(format!("the output collector did not finish: {e}"))
+            })??,
+        };
 
         // Now that the collector is done, and not before: see above.
         let stopped = if flooded.load(std::sync::atomic::Ordering::SeqCst) {
