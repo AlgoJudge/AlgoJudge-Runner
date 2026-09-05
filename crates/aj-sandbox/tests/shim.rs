@@ -211,7 +211,24 @@ impl Built {
             let _ = std::fs::set_permissions(&self.outputs, std::fs::Permissions::from_mode(0o777));
         }
         let n = NEXT.fetch_add(1, Ordering::SeqCst);
-        self.outputs.join(format!("{what}-{n}"))
+        let at = self.outputs.join(format!("{what}-{n}"));
+        // **Made here, because the shim no longer makes it.** In the product
+        // the far end is a named pipe the Runner created before the container
+        // was started; the shim opens what it is given and does not create,
+        // so a destination that is not there is a Runner that did not do its
+        // half rather than something to paper over.
+        std::fs::File::create(&at).expect("a destination for the output");
+        // **Writable by anybody, and only here.** One test runs the shim as
+        // 65534 to prove the nonce scrub does not depend on privilege, and a
+        // root-owned destination would stop it writing at all. In the product
+        // the far end is a 0600 pipe the Runner made and the shim is root when
+        // it opens it, which is what keeps the submission away from it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o666));
+        }
+        at
     }
 }
 
@@ -350,17 +367,99 @@ fn the_input_file_arrives_as_standard_input() {
     );
 }
 
+/// **The report goes where it is told, and stderr carries nothing.**
+///
+/// `AJ_SHIM_REPORT` names a channel of the shim's own. In the product it is a
+/// pipe the Runner is reading; here it is a file, because what is being tested
+/// is that the shim writes there and not that a pipe works.
+///
+/// Both halves matter and neither implies the other: a shim that wrote to the
+/// channel *and* to stderr would pass a test that only looked at the channel,
+/// and would go on costing the daemon a write per byte of it.
 #[test]
-fn the_report_comes_after_whatever_the_program_wrote() {
+fn the_report_travels_on_the_channel_it_was_given() {
+    let built = built!();
+    let at = built.output_for("report-channel");
+    let out = built.output_for("report-channel-stdout");
+
+    let output = Command::new(&built.shim)
+        .arg(&built.input)
+        .arg(&out)
+        .arg(&built.helper)
+        .arg("noisy")
+        .env("AJ_SHIM_NONCE", NONCE)
+        .env("AJ_SHIM_REPORT", &at)
+        .output()
+        .expect("the shim runs");
+
+    let channel = std::fs::read(&at).unwrap_or_default();
+    let said = String::from_utf8_lossy(&channel);
+    assert!(
+        said.contains(NONCE) && said.contains("aj-shim1 ok "),
+        "the report went to the channel it was given: {said}",
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "and nowhere else: {:?}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// **A channel that was named and cannot be opened is fatal.**
+///
+/// There is no third behaviour, and the reason is what the Runner does with it:
+/// having named a channel, it is reading that channel. A shim that quietly fell
+/// back to stderr would leave it reading an empty pipe until something else
+/// gave up — an infrastructure failure reported as a timeout, which is a
+/// verdict against somebody's program.
+#[test]
+fn a_report_channel_that_cannot_be_opened_is_fatal() {
+    let built = built!();
+    let out = built.output_for("report-missing-stdout");
+
+    let output = Command::new(&built.shim)
+        .arg(&built.input)
+        .arg(&out)
+        .arg(&built.helper)
+        .arg("exit")
+        .arg("0")
+        .env("AJ_SHIM_NONCE", NONCE)
+        .env(
+            "AJ_SHIM_REPORT",
+            built.shim.parent().unwrap().join("not-a-channel"),
+        )
+        .output()
+        .expect("the shim runs");
+
+    assert_eq!(
+        output.status.code(),
+        Some(125),
+        "the shim failed, and said so as itself rather than as the submission",
+    );
+}
+
+/// **The submission cannot reach the report's channel**, and this is what
+/// replaced "the report is written last".
+///
+/// It used to share stderr with whatever the program printed there, so the
+/// ordering was the defence: the shim killed everything else in the namespace
+/// and then wrote, last. The submission's stderr is `/dev/null` now, so the two
+/// do not share a channel at all -- a stronger thing to be able to say, and a
+/// cheaper one to keep true.
+#[test]
+fn nothing_the_program_writes_reaches_the_report() {
     let built = built!();
     let output = run(built, &["noisy"], Some(NONCE));
     let said = report_in(&output).expect("a report");
 
-    assert_eq!(said.rest, "the program's own complaint\n");
+    assert_eq!(
+        said.rest, "",
+        "the report's channel carried the report and nothing else",
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.find("complaint").unwrap() < stderr.find("aj-shim1").unwrap(),
-        "the report has to be last: {stderr}"
+        !stderr.contains("complaint"),
+        "the submission's own stderr went nowhere: {stderr}",
     );
 }
 

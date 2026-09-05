@@ -9,13 +9,13 @@
  * child -- which is the program and nothing else, at microsecond resolution.
  *
  * **It is the precise instrument, and it is what a participant is charged.**
- * The report travels out on stderr, through a container the submission also
- * lives in, so three things are what make a forged one hard: the line carries a
- * nonce the submission cannot read, this process kills every other process in
- * the namespace before writing, and it writes last. The Runner's cgroup reading
- * is kept beside it to *disbelieve* a report the reading cannot account for --
- * a container costs a program nothing it can be charged for, and measurement
- * showed that charging the larger of the two failed correct submissions.
+ * The report goes out on a channel of its own that nothing else in the
+ * container can name, and it still carries the nonce, this process still kills
+ * every other process in the namespace before writing, and it still writes
+ * last. The Runner's cgroup reading is kept beside it to *disbelieve* a report
+ * the reading cannot account for -- a container costs a program nothing it can
+ * be charged for, and measurement showed that charging the larger of the two
+ * failed correct submissions.
  *
  *   aj-shim <input-file> <output-file> <program> [args...]
  *
@@ -23,24 +23,31 @@
  * that before and is what this replaces; a shell would otherwise be a second
  * process in the accounting, and its own start is part of what is being removed.
  *
- * **The output file becomes the child's stdout, and that is a disk measurement
- * rather than a taste.** Left on the container's own stdout, everything a
- * submission prints is written by the daemon to its `*-json.log` -- JSON-escaped
- * and stamped per line -- and read back through a socket. Measured 2026-09-05 on
- * a twelve-Runner burst: one flooding submission produced a **76 MB** log for a
- * 64 MiB cap, and the daemon wrote at 72 MB/s throughout. Here the bytes go
- * straight to the file the Runner already has open a directory to.
+ * **The second argument becomes the child's stdout, and it is normally a pipe.**
+ * Left on the container's own stdout, everything a submission prints is written
+ * by the daemon to its `*-json.log` -- JSON-escaped and stamped per line -- and
+ * read back through a socket. Measured 2026-09-05 on a twelve-Runner burst: one
+ * flooding submission produced a **76 MB** log for a 64 MiB cap, and the daemon
+ * wrote at 72 MB/s throughout. Here the bytes go to whoever is reading, while
+ * the program is still running, and are never stored by anybody.
  *
  * **The submission never gets a writable path, only the descriptor.** This runs
- * as root and opens the file before forking; the directory it sits in is root's,
- * so the submission -- which is uid 65534 by the time it runs -- cannot create,
- * rename or read anything there. It is the same trick already used for the
- * input, in the other direction.
+ * as root and opens both ends before forking; what they sit in is root's, so
+ * the submission -- which is uid 65534 by the time it runs -- cannot open, name
+ * or create anything there. It is the same trick already used for the input,
+ * in the other direction.
  *
- * `AJ_SHIM_MAX_OUTPUT` is the cap, in bytes, applied as `RLIMIT_FSIZE` before
- * privileges are dropped. **The kernel stops the program at the byte**, where
- * the Runner used to count a stream and notice afterwards; a submission over it
- * dies of `SIGXFSZ`, which the report carries out like any other signal.
+ * **The report has a channel of its own**, named by `AJ_SHIM_REPORT`. It used
+ * to travel on the container's stderr, mixed in with whatever the submission
+ * printed there and picked back out by its nonce. Now the submission's stderr
+ * is `/dev/null` and the report has a pipe nobody else can write to, so the
+ * three things that made a forged report hard are down to one that makes it
+ * impossible. Absent, the report goes to stderr as it always did.
+ *
+ * **There is no output cap here any more.** `RLIMIT_FSIZE` was it, and it does
+ * not apply to a pipe -- keeping it would have gone on capping the scratch
+ * while silently not capping the thing it was written for. The Runner counts
+ * what it reads.
  */
 
 #define _GNU_SOURCE
@@ -75,12 +82,21 @@ extern char **environ;
 
 static char nonce[128];
 
+/* Where the report goes.
+ *
+ * **stderr until told otherwise, and that is the transition and the fallback
+ * at once.** A Runner that names no channel gets the old behaviour, which is
+ * what keeps an older image and a newer one both judgeable while this moves.
+ * Once the child is running its own stderr is `/dev/null`, so this is also the
+ * one descriptor by which anything can still be said. */
+static int report_fd = STDERR_FILENO;
+
 /* One `write`, because two could interleave with whatever else holds this fd. */
 static void say(const char *text) {
     size_t left = strlen(text);
     const char *at = text;
     while (left > 0) {
-        ssize_t wrote = write(STDERR_FILENO, at, left);
+        ssize_t wrote = write(report_fd, at, left);
         if (wrote <= 0) {
             if (errno == EINTR) continue;
             return;
@@ -118,38 +134,34 @@ static void take_nonce(void) {
     fatal("no AJ_SHIM_NONCE in the environment");
 }
 
-/* The output cap, taken from the environment and then removed from it.
+/* The report's channel, taken from the environment and then removed from it.
  *
- * **Scrubbed like the nonce, and for a weaker reason.** Knowing the cap tells a
- * submission nothing it could not learn by writing until it dies, but the
- * environment it is handed should carry only what it needs, and leaving one of
- * ours in there invites the next one to be left too.
+ * **Scrubbed like the nonce**, for a weaker reason: a submission that learnt the
+ * path could open it and write a line of its own, and although the nonce is
+ * what makes such a line ignorable, a channel it cannot name is one it cannot
+ * try. Absent means stderr, which is where the report went until 2026-09-05.
  *
- * Absent means no cap, which is what every unmeasured step wants. */
-static rlim_t take_output_cap(void) {
-    static const char key[] = "AJ_SHIM_MAX_OUTPUT=";
+ * A path that is given and cannot be opened is fatal. There is no third
+ * behaviour: a Runner that named a channel is waiting on it, and a shim that
+ * quietly wrote somewhere else would leave that Runner waiting for ever. */
+static void take_report_channel(void) {
+    static const char key[] = "AJ_SHIM_REPORT=";
     for (char **entry = environ; *entry != NULL; entry++) {
         if (strncmp(*entry, key, sizeof key - 1) != 0) continue;
 
         char *value = *entry + sizeof key - 1;
-        errno = 0;
-        char *end = NULL;
-        unsigned long long bytes = strtoull(value, &end, 10);
-        if (errno != 0 || end == value || *end != '\0') {
-            errno = EINVAL;
-            fatal("AJ_SHIM_MAX_OUTPUT is not a number of bytes");
-        }
-        unsetenv("AJ_SHIM_MAX_OUTPUT");
-        return (rlim_t)bytes;
+        char path[512];
+        snprintf(path, sizeof path, "%s", value);
+        memset(value, 'x', strlen(value));
+        unsetenv("AJ_SHIM_REPORT");
+
+        int fd = open(path, O_WRONLY | O_CLOEXEC);
+        if (fd < 0) fatal("cannot open the report channel");
+        report_fd = fd;
+        return;
     }
-    return 0;
 }
 
-/* **Verified, and fatal if it did not take.** A drop that silently fails would
- * run a submission as root, so every failure here has to stop the run rather
- * than continue into `execve`. Where this already runs unprivileged the calls
- * are no-ops that succeed, which is correct: the submission ends up as the same
- * user either way. */
 static void become_the_submission(void) {
     if (getuid() == 0) {
         if (setgroups(0, NULL) != 0) fatal("setgroups");
@@ -200,16 +212,23 @@ int main(int argc, char **argv) {
     }
 
     take_nonce();
-    rlim_t cap = take_output_cap();
+
+    /* **Output, then the report, then the input, and the order is the point.**
+     *
+     * Every one of these may be a named pipe, and opening one for writing waits
+     * until somebody opens the reading end. So the report channel is opened
+     * before the input: a shim that blocked on an input nobody was feeding, and
+     * only then found it had nowhere to complain, would fail silently.
+     *
+     * The output is opened first because it is the one the Runner is certainly
+     * waiting on -- it opened that end before the container was started. */
+    int output = open(argv[2], O_WRONLY | O_CLOEXEC);
+    if (output < 0) fatal("cannot open the output");
+
+    take_report_channel();
 
     int input = open(argv[1], O_RDONLY | O_CLOEXEC);
     if (input < 0) fatal("cannot open the input file");
-
-    /* **Opened here, as root, and never named to the submission.** 0600 so that
-     * nothing else in the container can read back what was written -- a checker
-     * runs in a container of its own and gets the file from the Runner. */
-    int output = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (output < 0) fatal("cannot open the output file");
 
     struct timeval began;
     gettimeofday(&began, NULL);
@@ -224,15 +243,33 @@ int main(int argc, char **argv) {
         if (dup2(input, STDIN_FILENO) < 0) fatal("dup2 the input onto stdin");
         if (dup2(output, STDOUT_FILENO) < 0) fatal("dup2 the output onto stdout");
 
-        /* **Before the drop, so it cannot be raised again.** A limit set as root
-         * and then inherited across `setuid` is a limit the submission has no
-         * way back over: `RLIMIT_FSIZE` may only be raised towards the hard
-         * limit, and this sets both. `SIGXFSZ` then arrives on the write that
-         * would have crossed it. */
-        if (cap > 0) {
-            struct rlimit fsize = {.rlim_cur = cap, .rlim_max = cap};
-            if (setrlimit(RLIMIT_FSIZE, &fsize) != 0) fatal("setrlimit RLIMIT_FSIZE");
+        /* **The submission's own stderr goes nowhere.**
+         *
+         * Nothing reads it: a judged run's stderr is surfaced by no screen, no
+         * document and no attachment -- only a *build* container's is, and that
+         * is a different container. Until now it was collected and thrown away,
+         * which cost the daemon a write per byte for something nobody would
+         * ever see.
+         *
+         * The shim's own stderr is untouched, and after this the two are not
+         * the same descriptor: `report_fd` was resolved before the fork. */
+        /* **Move the report out of the way first, where it is still stderr.**
+         * With no channel named, `report_fd` *is* descriptor 2 -- and the very
+         * next line puts `/dev/null` there. Without this the child's own
+         * "failed exec" line, which is how a program that is not there is
+         * reported at all, would be written into nothing.
+         *
+         * Close-on-exec, because a submission that does start has no business
+         * holding it. */
+        if (report_fd == STDERR_FILENO) {
+            int kept = fcntl(report_fd, F_DUPFD_CLOEXEC, 3);
+            if (kept < 0) fatal("cannot keep the report channel");
+            report_fd = kept;
         }
+
+        int nowhere = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (nowhere < 0) fatal("cannot open /dev/null for the submission's stderr");
+        if (dup2(nowhere, STDERR_FILENO) < 0) fatal("dup2 /dev/null onto stderr");
 
         become_the_submission();
         /* **`execvp`, because the catalogue names `python3` and not a path.**
@@ -251,6 +288,16 @@ int main(int argc, char **argv) {
          * comes back as the code it always did. */
         _exit(errno == ENOENT ? NOT_FOUND : EXEC_FAILED);
     }
+
+    /* **The parent lets go of both, and that is what makes an end an end.**
+     *
+     * These are the child's now. While the shim still holds the writing end of
+     * the output, a reader sees no end-of-file however long ago the program
+     * finished -- it would arrive when the shim exits, which is after the
+     * report, which is after `wait4`. A reader that has to wait for that cannot
+     * decide anything early. */
+    close(input);
+    close(output);
 
     int status = 0;
     struct rusage used;
