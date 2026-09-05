@@ -143,6 +143,16 @@ has a test rather than a paragraph.
    is an owned mutex, so a program beside it asking for one of its own would wait
    for a run that is waiting for it.
 
+   That was two differences until 2026-09-05, and this document named one. The
+   `--cpuset-cpus` row above was applied to the judged run alone, so on a host an
+   operator had divided, **every build and every judge floated across the whole
+   machine** while the program being measured sat on its one processor. All five
+   containers carry the set now, and
+   `pipeline.rs::every_container_this_pipeline_starts_is_confined_to_the_runners_processors`
+   is what keeps a sixth from being added without it — a source check, because
+   the behaviour is only observable on a machine that has been divided up, which
+   neither a developer's nor CI's is.
+
 Two things that follow, and are easy to get wrong in the opposite direction:
 
 - **`/dev/shm` is writable and the profile does not ask for it.** The runtime

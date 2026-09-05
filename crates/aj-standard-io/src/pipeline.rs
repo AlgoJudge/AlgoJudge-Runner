@@ -319,6 +319,18 @@ impl<S: Sandbox> Pipeline<S> {
     ///
     /// **Given, not chosen.** Where the Runner may use the whole machine this
     /// adds nothing and the host's scheduler places the job.
+    /// **Every container this pipeline starts goes through here.**
+    ///
+    /// Five do: the submission's build, the judged run, a checker's or an
+    /// interactor's build, and the checker or interactor itself. Only the judged
+    /// run did until 2026-09-05, which left the other four ignoring an
+    /// operator's division of the host — on a machine cut into twelve, every
+    /// compiler and every judge floated across all sixteen processors while the
+    /// program being measured sat on one. `docs/SECURITY.md` said the division
+    /// was carried to the job containers, and it was carried to one of five.
+    ///
+    /// The two builds are the ones that mattered most: a compiler is the most
+    /// processor-hungry thing here, and a checker mostly waits on a pipe.
     fn pinned(&self, profile: Profile) -> Profile {
         pin(profile, self.cpus.as_deref())
     }
@@ -444,16 +456,18 @@ impl<S: Sandbox> Pipeline<S> {
             let built = self
                 .sandbox
                 .run(
-                    &Profile::new(&language.image, command)
-                        .memory_bytes(512 * 1024 * 1024)
-                        .pids(128)
-                        .wall_clock(Duration::from_secs(60))
-                        .max_output_bytes(BUILD_LOG_BYTES)
-                        .max_file_bytes(BUILD_ARTEFACT_BYTES as i64)
-                        .tmpfs_bytes(BUILD_TMPFS_BYTES)
-                        .writable_root()
-                        .collect(BUILD_OUTPUT, BUILD_ARTEFACT_BYTES)
-                        .mount(Mount::read_only(&source.on_host, SOURCE)),
+                    &self.pinned(
+                        Profile::new(&language.image, command)
+                            .memory_bytes(512 * 1024 * 1024)
+                            .pids(128)
+                            .wall_clock(Duration::from_secs(60))
+                            .max_output_bytes(BUILD_LOG_BYTES)
+                            .max_file_bytes(BUILD_ARTEFACT_BYTES as i64)
+                            .tmpfs_bytes(BUILD_TMPFS_BYTES)
+                            .writable_root()
+                            .collect(BUILD_OUTPUT, BUILD_ARTEFACT_BYTES)
+                            .mount(Mount::read_only(&source.on_host, SOURCE)),
+                    ),
                 )
                 .await
                 .map_err(|e| format!("the build could not be run: {e}"))?;
@@ -948,16 +962,18 @@ impl<S: Sandbox> Pipeline<S> {
         let built = self
             .sandbox
             .run(
-                &Profile::new(&language.image, language.build.clone().unwrap_or_default())
-                    .memory_bytes(512 * 1024 * 1024)
-                    .pids(128)
-                    .wall_clock(Duration::from_secs(60))
-                    .max_output_bytes(BUILD_LOG_BYTES)
-                    .max_file_bytes(BUILD_ARTEFACT_BYTES as i64)
-                    .tmpfs_bytes(BUILD_TMPFS_BYTES)
-                    .writable_root()
-                    .collect(BUILD_OUTPUT, BUILD_ARTEFACT_BYTES)
-                    .mount(Mount::read_only(&source.on_host, SOURCE)),
+                &self.pinned(
+                    Profile::new(&language.image, language.build.clone().unwrap_or_default())
+                        .memory_bytes(512 * 1024 * 1024)
+                        .pids(128)
+                        .wall_clock(Duration::from_secs(60))
+                        .max_output_bytes(BUILD_LOG_BYTES)
+                        .max_file_bytes(BUILD_ARTEFACT_BYTES as i64)
+                        .tmpfs_bytes(BUILD_TMPFS_BYTES)
+                        .writable_root()
+                        .collect(BUILD_OUTPUT, BUILD_ARTEFACT_BYTES)
+                        .mount(Mount::read_only(&source.on_host, SOURCE)),
+                ),
             )
             .await
             .map_err(|e| format!("the checker could not be built: {e}"))?;
@@ -1024,7 +1040,8 @@ impl<S: Sandbox> Pipeline<S> {
         let run = self
             .sandbox
             .run(
-                &Profile::new(
+                &self.pinned(
+                    Profile::new(
                     &interactor.image,
                     vec![
                         "/bin/sh".to_owned(),
@@ -1065,6 +1082,7 @@ impl<S: Sandbox> Pipeline<S> {
                 .mount(Mount::writable(&beside_them.on_host, ANSWER))
                 .mount(Mount::read_only(&interactor.at.on_host, PROGRAM))
                 .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT)),
+                ),
             )
             .await
             .map_err(|e| format!("the interactor could not be run: {e}"))?;
@@ -1099,34 +1117,36 @@ impl<S: Sandbox> Pipeline<S> {
         let run = self
             .sandbox
             .run(
-                &Profile::new(&checker.image, command)
-                    .memory_bytes(256 * 1024 * 1024)
-                    .pids(16)
-                    .wall_clock(CHECKER_WALL_CLOCK)
-                    .max_output_bytes(64 * 1024)
-                    // **Which test this is, said rather than parsed.** It is in
-                    // `argv[1]` already — `/in/2a.in` — so this adds nothing a
-                    // checker could not work out. What it removes is the working
-                    // out: the split of `2a` into a group and a letter is a rule of
-                    // the package format, and a checker deriving it again is that
-                    // rule copied into code we do not control and cannot correct.
-                    //
-                    // **Variables rather than a fourth argument**, because
-                    // `argv[1..3]` is SIO2's contract taken verbatim and a checker
-                    // moved from there must keep working untouched.
-                    .env(format!("AJ_TEST={test}"))
-                    .env(format!("AJ_GROUP={group}"))
-                    .mount(Mount::read_only(&checker.at.on_host, PROGRAM))
-                    .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT))
-                    // **Alongside, and this is the flag that stops a hard
-                    // deadlock.** The judged run holds the measurement gate for
-                    // its whole length, and on the systemd cgroup driver that
-                    // gate is an owned mutex — a checker asking for one of its
-                    // own would wait for a run that is waiting for it.
-                    .alongside()
-                    // Read-only, and a pipe opened for reading is a read: what
-                    // the mount refuses is creating or replacing the name.
-                    .mount(Mount::read_only(&beside_them.on_host, ANSWER)),
+                &self.pinned(
+                    Profile::new(&checker.image, command)
+                        .memory_bytes(256 * 1024 * 1024)
+                        .pids(16)
+                        .wall_clock(CHECKER_WALL_CLOCK)
+                        .max_output_bytes(64 * 1024)
+                        // **Which test this is, said rather than parsed.** It is in
+                        // `argv[1]` already — `/in/2a.in` — so this adds nothing a
+                        // checker could not work out. What it removes is the working
+                        // out: the split of `2a` into a group and a letter is a rule of
+                        // the package format, and a checker deriving it again is that
+                        // rule copied into code we do not control and cannot correct.
+                        //
+                        // **Variables rather than a fourth argument**, because
+                        // `argv[1..3]` is SIO2's contract taken verbatim and a checker
+                        // moved from there must keep working untouched.
+                        .env(format!("AJ_TEST={test}"))
+                        .env(format!("AJ_GROUP={group}"))
+                        .mount(Mount::read_only(&checker.at.on_host, PROGRAM))
+                        .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT))
+                        // **Alongside, and this is the flag that stops a hard
+                        // deadlock.** The judged run holds the measurement gate for
+                        // its whole length, and on the systemd cgroup driver that
+                        // gate is an owned mutex — a checker asking for one of its
+                        // own would wait for a run that is waiting for it.
+                        .alongside()
+                        // Read-only, and a pipe opened for reading is a read: what
+                        // the mount refuses is creating or replacing the name.
+                        .mount(Mount::read_only(&beside_them.on_host, ANSWER)),
+                ),
             )
             .await
             .map_err(|e| format!("the checker could not be run: {e}"))?;
@@ -1622,6 +1642,29 @@ mod tests {
     #[test]
     fn a_runner_that_was_given_no_processors_in_particular_pins_none() {
         assert_eq!(pin(a_run(), None).cpuset, None);
+    }
+
+    /// **Every profile this file builds is pinned, and this is what says so.**
+    ///
+    /// A source check rather than a behavioural one, because the behaviour is
+    /// only observable on a host that has been divided up — which neither a
+    /// developer's machine nor CI is, so a container test would pass on both
+    /// while the property was false. Reading the source is what is left.
+    ///
+    /// It caught four of five call sites on 2026-09-05: only the judged run was
+    /// pinned, so every compiler and every judge escaped the operator's cpuset.
+    #[test]
+    fn every_container_this_pipeline_starts_is_confined_to_the_runners_processors() {
+        let source = include_str!("pipeline.rs");
+        let production = &source[..source.find("#[cfg(test)]").expect("a test module")];
+
+        let built = production.matches("Profile::new(").count();
+        let pinned = production.matches("self.pinned(").count();
+        assert_eq!(
+            built, pinned,
+            "{built} profiles are built and {pinned} are pinned; a container that \
+             skips `pinned` ignores an operator's division of the host",
+        );
     }
 
     /// And a Runner that *was* given a set hands that set on, because a job
