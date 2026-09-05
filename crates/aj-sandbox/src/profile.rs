@@ -250,6 +250,14 @@ impl Pipes {
     /// What the submission's own output travels on.
     pub const OUTPUT: &'static str = "stdout";
 
+    /// What a submission's standard input travels on, where it has one.
+    ///
+    /// **Only an interactive problem has one.** Everywhere else the input is a
+    /// file the package brought, mounted read-only, which is what makes a batch
+    /// problem reproducible; this is the channel that exists when the input is
+    /// being written by something reading the answers.
+    pub const INPUT: &'static str = "stdin";
+
     /// What the shim's measurement report travels on.
     ///
     /// **Its own channel, and that is the point of it.** The report used to

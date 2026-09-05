@@ -12,13 +12,16 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aj_package::{Config, TestSet};
-use aj_sandbox::pipes::{open_for_writing, release, Fifo};
+use aj_sandbox::pipes::{open_for_writing, release, release_writer, Fifo};
 use aj_sandbox::{Beside, Enough, Mount, Pipes, Profile, Sandbox, Stopped};
 
 use crate::checker::{checker_said, Broken};
 use crate::compare::{Comparing, Comparison};
 use crate::details::{compiled, failed_to_compile, Compilation, Details, Limits};
-use crate::language::{self, Images, ANSWER, BUILD_OUTPUT, INPUT, OUTPUT, PROGRAM, SOURCE};
+use crate::language::{
+    self, Images, ANSWER, BUILD_OUTPUT, FROM_THE_JUDGE, INPUT, OUTPUT, PROGRAM, SOURCE,
+    TO_THE_JUDGE, VERDICT,
+};
 use crate::score::{judge, Judgement, Reason, Status, TestOutcome};
 
 /// The scratch a compiler is given, for **every** build.
@@ -212,10 +215,22 @@ pub struct Job<'a> {
 /// assumption held while `cpp` was the only compiled language there was; it
 /// stopped holding the moment a package could name `cpp17-clang` — or `python3`,
 /// where starting `/program/program` would try to execute a `.py` file.
-struct Checker {
+struct Built {
     at: Places,
     image: String,
     start: Vec<String>,
+}
+
+/// The program beside the submission, and which of the two things it is.
+///
+/// **One build and two wirings.** A checker and an interactor are the same
+/// artefact — a program the package author wrote, compiled in a language image,
+/// run in its own container — and they differ only in what is connected to it.
+/// A checker is handed the answer and asked about it; an interactor is handed
+/// the submission's questions and produces the answers to them.
+enum Aside {
+    Checker(Built),
+    Interactor(Built),
 }
 
 /// A submission that was actually judged.
@@ -441,9 +456,13 @@ impl<S: Sandbox> Pipeline<S> {
         }
 
         // ── the checker, which is also untrusted-adjacent ───────────────────
-        let checker = match &job.config.checker {
-            None => None,
-            Some(declared) => Some(self.build_checker(job, declared).await?),
+        // Refused together in `Config::validated`, so at most one arm is taken.
+        let aside = match (&job.config.checker, &job.config.interactor) {
+            (Some(declared), _) => Some(Aside::Checker(self.build_checker(job, declared).await?)),
+            (_, Some(declared)) => {
+                Some(Aside::Interactor(self.build_checker(job, declared).await?))
+            }
+            (None, None) => None,
         };
 
         // ── each test, in its own container ─────────────────────────────────
@@ -499,29 +518,46 @@ impl<S: Sandbox> Pipeline<S> {
             // tokenises them itself; with one it passes them straight on to a
             // second pipe the checker is reading.
             //
-            // 0644, where the submission's own channels are 0600: the checker
-            // runs unprivileged and has to be able to open this, and there is
-            // nothing in it to hide from a program that produced it.
-            let answer = match &checker {
-                Some(_) => Some(
-                    Fifo::make(beside_them.here.join(format!("{}.out", test.name)), 0o644)
-                        .map_err(|e| {
-                            format!(
-                                "test {}: the answer channel could not be made: {e}",
-                                test.name
-                            )
-                        })?,
-                ),
-                None => None,
+            // 0666, where the submission's own channels are 0600: whatever is
+            // beside it runs unprivileged and has to open these, and there is
+            // nothing in them to hide from the program on the other end.
+            let channel = |at: &std::path::Path| {
+                Fifo::make(at, 0o666)
+                    .map_err(|e| format!("test {}: a channel could not be made: {e}", test.name))
             };
-            let watching = match &answer {
-                Some(answer) => Watching::Relay(answer.path().to_path_buf()),
+
+            // What the far side is given, by role. A checker reads one channel
+            // and is done; an interactor reads one, writes another, and says
+            // what it decided on a third.
+            let beside_channels = match &aside {
+                Some(Aside::Checker(_)) => vec![channel(
+                    &beside_them.here.join(format!("{}.out", test.name)),
+                )?],
+                Some(Aside::Interactor(_)) => vec![
+                    channel(&beside_them.here.join(TO_THE_JUDGE))?,
+                    channel(&beside_them.here.join(FROM_THE_JUDGE))?,
+                    channel(&beside_them.here.join(VERDICT))?,
+                ],
+                None => Vec::new(),
+            };
+
+            let watching = match &aside {
+                Some(_) => Watching::Relay(beside_channels[0].path().to_path_buf()),
                 None => Watching::Against(
                     String::from_utf8_lossy(
                         &std::fs::read(&test.expected).map_err(|e| e.to_string())?,
                     )
                     .into_owned(),
                 ),
+            };
+
+            // **The submission's own standard input**, and it exists only for an
+            // interactive problem. Everywhere else the input is a file the
+            // package brought, mounted read-only — which is what makes a batch
+            // problem reproducible and is not being changed.
+            let feeding = match &aside {
+                Some(Aside::Interactor(_)) => Some(channel(&channels.here.join(Pipes::INPUT))?),
+                _ => None,
             };
             let beside = Beside::new();
             let reading = relay(
@@ -530,15 +566,28 @@ impl<S: Sandbox> Pipeline<S> {
                 OUTPUT_CAP,
                 beside.clone(),
             );
+            let feeding = feeding.map(|stdin| {
+                (
+                    feed(
+                        beside_them.here.join(FROM_THE_JUDGE),
+                        stdin.path().to_path_buf(),
+                        beside.clone(),
+                    ),
+                    stdin,
+                )
+            });
 
             // Bound rather than passed as a temporary: the future below holds
             // a reference to it for as long as it runs.
             let judged = self.pinned(
                 Profile::new(
                     &language.image,
-                    language::with_input(
+                    language::with_channels(
                         &language.start,
-                        &test.name,
+                        &match &feeding {
+                            Some(_) => format!("{OUTPUT}/{}", Pipes::INPUT),
+                            None => language::test_input(&test.name),
+                        },
                         &format!("{OUTPUT}/{}", Pipes::OUTPUT),
                     ),
                 )
@@ -571,11 +620,16 @@ impl<S: Sandbox> Pipeline<S> {
             // clock, both are removed by the sandbox on every path out, and a
             // failure in either has to be reported rather than abandoned.
             let running = self.sandbox.run_beside(&judged, &beside);
-            let (run, checked) = match &checker {
-                Some(built) => {
+            let (run, said) = match &aside {
+                Some(Aside::Checker(built)) => {
                     let checking = self.check(job, built, &beside_them, &test.name);
-                    let (run, checked) = tokio::join!(running, checking);
-                    (run, Some(checked))
+                    let (run, said) = tokio::join!(running, checking);
+                    (run, Some(said))
+                }
+                Some(Aside::Interactor(built)) => {
+                    let interacting = self.interact(job, built, &beside_them, &test.name);
+                    let (run, said) = tokio::join!(running, interacting);
+                    (run, Some(said))
                 }
                 None => (running.await, None),
             };
@@ -585,6 +639,15 @@ impl<S: Sandbox> Pipeline<S> {
             // started will never answer; leaving by a `?` would leak one per
             // failed test for the life of the Runner.
             release(output.path());
+            if let Some((feeding, stdin)) = feeding {
+                // Nothing is going to write the far end now, and nothing is
+                // going to read this one. Both halves of the thread's wait have
+                // to be ended, or it is a thread held for the life of the
+                // Runner.
+                release(&beside_them.here.join(FROM_THE_JUDGE));
+                release_writer(stdin.path());
+                let _ = feeding.await;
+            }
             let produced = reading
                 .await
                 .map_err(|e| format!("test {}: the output was not read: {e}", test.name))?;
@@ -721,9 +784,9 @@ impl<S: Sandbox> Pipeline<S> {
                 continue;
             }
 
-            let (status, percentage, note) = match checked {
-                Some(checked) => {
-                    match checked? {
+            let (status, percentage, note) = match said {
+                Some(said) => {
+                    match said? {
                         Ok(said) => (
                             if said.accepted {
                                 Status::Ok
@@ -798,7 +861,7 @@ impl<S: Sandbox> Pipeline<S> {
         &self,
         job: &Job<'_>,
         declared: &aj_package::config::Source,
-    ) -> Result<Checker, String> {
+    ) -> Result<Built, String> {
         let language = language::for_id(&declared.language, &self.images).ok_or_else(|| {
             format!(
                 "the checker is in {}, which this Runner does not build",
@@ -846,7 +909,7 @@ impl<S: Sandbox> Pipeline<S> {
             ));
         }
         unpack(&built.collected, &built_into.here)?;
-        Ok(Checker {
+        Ok(Built {
             at: output,
             image: language.image.clone(),
             start: language.start.clone(),
@@ -858,10 +921,90 @@ impl<S: Sandbox> Pipeline<S> {
     /// It comes from a package a manager authored, not from the platform, so it
     /// is untrusted-adjacent: it gets limits and no network like anything else,
     /// and it never runs in the Runner's process.
+    /// Runs an interactor beside the submission and reads what it decided.
+    ///
+    /// **The same contract as a checker, seen from the other side.** `argv[1]`
+    /// is still the test's input and `argv[3]` still the reference answer; what
+    /// changes is `argv[2]`, which a checker *reads* — the participant's output
+    /// — and an interactor *writes*: the `OK`/`WRONG` document. So
+    /// [`checker_said`] and [`Broken`] are reused unchanged, and the rule that a
+    /// non-zero exit is a broken package rather than a wrong answer covers an
+    /// interactor for free.
+    ///
+    /// The conversation itself is this program's own standard input and output,
+    /// redirected by the shell onto two channels the Runner made. It never has
+    /// the submission's own descriptors: everything is copied by [`relay`] one
+    /// way and [`feed`] the other, which is what keeps the byte counter, the
+    /// output cap and the early kill in trusted code.
+    async fn interact(
+        &self,
+        job: &Job<'_>,
+        interactor: &Built,
+        beside_them: &Places,
+        test: &str,
+    ) -> Result<Result<crate::checker::Checked, Broken>, String> {
+        let mut command = interactor.start.clone();
+        command.extend([
+            format!("{INPUT}/{test}.in"),
+            format!("{ANSWER}/{VERDICT}"),
+            format!("{INPUT}/{test}.out"),
+        ]);
+        let spoken = command
+            .iter()
+            .map(|part| format!("'{}'", part.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Read before the run is awaited, because the interactor may write its
+        // verdict and exit while the submission is still being stopped.
+        let reading = read_channel(beside_them.here.join(VERDICT));
+
+        let run = self
+            .sandbox
+            .run(
+                &Profile::new(
+                    &interactor.image,
+                    vec![
+                        "/bin/sh".to_owned(),
+                        "-c".to_owned(),
+                        format!(
+                            "exec {spoken} < '{ANSWER}/{TO_THE_JUDGE}' > '{ANSWER}/{FROM_THE_JUDGE}'"
+                        ),
+                    ],
+                )
+                .memory_bytes(256 * 1024 * 1024)
+                .pids(16)
+                .wall_clock(CHECKER_WALL_CLOCK)
+                .max_output_bytes(64 * 1024)
+                // See `check`: this is what keeps the systemd cgroup driver's
+                // gate from deadlocking two runs against each other.
+                .alongside()
+                // **Writable, where a checker's is read-only.** An interactor
+                // opens two of these for writing, and a read-only bind refuses
+                // that even for a pipe. What is in the directory is three
+                // channels the Runner made and nothing else.
+                .mount(Mount::writable(&beside_them.on_host, ANSWER))
+                .mount(Mount::read_only(&interactor.at.on_host, PROGRAM))
+                .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT)),
+            )
+            .await
+            .map_err(|e| format!("the interactor could not be run: {e}"))?;
+
+        release(&beside_them.here.join(VERDICT));
+        let verdict = reading
+            .await
+            .map_err(|e| format!("the interactor's verdict was not read: {e}"))?;
+
+        if run.stopped != Stopped::OnItsOwn {
+            return Err(format!("the interactor was stopped: {:?}", run.stopped));
+        }
+        Ok(checker_said(run.exit_code, &verdict))
+    }
+
     async fn check(
         &self,
         job: &Job<'_>,
-        checker: &Checker,
+        checker: &Built,
         beside_them: &Places,
         test: &str,
     ) -> Result<Result<crate::checker::Checked, Broken>, String> {
@@ -1043,6 +1186,50 @@ fn relay(
         Produced {
             found: comparing.map(|comparing| comparing.finish()),
             capped,
+        }
+    })
+}
+
+/// Reads one channel to its end, on a thread of its own.
+fn read_channel(at: PathBuf) -> tokio::task::JoinHandle<Vec<u8>> {
+    tokio::task::spawn_blocking(move || std::fs::read(&at).unwrap_or_default())
+}
+
+/// Carries what the interactor says back to the submission.
+///
+/// **The mirror of [`relay`], and it exists for the same reason.** The
+/// submission is never wired to package-authored code in either direction: what
+/// reaches its standard input is copied here, by the Runner, out of a second
+/// pipe. That is what makes both halves of a conversation countable, and
+/// countable is what the reaper needs — an interactive run spends most of its
+/// time with neither side on a processor, and only a byte moving tells that
+/// apart from a run that has wedged.
+fn feed(from: PathBuf, to: PathBuf, beside: Beside) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read as _, Write as _};
+
+        // The far end first, exactly as the forward relay does: the submission
+        // is blocked opening its input, and it is the interactor's arrival that
+        // has to be waited for, not the submission's.
+        let Ok(mut said) = std::fs::File::open(&from) else {
+            return;
+        };
+        let Ok(mut onward) = open_for_writing(&to, CHECKER_WALL_CLOCK) else {
+            return;
+        };
+
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            let read = match said.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            beside.moved(read);
+            // The submission is gone, or has closed its input. Neither is this
+            // side's business to report.
+            if onward.write_all(&buffer[..read]).is_err() {
+                break;
+            }
         }
     })
 }

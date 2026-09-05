@@ -93,6 +93,22 @@ pub fn open_for_writing(at: &Path, waiting: Duration) -> io::Result<std::fs::Fil
     }
 }
 
+/// Lets go of a writer waiting for a reader that will never come.
+///
+/// **The mirror of [`release`], and the asymmetry is only in the flags.** A
+/// non-blocking `O_RDONLY` open of a pipe succeeds whether or not anybody is
+/// writing — there is no `ENXIO` in this direction — so this both wakes a
+/// blocked writer and returns at once. Which matters: the caller is an async
+/// task, and a blocking open here would be the whole runtime waiting on a
+/// container that has already gone.
+pub fn release_writer(at: &Path) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let _ = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(at);
+}
+
 /// One named pipe, removed when this is dropped.
 ///
 /// **Ownership is what the type is for.** A FIFO left behind is a few bytes,

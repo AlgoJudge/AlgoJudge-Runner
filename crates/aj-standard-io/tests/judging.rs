@@ -40,6 +40,59 @@ groups:
 "#;
 
 /// Adds two numbers, correctly.
+/// Guesses a number by halving, and flushes every question.
+const GUESSING: &str = r#"
+#include <cstdio>
+int main() {
+    long long lo = 0, hi = 4000000;
+    for (;;) {
+        long long mid = lo + (hi - lo) / 2;
+        printf("? %lld\n", mid);
+        fflush(stdout);
+        char said = 0;
+        if (scanf(" %c", &said) != 1) return 0;
+        if (said == 61) return 0;
+        if (said == 60) hi = mid - 1; else lo = mid + 1;
+    }
+}
+"#;
+
+/// The other side of it: thinks of the test's own answer and says higher or
+/// lower, then writes its verdict where `argv[2]` points.
+const ASKING: &str = r#"
+#include <cstdio>
+int main(int argc, char** argv) {
+    if (argc < 4) return 1;
+    FILE* in = fopen(argv[1], "r");
+    long long a = 0, b = 0;
+    if (!in || fscanf(in, "%lld %lld", &a, &b) != 2) return 1;
+    long long secret = a + b;
+    FILE* say = fopen(argv[2], "w");
+    if (!say) return 1;
+    int asked = 0;
+    for (;;) {
+        char q = 0; long long guess = 0;
+        if (scanf(" %c %lld", &q, &guess) != 2) {
+            fprintf(say, "WRONG\nstopped asking\n");
+            break;
+        }
+        if (++asked > 40) {
+            fprintf(say, "WRONG\ntoo many questions\n");
+            break;
+        }
+        if (guess == secret) {
+            printf("=\n"); fflush(stdout);
+            fprintf(say, "OK\nfound it in %d questions\n", asked);
+            break;
+        }
+        printf(guess > secret ? "<\n" : ">\n");
+        fflush(stdout);
+    }
+    fclose(say);
+    return 0;
+}
+"#;
+
 const CORRECT_CPP: &str = r#"
 #include <iostream>
 int main() { long long a, b; std::cin >> a >> b; std::cout << a + b << "\n"; }
@@ -901,6 +954,137 @@ int main(int argc, char** argv) {
          not the shape of a run that was stopped: {document}"
     );
     assert_eq!(judged.judgement.score, judged.judgement.max_score);
+}
+
+/// A package like [`package`], judged by an interactor of the caller's own.
+async fn judge_interactive(name: &str, source: &str, interactor: &str) -> Evaluated {
+    let pipeline = pipeline().await;
+    let (package, _, _) = package(name);
+
+    std::fs::create_dir_all(package.here.join("checker")).unwrap();
+    std::fs::write(package.here.join("checker/checker.cpp"), interactor).unwrap();
+    let declared = format!("{CONFIG}interactor:\n  source: checker/checker.cpp\n  language: cpp\n");
+    std::fs::write(package.here.join("config.yml"), &declared).unwrap();
+
+    let config = Config::parse(&declared).unwrap();
+    let tests = TestSet::read(&package.here, &config).unwrap();
+
+    let w = work(name);
+    pipeline
+        .evaluate(&Job {
+            config: &config,
+            tests: &tests,
+            language: "cpp",
+            file_name: "main.cpp",
+            source: source.as_bytes(),
+            package,
+            work: w,
+            pipes: None,
+        })
+        .await
+}
+
+/// **An interactive problem is judged, and both directions carry.**
+///
+/// The submission is told nothing at the start: its standard input is a pipe
+/// with the interactor on the far end, and every number it reads is one the
+/// interactor decided to send after reading what it wrote. Twenty-odd round
+/// trips per test, so a wiring that works once and then stalls fails here.
+///
+/// **The Runner is in the middle of both directions** and neither program holds
+/// the other's descriptors. That is what makes the traffic countable, which is
+/// what lets a run be told apart from a wedged one: an interactive run spends
+/// most of its life with neither side on a processor.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn an_interactor_judges_a_conversation() {
+    let judged = verdict(judge_interactive("cpp-guessing", GUESSING, ASKING).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+
+    assert_eq!(
+        judged.judgement.verdict, "Accepted",
+        "the guesser found every number: {document}"
+    );
+    assert_eq!(judged.judgement.score, judged.judgement.max_score);
+    assert!(
+        document["tests"][0]["note"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("found it in"),
+        "the interactor's own comment reaches the participant: {document}"
+    );
+}
+
+/// **An interactor that has heard enough stops the submission**, exactly as a
+/// checker does: it exits, its end of the conversation closes, and the Runner
+/// turns the failed write into a kill.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn an_interactor_that_gives_up_stops_the_submission() {
+    // Asks the same question forever and never listens to the answer.
+    let deaf = r#"
+#include <cstdio>
+int main() {
+    for (;;) { printf("? 1\n"); fflush(stdout); }
+}
+"#;
+    let judged = verdict(judge_interactive("cpp-deaf", deaf, ASKING).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    let first = &document["tests"][0];
+
+    assert_eq!(
+        first["reason"], "wrongAnswer",
+        "the interactor gave up on it, and that is a verdict about the answer \
+         rather than about the machinery: {document}"
+    );
+
+    // The limit these tests are judged under.
+    const LIMIT_MS: u64 = 2000;
+    let spent = first["timeMs"].as_u64().unwrap_or(LIMIT_MS);
+    assert!(
+        spent < LIMIT_MS,
+        "a program that never stops reported {spent} ms of {LIMIT_MS} ms: {document}"
+    );
+}
+
+/// **A program that does not flush deadlocks, and the judge has to say which
+/// kind of stuck it is.**
+///
+/// This is the one failure an interactive problem has that a batch problem does
+/// not, and the one a participant cannot debug from a bare "time limit": their
+/// program is not slow, it is holding its question in a buffer while the
+/// interactor waits for it. Neither side spends a processor, so it is the
+/// reaper's no-progress deadline that ends it — and the note it writes is the
+/// only thing telling them where to look.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_submission_that_never_flushes_is_a_time_limit_with_no_processor_time() {
+    let unflushed = r#"
+#include <cstdio>
+int main() {
+    long long lo = 0, hi = 4000000;
+    for (;;) {
+        long long mid = lo + (hi - lo) / 2;
+        printf("? %lld\n", mid);
+        char said = 0;
+        if (scanf(" %c", &said) != 1) return 0;
+        if (said == 61) return 0;
+        if (said == 60) hi = mid - 1; else lo = mid + 1;
+    }
+}
+"#;
+    let judged = verdict(judge_interactive("cpp-unflushed", unflushed, ASKING).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    let first = &document["tests"][0];
+
+    assert_eq!(first["reason"], "timeLimit", "{document}");
+    assert!(
+        first["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no processor time"),
+        "the note has to separate a slow program from a stuck one: {document}"
+    );
 }
 
 // ── Every other outcome a participant can get ───────────────────────────────

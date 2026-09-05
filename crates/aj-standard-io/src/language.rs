@@ -135,6 +135,18 @@ pub const OUTPUT: &str = "/aj-out";
 /// to rewrite behind the checker's back.
 pub const ANSWER: &str = "/answers";
 
+/// What an interactor reads: everything the submission wrote.
+pub const TO_THE_JUDGE: &str = "to-the-judge";
+/// What an interactor writes: everything the submission reads.
+pub const FROM_THE_JUDGE: &str = "from-the-judge";
+/// Where an interactor says what it decided.
+///
+/// **A channel and not its standard output**, because its standard output is
+/// already spoken for: it is one half of the conversation. A file would want a
+/// writable mount and a directory somebody owns; a pipe is the same machinery as
+/// everything else here and needs neither.
+pub const VERDICT: &str = "verdict";
+
 // ── the images, by key ──────────────────────────────────────────────────────
 
 /// GCC, and the image a package's C or C++ checker is built and run in.
@@ -520,26 +532,30 @@ fn quoted(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
 }
 
-/// Wraps a start command so the test's input arrives on standard input, through
-/// the measuring shim where the image has one.
+/// Where a batch problem's input comes from: the file the package brought.
+pub fn test_input(test: &str) -> String {
+    format!("{INPUT}/{test}.in")
+}
+
+/// Wraps a start command so the submission reads one channel and writes another,
+/// through the measuring shim.
 ///
-/// **`exec` in both arms, and that is what makes the test free.** The shell
-/// replaces itself either way, so it is not a second process in the accounting
-/// and not a second entry against the process limit; what it spends deciding is
-/// inside the cgroup's total and outside the shim's report, which is the right
-/// side of each. Without a shim this is exactly what it has always been: the
-/// program as PID 1 with its input redirected.
+/// **Two paths and no knowledge of what is behind them**, which is what lets one
+/// function serve both kinds of problem. For a batch problem the input is a file
+/// the package brought; for an interactive one it is a pipe with an interactor
+/// on the far end. The shim opens what it is given either way.
 ///
-/// The shim is not probed for. An image may be an operator's own -- the
-/// catalogue lets a toolchain name one -- so the absence has to be handled where
-/// the command is built rather than by a capability the Runner remembers.
-pub fn with_input(start: &[String], test: &str, output: &str) -> Vec<String> {
+/// **`exec`, and that is what makes the shell free.** It replaces itself, so it
+/// is not a second process in the accounting and not a second entry against the
+/// process limit; what it spends deciding is inside the cgroup's total and
+/// outside the shim's report, which is the right side of each.
+pub fn with_channels(start: &[String], input: &str, output: &str) -> Vec<String> {
     let program = start
         .iter()
         .map(|part| quoted(part))
         .collect::<Vec<_>>()
         .join(" ");
-    let input = quoted(&format!("{INPUT}/{test}.in"));
+    let input = quoted(input);
     let output = quoted(output);
     // **There is no branch any more, and that is the change of 2026-09-05.**
     // It used to fall back to running the program directly when the image had
@@ -695,9 +711,9 @@ mod tests {
 
     #[test]
     fn the_shim_is_given_the_input_and_the_output_in_that_order() {
-        let script = with_input(
+        let script = with_channels(
             &["python3".into(), "/program/program.py".into()],
-            "1a",
+            &test_input("1a"),
             "/aj-out/stdout",
         )
         .pop()
@@ -731,9 +747,13 @@ mod tests {
     /// wrong answer for every test in the package.
     #[test]
     fn nothing_but_the_shim_and_no_shell_behind_it() {
-        let script = with_input(&["/program/program".into()], "0a", "/aj-out/stdout")
-            .pop()
-            .unwrap();
+        let script = with_channels(
+            &["/program/program".into()],
+            &test_input("0a"),
+            "/aj-out/stdout",
+        )
+        .pop()
+        .unwrap();
 
         assert!(script.starts_with("exec "), "got {script}");
         assert_eq!(script.matches("exec ").count(), 1, "got {script}");
