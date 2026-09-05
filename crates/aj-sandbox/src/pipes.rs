@@ -18,6 +18,7 @@
 use std::ffi::CString;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Lets go of a reader waiting for a writer that will never come.
 ///
@@ -32,6 +33,64 @@ pub fn release(at: &Path) {
         .write(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(at);
+}
+
+/// Opens a pipe for writing, waiting for the far end to arrive.
+///
+/// **Non-blocking and retried, rather than a blocking open, and the asymmetry
+/// with the reader is deliberate.** A reader blocked on an open can be let go
+/// by opening the writing end for an instant — see [`release`] — because that
+/// is a thing the Runner can do on its own. A writer blocked on an open needs
+/// somebody to open the *reading* end, and the only candidate is the container
+/// that failed to start. So the wait is bounded here instead of relying on a
+/// rescue that would have to come from the thing that went wrong.
+///
+/// `ENXIO` is the whole of the retry: it is what a non-blocking `O_WRONLY` open
+/// says when no reader has the pipe open yet, and it is indistinguishable from
+/// success arriving a millisecond later.
+///
+/// `O_NONBLOCK` is cleared once it is open, so the writes that follow **block**
+/// when the pipe is full. That is the back-pressure the whole arrangement rests
+/// on: a full pipe must stop the producer, not spin the Runner on `EAGAIN`.
+pub fn open_for_writing(at: &Path, waiting: Duration) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::io::AsRawFd as _;
+
+    let until = std::time::Instant::now() + waiting;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(at)
+        {
+            Ok(open) => {
+                // SAFETY: the descriptor is open and owned by `open`.
+                unsafe {
+                    let flags = libc::fcntl(open.as_raw_fd(), libc::F_GETFL);
+                    if flags < 0
+                        || libc::fcntl(open.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK)
+                            < 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                return Ok(open);
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                if std::time::Instant::now() >= until {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "nothing opened {} for reading within {waiting:?}",
+                            at.display()
+                        ),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// One named pipe, removed when this is dropped.

@@ -12,13 +12,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aj_package::{Config, TestSet};
-use aj_sandbox::pipes::{release, Fifo};
+use aj_sandbox::pipes::{open_for_writing, release, Fifo};
 use aj_sandbox::{Beside, Enough, Mount, Pipes, Profile, Sandbox, Stopped};
 
 use crate::checker::{checker_said, Broken};
 use crate::compare::{Comparing, Comparison};
 use crate::details::{compiled, failed_to_compile, Compilation, Details, Limits};
-use crate::language::{self, Images, BUILD_OUTPUT, INPUT, OUTPUT, PROGRAM, SOURCE};
+use crate::language::{self, Images, ANSWER, BUILD_OUTPUT, INPUT, OUTPUT, PROGRAM, SOURCE};
 use crate::score::{judge, Judgement, Reason, Status, TestOutcome};
 
 /// The scratch a compiler is given, for **every** build.
@@ -74,6 +74,13 @@ const BUILD_LOG_BYTES: u64 = 256 * 1024;
 /// verbose solution. A problem whose answer genuinely approaches it wants a
 /// checker, because nothing this size is compared token by token usefully.
 const OUTPUT_CAP: u64 = 64 * 1024 * 1024;
+
+/// How long a checker may run, and how long the Runner waits for it to open.
+///
+/// One constant for both because they are the same wait seen from two sides: a
+/// checker that has not opened its answer within its own wall clock is a
+/// checker that is never going to.
+const CHECKER_WALL_CLOCK: Duration = Duration::from_secs(30);
 
 /// The largest submission this problem type will look at — **the outer wall,
 /// and not a rule of anybody's activity.**
@@ -362,8 +369,7 @@ impl<S: Sandbox> Pipeline<S> {
         let source = job.work.join("src");
         let built_into = job.work.join("build");
         let artefacts = built_into.join("out");
-        let answers = job.work.join("answers");
-        for place in [&source, &built_into, &answers] {
+        for place in [&source, &built_into] {
             std::fs::create_dir_all(&place.here).map_err(|e| e.to_string())?;
         }
         std::fs::write(source.here.join(language.source_name), job.source)
@@ -450,17 +456,28 @@ impl<S: Sandbox> Pipeline<S> {
             // submission — which runs as `nobody` — cannot create, rename or
             // read anything in it. The shim opens the file inside it before it
             // drops privileges and hands over the descriptor alone.
-            let channels = job
+            let per_test = job
                 .pipes
                 .clone()
                 .unwrap_or_else(|| job.work.join("out"))
                 .join(&test.name);
-            std::fs::create_dir_all(&channels.here).map_err(|e| {
-                format!(
-                    "test {}: the output directory could not be made: {e}",
-                    test.name
-                )
-            })?;
+
+            // **Two directories and not one, because two containers.** The
+            // submission's own channels are in `run/`; anything a checker is
+            // given is in `beside/`. Both run as the same unprivileged user, so
+            // a single directory would be a place each could reach the other's
+            // — and the submission could then read the answer it is being
+            // compared against, or write into it.
+            let channels = per_test.join("run");
+            let beside_them = per_test.join("beside");
+            for at in [&channels.here, &beside_them.here] {
+                std::fs::create_dir_all(at).map_err(|e| {
+                    format!(
+                        "test {}: the channel directory could not be made: {e}",
+                        test.name
+                    )
+                })?;
+            }
             // **A pipe, and the whole change is in that word.** The bytes go
             // from the program to this process and stop there: nothing is
             // written down, nothing is collected, and the answer is known while
@@ -477,14 +494,28 @@ impl<S: Sandbox> Pipeline<S> {
                 )
             })?;
 
-            // **Who compares decides what the relay does with the bytes.** With
-            // no checker the Runner tokenises them itself and can stop the
-            // program the moment they diverge; with one it has to keep them,
-            // because the checker is a separate program that has not started.
-            // Wiring the checker to the same pipe is the next step, and it is
-            // what makes this arm disappear.
-            let watching = match &checker {
-                Some(_) => Watching::Keep,
+            // **Who compares decides what the relay does with the bytes**, and
+            // in both arms nothing is stored. With no checker the Runner
+            // tokenises them itself; with one it passes them straight on to a
+            // second pipe the checker is reading.
+            //
+            // 0644, where the submission's own channels are 0600: the checker
+            // runs unprivileged and has to be able to open this, and there is
+            // nothing in it to hide from a program that produced it.
+            let answer = match &checker {
+                Some(_) => Some(
+                    Fifo::make(beside_them.here.join(format!("{}.out", test.name)), 0o644)
+                        .map_err(|e| {
+                            format!(
+                                "test {}: the answer channel could not be made: {e}",
+                                test.name
+                            )
+                        })?,
+                ),
+                None => None,
+            };
+            let watching = match &answer {
+                Some(answer) => Watching::Relay(answer.path().to_path_buf()),
                 None => Watching::Against(
                     String::from_utf8_lossy(
                         &std::fs::read(&test.expected).map_err(|e| e.to_string())?,
@@ -500,52 +531,67 @@ impl<S: Sandbox> Pipeline<S> {
                 beside.clone(),
             );
 
-            let run = self
-                .sandbox
-                .run_beside(
-                    &self.pinned(
-                        Profile::new(
-                            &language.image,
-                            language::with_input(
-                                &language.start,
-                                &test.name,
-                                &format!("{OUTPUT}/{}", Pipes::OUTPUT),
-                            ),
-                        )
-                        .memory_bytes(limits.memory_bytes)
-                        .pids(16)
-                        // The one step a participant is judged on the time of, and
-                        // so the one that goes through the shim.
-                        .measured()
-                        // **Nothing leaves this container on its stdio.** The
-                        // output travels on the pipe and the shim's report on
-                        // its own, so the daemon has nothing to write down and
-                        // no log driver to write it with.
-                        .silent()
-                        .wall_clock(reaping_deadline(limits.time_ms))
-                        // What the deadline above measures progress against,
-                        // and what "plainly past its budget" is measured from.
-                        .cpu_limit(Duration::from_millis(limits.time_ms))
-                        .pipes(&channels.here, &channels.on_host, OUTPUT)
-                        .mount(Mount::read_only(&artefacts.on_host, PROGRAM))
-                        .mount(input_mount(&job.package.on_host, &test.name)),
+            // Bound rather than passed as a temporary: the future below holds
+            // a reference to it for as long as it runs.
+            let judged = self.pinned(
+                Profile::new(
+                    &language.image,
+                    language::with_input(
+                        &language.start,
+                        &test.name,
+                        &format!("{OUTPUT}/{}", Pipes::OUTPUT),
                     ),
-                    &beside,
                 )
-                .await;
+                .memory_bytes(limits.memory_bytes)
+                .pids(16)
+                // The one step a participant is judged on the time of, and
+                // so the one that goes through the shim.
+                .measured()
+                // **Nothing leaves this container on its stdio.** The
+                // output travels on the pipe and the shim's report on
+                // its own, so the daemon has nothing to write down and
+                // no log driver to write it with.
+                .silent()
+                .wall_clock(reaping_deadline(limits.time_ms))
+                // What the deadline above measures progress against,
+                // and what "plainly past its budget" is measured from.
+                .cpu_limit(Duration::from_millis(limits.time_ms))
+                .pipes(&channels.here, &channels.on_host, OUTPUT)
+                .mount(Mount::read_only(&artefacts.on_host, PROGRAM))
+                .mount(input_mount(&job.package.on_host, &test.name)),
+            );
 
-            // **Before the run's own error, and that is not a preference.** The
-            // relay is a thread blocked on an open that a container which never
-            // started will never answer; leaving by the `?` below would leak one
-            // per failed test for the life of the Runner.
+            // **The checker runs beside the submission, not after it.** It is
+            // reading the answer as the program writes it, which is what makes
+            // the pipe worth having: the checker's exit is the only thing a
+            // separate program can say *while* it is running, and the closed
+            // pipe that exit produces is what stops the submission.
+            //
+            // The pair is `join`ed rather than raced. Both have their own wall
+            // clock, both are removed by the sandbox on every path out, and a
+            // failure in either has to be reported rather than abandoned.
+            let running = self.sandbox.run_beside(&judged, &beside);
+            let (run, checked) = match &checker {
+                Some(built) => {
+                    let checking = self.check(job, built, &beside_them, &test.name);
+                    let (run, checked) = tokio::join!(running, checking);
+                    (run, Some(checked))
+                }
+                None => (running.await, None),
+            };
+
+            // **Before either error, and that is not a preference.** The relay
+            // is a thread blocked on an open that a container which never
+            // started will never answer; leaving by a `?` would leak one per
+            // failed test for the life of the Runner.
             release(output.path());
             let produced = reading
                 .await
                 .map_err(|e| format!("test {}: the output was not read: {e}", test.name))?;
             let run = run.map_err(|e| format!("a test could not be run: {e}"))?;
 
-            // The channels are gone with it; nothing in here outlives a test.
-            let _ = std::fs::remove_dir_all(&channels.here);
+            // The channels go with it; nothing in here outlives a test.
+            let _ = std::fs::remove_dir_all(&per_test.here);
             let measured = Measured::of(&run).map_err(|e| format!("test {}: {e}", test.name))?;
             let time_ms = measured.time_ms;
 
@@ -675,11 +721,9 @@ impl<S: Sandbox> Pipeline<S> {
                 continue;
             }
 
-            let (status, percentage, note) = match &checker {
-                Some(built) => {
-                    let answer = answers.here.join(format!("{}.out", test.name));
-                    std::fs::write(&answer, &produced.kept).map_err(|e| e.to_string())?;
-                    match self.check(job, built, &answers, &test.name).await? {
+            let (status, percentage, note) = match checked {
+                Some(checked) => {
+                    match checked? {
                         Ok(said) => (
                             if said.accepted {
                                 Status::Ok
@@ -818,13 +862,13 @@ impl<S: Sandbox> Pipeline<S> {
         &self,
         job: &Job<'_>,
         checker: &Checker,
-        answers: &Places,
+        beside_them: &Places,
         test: &str,
     ) -> Result<Result<crate::checker::Checked, Broken>, String> {
         let mut command = checker.start.clone();
         command.extend([
             format!("{INPUT}/{test}.in"),
-            format!("/answers/{test}.out"),
+            format!("{ANSWER}/{test}.out"),
             format!("{INPUT}/{test}.out"),
         ]);
 
@@ -834,11 +878,19 @@ impl<S: Sandbox> Pipeline<S> {
                 &Profile::new(&checker.image, command)
                     .memory_bytes(256 * 1024 * 1024)
                     .pids(16)
-                    .wall_clock(Duration::from_secs(30))
+                    .wall_clock(CHECKER_WALL_CLOCK)
                     .max_output_bytes(64 * 1024)
                     .mount(Mount::read_only(&checker.at.on_host, PROGRAM))
                     .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT))
-                    .mount(Mount::read_only(&answers.on_host, "/answers")),
+                    // **Alongside, and this is the flag that stops a hard
+                    // deadlock.** The judged run holds the measurement gate for
+                    // its whole length, and on the systemd cgroup driver that
+                    // gate is an owned mutex — a checker asking for one of its
+                    // own would wait for a run that is waiting for it.
+                    .alongside()
+                    // Read-only, and a pipe opened for reading is a read: what
+                    // the mount refuses is creating or replacing the name.
+                    .mount(Mount::read_only(&beside_them.on_host, ANSWER)),
             )
             .await
             .map_err(|e| format!("the checker could not be run: {e}"))?;
@@ -859,16 +911,24 @@ impl<S: Sandbox> Pipeline<S> {
 enum Watching {
     /// Compare against the reference answer, token by token, as it arrives.
     Against(String),
-    /// Hold it for a checker to be given afterwards.
-    Keep,
+    /// Pass it straight to a checker, which is reading the far end as it goes.
+    ///
+    /// **The checker never touches the program's own pipe.** It is handed a
+    /// second one the Runner writes into, which is what keeps the byte counter,
+    /// the cap and the early kill in trusted code, and what lets the two
+    /// containers run as the same unprivileged user without sharing a
+    /// directory.
+    Relay(PathBuf),
 }
 
 /// What came out of one test, and what was made of it on the way.
 struct Produced {
     /// The comparison, where the Runner was the one comparing.
+    ///
+    /// **Absent means a checker had it**, and a checker's answer is its exit
+    /// code rather than anything this could carry. There is no third case:
+    /// somebody is always reading, which is why nothing here holds the bytes.
     found: Option<Comparison>,
-    /// The bytes, where a checker is going to want them.
-    kept: Vec<u8>,
     /// It printed more than it was allowed to.
     ///
     /// **Kept here rather than read off `Stopped::Output`**, because the two
@@ -901,9 +961,25 @@ fn relay(
 
         let mut comparing = match &watching {
             Watching::Against(expected) => Some(Comparing::against(expected)),
-            Watching::Keep => None,
+            _ => None,
         };
-        let mut kept = Vec::new();
+        // **Opened before a byte is read, and that ordering is the point.** The
+        // checker is already running and blocked on its own open; leaving this
+        // until the program has produced something would hold it there for as
+        // long as the program thinks.
+        let mut far = match &watching {
+            Watching::Relay(to) => match open_for_writing(to, CHECKER_WALL_CLOCK) {
+                Ok(open) => Some(open),
+                Err(e) => {
+                    tracing::warn!(path = %to.display(), %e, "the checker never opened its answer");
+                    return Produced {
+                        found: None,
+                        capped: false,
+                    };
+                }
+            },
+            _ => None,
+        };
         let mut capped = false;
         let mut total: u64 = 0;
 
@@ -927,27 +1003,45 @@ fn relay(
                 // follows it.
                 if !capped && total > cap {
                     capped = true;
-                    kept = Vec::new();
+                    // The checker is reading a stream that is not going to end
+                    // on its own. Closing this is what lets it finish rather
+                    // than wait out its own wall clock.
+                    far = None;
                     beside.enough(Enough::Output);
                 }
                 if capped {
                     continue;
                 }
 
-                match &mut comparing {
-                    Some(comparing) => {
+                match (&mut comparing, &mut far) {
+                    (Some(comparing), _) => {
                         if comparing.feed(chunk).is_some() {
                             beside.enough(Enough::Decided);
                         }
                     }
-                    None => kept.extend_from_slice(chunk),
+                    // **A checker that has stopped reading has decided.** It is
+                    // the only signal there is: a checker says what it thinks
+                    // with an exit code, so the moment it exits its end of the
+                    // pipe closes and this write fails. That is the same early
+                    // kill the built-in comparison gets, reached by the only
+                    // road a separate program leaves open.
+                    (None, Some(open)) => {
+                        use std::io::Write as _;
+                        if open.write_all(chunk).is_err() {
+                            beside.enough(Enough::Decided);
+                            far = None;
+                        }
+                    }
+                    // Nothing is listening any more — the checker exited, or
+                    // the cap closed its end. Draining is still what keeps the
+                    // program out of a blocking `write` until it is stopped.
+                    (None, None) => {}
                 }
             }
         }
 
         Produced {
             found: comparing.map(|comparing| comparing.finish()),
-            kept,
             capped,
         }
     })

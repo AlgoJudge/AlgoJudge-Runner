@@ -119,12 +119,21 @@ pub const SOURCE: &str = "/src";
 pub const BUILD_OUTPUT: &str = "/out";
 pub const PROGRAM: &str = "/program";
 pub const INPUT: &str = "/in";
-/// Where the directory holding the run's own stdout is mounted.
+/// Where the directory holding the run's own channels is mounted.
 ///
-/// One directory per run, holding one file, and root's: the submission
-/// runs as `nobody` and cannot create, rename or read anything in it. What
-/// it gets is the descriptor the shim opened before dropping privileges.
+/// One directory per run and root's: the submission runs as `nobody` and cannot
+/// create, rename or read anything in it. What it gets is the descriptors the
+/// shim opened before dropping privileges.
 pub const OUTPUT: &str = "/aj-out";
+
+/// Where the directory holding what a **checker** is given is mounted.
+///
+/// **A second directory, and the separation is the security argument.** Both
+/// containers run as the same unprivileged user, so anything they shared would
+/// be a place each could reach the other's — and what is in here is the
+/// participant's answer as it arrives, which their own program must not be able
+/// to rewrite behind the checker's back.
+pub const ANSWER: &str = "/answers";
 
 // ── the images, by key ──────────────────────────────────────────────────────
 

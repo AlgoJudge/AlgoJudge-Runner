@@ -775,6 +775,134 @@ int main() {
     assert_ne!(judged.judgement.score, judged.judgement.max_score);
 }
 
+/// A package like [`package`], with a checker of the caller's own.
+async fn judge_with_checker(name: &str, source: &str, checker: &str) -> Evaluated {
+    let pipeline = pipeline().await;
+    let (package, _, _) = package(name);
+
+    std::fs::create_dir_all(package.here.join("checker")).unwrap();
+    std::fs::write(package.here.join("checker/checker.cpp"), checker).unwrap();
+    let declared = format!("{CONFIG}checker:\n  source: checker/checker.cpp\n  language: cpp\n");
+    std::fs::write(package.here.join("config.yml"), &declared).unwrap();
+
+    let config = Config::parse(&declared).unwrap();
+    let tests = TestSet::read(&package.here, &config).unwrap();
+
+    let evaluated = pipeline
+        .evaluate(&Job {
+            config: &config,
+            tests: &tests,
+            language: "cpp",
+            file_name: "main.cpp",
+            source: source.as_bytes(),
+            package: package.clone(),
+            work: work(name),
+            pipes: None,
+        })
+        .await;
+    evaluated
+}
+
+/// **What a checker is handed is a stream, and a checker can find that out.**
+///
+/// Since 2026-09-05 the participant's output reaches a checker on a pipe, as
+/// the program writes it — which is what lets a checker's own exit stop the
+/// submission. The cost is real and it falls on the package author: a pipe
+/// cannot be seeked, and cannot be read twice.
+///
+/// **The Runner cannot rescue a checker that ignores this**, and saying so is
+/// the point of the test. `seekg` sets the stream's fail bit rather than
+/// throwing; a checker that does not look will read nothing, print `WRONG`, and
+/// a correct submission is rejected with no error anywhere. What is asserted
+/// here is the half that is knowable: the failure is *visible* to a checker
+/// that checks. The rest belongs in `PACKAGE_FORMAT.md`, not in code.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_checker_is_given_a_stream_and_can_tell() {
+    let seeking = r#"
+#include <fstream>
+#include <iostream>
+int main(int argc, char** argv) {
+    if (argc < 4) { std::cout << "WRONG\nno arguments\n"; return 0; }
+    std::ifstream answer(argv[2]);
+    answer.seekg(0, std::ios::end);
+    if (!answer) { std::cout << "WRONG\nNOT SEEKABLE\n"; return 0; }
+    std::cout << "WRONG\nit was seekable after all\n";
+    return 0;
+}
+"#;
+    let judged = verdict(judge_with_checker("cpp-seeking-checker", CORRECT_CPP, seeking).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+
+    assert_eq!(
+        document["tests"][0]["note"], "NOT SEEKABLE",
+        "the answer must be a stream, and a checker that looks must see so: {document}"
+    );
+}
+
+/// **A checker's exit is what stops the submission**, and it is the only thing
+/// a separate program can say while it is still running.
+///
+/// This is the checker's half of the change: the built-in comparison stops a
+/// program by deciding, and a checker stops one by finishing. Both arrive at
+/// the sandbox the same way — the Runner's write into the far pipe fails, and
+/// it asks for the run to end.
+///
+/// The submission here never stops on its own. If it is judged at all, it was
+/// stopped; and the reported time says it was stopped almost at once rather
+/// than waited out.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_checker_that_has_seen_enough_stops_the_submission() {
+    // Prints the right answer, then never stops. Correct on everything the
+    // checker below reads, so the verdict cannot come from the flood.
+    let then_forever = r#"
+#include <cstdio>
+int main() {
+    long long a, b;
+    if (scanf("%lld %lld", &a, &b) != 2) return 1;
+    printf("%lld\n", a + b);
+    fflush(stdout);
+    for (;;) puts("and so on and so on and so on and so on and so on and so on");
+}
+"#;
+    // Reads one number and leaves. Everything after it is unread, and the
+    // closing of this end is what the Runner turns into a kill.
+    let one_number = r#"
+#include <fstream>
+#include <iostream>
+int main(int argc, char** argv) {
+    if (argc < 4) { std::cout << "WRONG\nno arguments\n"; return 0; }
+    std::ifstream answer(argv[2]), expected(argv[3]);
+    long long theirs = 0, ours = 0;
+    if (!(answer >> theirs) || !(expected >> ours) || theirs != ours) {
+        std::cout << "WRONG\nnot the number\n";
+        return 0;
+    }
+    std::cout << "OK\n";
+    return 0;
+}
+"#;
+    let judged = verdict(judge_with_checker("cpp-checker-leaves", then_forever, one_number).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    let first = &document["tests"][0];
+
+    assert_eq!(
+        first["status"], "OK",
+        "the checker read its number and was satisfied: {document}"
+    );
+
+    // The limit these tests are judged under.
+    const LIMIT_MS: u64 = 2000;
+    let spent = first["timeMs"].as_u64().unwrap_or(LIMIT_MS);
+    assert!(
+        spent * 4 < LIMIT_MS,
+        "a program that never stops reported {spent} ms of {LIMIT_MS} ms, which is \
+         not the shape of a run that was stopped: {document}"
+    );
+    assert_eq!(judged.judgement.score, judged.judgement.max_score);
+}
+
 // ── Every other outcome a participant can get ───────────────────────────────
 
 /// Wrong on one test of one group. The group rule then takes that group to
