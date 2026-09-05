@@ -1122,6 +1122,73 @@ async fn an_interactor_may_write_to_its_own_stderr_without_being_failed() {
     assert_eq!(judged.judgement.score, judged.judgement.max_score);
 }
 
+/// **A judging program is told which test it is judging, and which group.**
+///
+/// Both are derivable — the test's name is in `argv[1]` as `/in/2a.in`, and the
+/// group is its leading digits — so this buys no information. What it buys is
+/// that nobody has to derive them: splitting `2a` into a group and a letter is a
+/// rule of the package format, and a checker doing it again is that rule copied
+/// into code we neither control nor can correct when it moves.
+///
+/// Variables rather than a fourth argument, because `argv[1..3]` is SIO2's
+/// contract taken verbatim and a checker carried over from there must keep
+/// working untouched. This asserts they arrive, and that they agree with the
+/// path the same checker was given.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_checker_is_told_which_test_and_which_group() {
+    let nosy = r#"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+int main(int argc, char** argv) {
+    if (argc < 4) { std::printf("WRONG\nno arguments\n"); return 0; }
+    const char* test = std::getenv("AJ_TEST");
+    const char* group = std::getenv("AJ_GROUP");
+    if (!test || !group) { std::printf("WRONG\nnothing in the environment\n"); return 0; }
+
+    // Read the answer, as an ordinary checker does. Leaving it unopened is
+    // legal and costs the whole checker wall clock, which is a separate test.
+    std::FILE* answer = std::fopen(argv[2], "r");
+    if (!answer) { std::printf("WRONG\nno answer channel\n"); return 0; }
+    long long theirs = 0;
+    if (std::fscanf(answer, "%lld", &theirs) != 1) { std::printf("WRONG\nno number\n"); return 0; }
+    std::fclose(answer);
+
+    // The name is in argv[1] as well, as `/in/<test>.in`. If the two ever
+    // disagree the variable is worse than useless, so this is what it checks.
+    std::string wanted = std::string("/in/") + test + ".in";
+    if (wanted != argv[1]) {
+        std::printf("WRONG\nAJ_TEST=%s does not match %s\n", test, argv[1]);
+        return 0;
+    }
+    std::printf("OK\ntest %s in group %s\n", test, group);
+    return 0;
+}
+"#;
+    let judged = verdict(judge_with_checker("cpp-nosy-checker", CORRECT_CPP, nosy).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+
+    assert_eq!(
+        judged.judgement.verdict, "Accepted",
+        "the checker found both variables and they agreed with argv[1]: {document}"
+    );
+
+    // `package()` builds tests 0a, 1a and 2a, one per group, so the group is not
+    // a constant and a checker reading the wrong variable cannot pass by luck.
+    for (index, expected) in [
+        (0, "test 0a in group 0"),
+        (1, "test 1a in group 1"),
+        (2, "test 2a in group 2"),
+    ] {
+        assert_eq!(
+            document["tests"][index]["note"], expected,
+            "test {index} was told the wrong thing: {document}"
+        );
+    }
+}
+
 // ── Every other outcome a participant can get ───────────────────────────────
 
 /// Wrong on one test of one group. The group rule then takes that group to

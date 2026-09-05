@@ -534,13 +534,22 @@ impl Sandbox for Docker {
             // the shim that applies it, as `RLIMIT_FSIZE` on the child before
             // dropping privileges — so it is meaningless without one, and the
             // shim scrubs both.
-            env: nonce.as_ref().map(|nonce| {
-                let mut env = vec![format!("AJ_SHIM_NONCE={nonce}")];
-                if let Some(pipes) = &profile.pipes {
-                    env.push(format!("AJ_SHIM_REPORT={}", pipes.inside(Pipes::REPORT)));
+            // **The shim's own, and then the caller's.** The two never meet:
+            // a nonce is issued only for a measured run, which is a submission,
+            // and a caller states variables only for a program the package
+            // brought. Merged rather than chosen between so that neither can
+            // silently drop the other if that ever stops being true.
+            env: {
+                let mut env = Vec::new();
+                if let Some(nonce) = nonce.as_ref() {
+                    env.push(format!("AJ_SHIM_NONCE={nonce}"));
+                    if let Some(pipes) = &profile.pipes {
+                        env.push(format!("AJ_SHIM_REPORT={}", pipes.inside(Pipes::REPORT)));
+                    }
                 }
-                env
-            }),
+                env.extend(profile.env.iter().cloned());
+                (!env.is_empty()).then_some(env)
+            },
             labels: Some(self.labels()),
             // Asked for only where something reads them back. A silent
             // container's stdio carries nothing and is attached by nobody.
