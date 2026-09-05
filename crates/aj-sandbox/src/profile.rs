@@ -170,6 +170,12 @@ pub struct Profile {
     /// Off for a build and for a checker: those two are read through
     /// [`Outcome::stdout`] and [`Outcome::stderr`], and a driver of `none`
     /// refuses the endpoint that reads them.
+    ///
+    /// **It also takes [`Profile::max_output_bytes`] with it**, which is the
+    /// consequence a caller is likeliest to miss. That cap is counted by the
+    /// collector, and the collector is not started for a silent run at all — so
+    /// a profile that is silent and states a cap is stating one nothing applies.
+    /// Set one or the other.
     pub silent: bool,
 
     /// This container runs **beside** a measured one, and opens no measurement.
@@ -394,8 +400,10 @@ impl Profile {
         self
     }
 
-    /// What to read back, and the most of it that will be held. **One call for
-    /// both**, so a caller cannot ask for the first and forget the second.
+    /// Keep no log of this container, and read nothing back from it.
+    ///
+    /// For a run whose output travels somewhere the Runner already holds. See
+    /// [`Profile::silent`] for what it costs, including the output cap.
     pub fn silent(mut self) -> Self {
         self.silent = true;
         self

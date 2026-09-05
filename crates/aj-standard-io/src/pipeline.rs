@@ -975,7 +975,21 @@ impl<S: Sandbox> Pipeline<S> {
                 .memory_bytes(256 * 1024 * 1024)
                 .pids(16)
                 .wall_clock(CHECKER_WALL_CLOCK)
-                .max_output_bytes(64 * 1024)
+                // **Nothing here reads this container's streams**, so it keeps
+                // no log: the conversation is on two FIFOs and the verdict on a
+                // third, and all that is left on stderr is whatever the author
+                // chose to print for themselves.
+                //
+                // **The output cap went with it, and that is a repair.** It was
+                // 64 KiB, it bounded only that stderr — and crossing it gave
+                // `Stopped::Output`, which the check below turns into "the
+                // interactor was stopped", a broken-package error for an
+                // interactor that was working and merely talkative. What bounds
+                // this run now is `CHECKER_WALL_CLOCK` alone: an interactor that
+                // never stops costs thirty seconds **per test**, because this is
+                // `run` rather than `run_beside` and nothing ends it when the
+                // submission does.
+                .silent()
                 // See `check`: this is what keeps the systemd cgroup driver's
                 // gate from deadlocking two runs against each other.
                 .alongside()

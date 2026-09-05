@@ -1087,6 +1087,41 @@ int main() {
     );
 }
 
+/// **An interactor may say as much as it likes to itself, and the cost of that
+/// is now a wall clock rather than a false accusation.**
+///
+/// Its stdout and stdin are the conversation, redirected onto FIFOs; only its
+/// **stderr** ever reached the collector. So the 64 KiB output cap it used to
+/// carry bounded diagnostics nobody reads — and crossing it produced
+/// `Stopped::Output`, which `interact` turns into "the interactor was stopped":
+/// a broken-package error, reported to a manager, about an interactor that was
+/// working and merely talkative.
+///
+/// Silencing it removed the cap with the driver. What is left is
+/// `CHECKER_WALL_CLOCK`, and this pins both halves: a chatty interactor that
+/// **finishes** is not failed at all, and the judging is unaffected.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn an_interactor_may_write_to_its_own_stderr_without_being_failed() {
+    // The interactor of `an_interactor_judges_a_conversation`, with a megabyte
+    // of complaining added — sixteen times the cap it used to carry.
+    let noisy = ASKING.replace(
+        "    int asked = 0;",
+        "    int asked = 0;\n    for (int i = 0; i < 16384; i++) \
+         fprintf(stderr, \"a diagnostic line nobody reads, number %d\\n\", i);",
+    );
+    assert_ne!(noisy, ASKING, "the interactor was not modified");
+
+    let judged = verdict(judge_interactive("cpp-noisy-interactor", GUESSING, &noisy).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+
+    assert_eq!(
+        judged.judgement.verdict, "Accepted",
+        "a talkative interactor is not a broken one: {document}"
+    );
+    assert_eq!(judged.judgement.score, judged.judgement.max_score);
+}
+
 // ── Every other outcome a participant can get ───────────────────────────────
 
 /// Wrong on one test of one group. The group rule then takes that group to
