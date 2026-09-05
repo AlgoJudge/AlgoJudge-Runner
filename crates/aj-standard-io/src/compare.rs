@@ -132,6 +132,7 @@ impl<'a> Comparing<'a> {
         if self.decided.is_some() {
             return self.decided.as_ref();
         }
+        let held = self.holding.len();
         self.holding.extend_from_slice(bytes);
 
         // **Split at the last ASCII space, and everything before it is whole.**
@@ -139,7 +140,16 @@ impl<'a> Comparing<'a> {
         // the prefix is safe to convert; the tokens in it are then found by the
         // same `split_whitespace` the whole-slice comparison uses, keeping the
         // Unicode-aware set of separators rather than quietly narrowing it.
-        let cut = self.holding.iter().rposition(u8::is_ascii_whitespace)?;
+        //
+        // **Only the arriving bytes are searched, and that is not an
+        // optimisation.** Whatever was held over from last time was held over
+        // *because* it had no separator in it, so searching it again can only
+        // find nothing — and searching it again is quadratic in the length of a
+        // token the submission chooses. Measured before it was fixed: a program
+        // printing one endless token spent 20 seconds of the judge's processor
+        // time to reach a cap it should have hit in well under one. A
+        // participant should not be able to buy that.
+        let cut = held + bytes.iter().rposition(u8::is_ascii_whitespace)?;
         let whole: Vec<u8> = self.holding.drain(..=cut).collect();
         let whole = String::from_utf8_lossy(&whole);
         for got in whole.split_whitespace() {
@@ -410,6 +420,29 @@ mod tests {
                 String::from_utf8_lossy(actual),
             );
         }
+    }
+
+    /// **The offset the linear scan rests on.**
+    ///
+    /// `feed` searches only what has just arrived, because what it was holding
+    /// had no separator by construction. That turns the position it finds into
+    /// an offset needing the held length added back, and getting that addition
+    /// wrong cuts the token in the wrong place — which shows up as a wrong
+    /// answer for a correct program, and only for one whose output happens to
+    /// straddle a chunk.
+    #[test]
+    fn a_token_held_across_many_chunks_is_cut_in_the_right_place() {
+        let long: String = std::iter::repeat_n('7', 5000).collect();
+        let expected = format!("{long} 1\n");
+        let mut comparing = Comparing::against(&expected);
+        for chunk in long.as_bytes().chunks(64) {
+            assert!(comparing.feed(chunk).is_none(), "no separator has arrived");
+        }
+        assert!(
+            comparing.feed(b" 1 ").is_none(),
+            "and both tokens are right"
+        );
+        assert_eq!(comparing.finish(), Comparison::Equal);
     }
 
     /// Invalid bytes are a wrong answer, not a broken evaluation.

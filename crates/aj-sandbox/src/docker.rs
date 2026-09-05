@@ -31,8 +31,10 @@ use bollard::query_parameters::{
 use futures_util::StreamExt as _;
 
 use crate::cgroups::{self, Cgroups};
-use crate::profile::{Outcome, Profile, Stopped};
-use crate::{Beside, Enough, Error, Result, Sandbox};
+use std::path::PathBuf;
+
+use crate::profile::{Outcome, Pipes, Profile, Stopped, SHIM};
+use crate::{pipes::release, Beside, Enough, Error, Result, Sandbox};
 
 pub struct Docker {
     client: bollard::Docker,
@@ -315,7 +317,7 @@ impl Docker {
                     // configuration mistake anybody could see.
                     .chain(
                         profile
-                            .stdout_directory
+                            .pipes
                             .iter()
                             .map(|out| (out.on_host.clone(), out.at.clone(), true)),
                     )
@@ -446,6 +448,28 @@ impl Sandbox for Docker {
         // cannot be changed afterwards, and an image with no shim must not be
         // handed a root one.
         let shim = profile.measured && self.image_has_shim(&profile.image).await;
+
+        // **A silent measured run without the shim would judge nobody's
+        // program**, so it is refused before anything starts.
+        //
+        // The two flags together say: the container's own streams carry nothing
+        // (the daemon has no log driver for them) and the numbers come from the
+        // report. Take the shim away and *both* halves are gone — the output
+        // went to a channel nothing opened and the report was never written —
+        // and what arrives at the pipeline is an empty answer from a program
+        // that ran. Every test would be wrong, and it would read as the
+        // participant's fault.
+        //
+        // This is a real loss and it belongs to an operator, not to us: an image
+        // of their own can no longer judge unless it carries the shim. Said here
+        // rather than found out there.
+        if profile.measured && profile.silent && !shim {
+            return Err(Error::Refused(format!(
+                "the image {} carries no {SHIM}, so a judged run in it would \
+                 produce neither output nor a measurement",
+                profile.image
+            )));
+        }
         let nonce = shim.then(|| format!("{:016x}{:016x}", rand_suffix(), rand_suffix()));
 
         let name = format!(
@@ -486,8 +510,8 @@ impl Sandbox for Docker {
             // shim scrubs both.
             env: nonce.as_ref().map(|nonce| {
                 let mut env = vec![format!("AJ_SHIM_NONCE={nonce}")];
-                if profile.stdout_directory.is_some() {
-                    env.push(format!("AJ_SHIM_MAX_OUTPUT={}", profile.max_output_bytes));
+                if let Some(pipes) = &profile.pipes {
+                    env.push(format!("AJ_SHIM_REPORT={}", pipes.inside(Pipes::REPORT)));
                 }
                 env
             }),
@@ -521,6 +545,33 @@ impl Sandbox for Docker {
             return Err(e.into());
         }
 
+        // **The report's channel is the sandbox's own**, because the report is:
+        // this is the only place that knows what a nonce is or how a report is
+        // shaped. The directory around it belongs to the caller, which is why
+        // only the channel is made here.
+        let report = match (&profile.pipes, nonce.as_deref()) {
+            (Some(pipes), Some(_)) => {
+                // This process's own view: it is the one making and reading
+                // the channel, and where it is containerised that is neither
+                // the daemon's path nor the container's.
+                let at = pipes.here(Pipes::REPORT);
+                match crate::pipes::Fifo::make(&at, 0o600) {
+                    // The `Fifo` is held to the end of this function, so the
+                    // channel is taken away whatever happens after it.
+                    Ok(fifo) => Some((fifo, read_to_end(at))),
+                    Err(e) => {
+                        if let Some((measuring, _)) = cgroup {
+                            measuring.finish();
+                        }
+                        return Err(Error::Refused(format!(
+                            "the shim's report has nowhere to go: {e}"
+                        )));
+                    }
+                }
+            }
+            _ => None,
+        };
+
         // From here on the container exists, so every path out removes it.
         let mut outcome = self
             .supervise(
@@ -547,7 +598,46 @@ impl Sandbox for Docker {
         }
 
         if let (Some(nonce), Ok(outcome)) = (nonce.as_deref(), outcome.as_mut()) {
-            if let Some(said) = take_report(&mut outcome.stderr, nonce) {
+            // **Where it arrives from decides what has to be picked out of it.**
+            // On its own channel nothing else can be in there, so the whole of
+            // it is the report; on stderr it is mixed with whatever the
+            // submission printed, and every match has to be drained back out.
+            let mut said = match report {
+                Some((fifo, reading)) => {
+                    // Nothing wrote, and nothing ever will: the container is
+                    // gone. Without this the reader is a thread blocked for the
+                    // life of the Runner.
+                    release(fifo.path());
+                    reading.await.ok().and_then(|mut bytes| {
+                        let found = take_report(&mut bytes, nonce);
+                        if found.is_none() && !bytes.is_empty() {
+                            tracing::warn!(
+                            container = name,
+                            bytes = bytes.len(),
+                            "something was written to the report channel and it was not a report",
+                        );
+                        }
+                        found
+                    })
+                }
+                None => take_report(&mut outcome.stderr, nonce),
+            };
+            // **Present and silent is a failure, and it used to be a
+            // shrug.** A missing report fell back to the cgroup, which is a
+            // real measurement of a real container — so a shim that failed
+            // after `exec` was indistinguishable from an image that never had
+            // one, and the difference is a participant charged for a container
+            // start they did not cause.
+            //
+            // Only a run that finished **on its own** owes a report. Every other
+            // stop is the sandbox having killed the shim, which is exactly when
+            // there is nothing to report.
+            if said.is_none() && outcome.stopped == Stopped::OnItsOwn {
+                return Err(Error::Refused(format!(
+                    "the run finished on its own and the {SHIM} reported nothing"
+                )));
+            }
+            if let Some(said) = said.take() {
                 let whole = outcome.cpu_time;
                 let charged = measured_time(said.cpu, whole);
 
@@ -768,18 +858,6 @@ impl Docker {
             stopped
         };
 
-        // **`SIGXFSZ` is the cap, not a crash.** Where stdout goes to a file the
-        // shim applies the cap as `RLIMIT_FSIZE`, so the kernel stops the
-        // program on the write that would cross it rather than the collector
-        // noticing afterwards — and the child dies of signal 25, which every
-        // other path here would read as a runtime error. It is the same outcome
-        // the counting produced, reached by a better instrument.
-        let stopped = if profile.stdout_directory.is_some() && exit_code == 128 + SIGXFSZ {
-            Stopped::Output
-        } else {
-            stopped
-        };
-
         Ok(Outcome {
             exit_code,
             stdout,
@@ -917,6 +995,31 @@ fn memory_kill(stopped: Stopped, reading: &cgroups::Reading) -> Stopped {
     }
 }
 
+/// Reads one channel to its end, on a thread of its own.
+///
+/// **The open blocks, and that is what makes it right.** Opening a pipe for
+/// reading waits until somebody opens the writing end, so a reader cannot
+/// mistake *nobody has written yet* for *there is nothing to read* — which is
+/// exactly what a non-blocking open reports, as an immediate end of file, and
+/// it would arrive as a run that printed nothing.
+fn read_to_end(at: PathBuf) -> tokio::task::JoinHandle<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        match std::fs::File::open(&at) {
+            Ok(mut channel) => {
+                if let Err(e) = channel.read_to_end(&mut bytes) {
+                    tracing::debug!(path = %at.display(), %e, "a channel ended badly");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(path = %at.display(), %e, "a channel could not be opened")
+            }
+        }
+        bytes
+    })
+}
+
 async fn collect(
     client: bollard::Docker,
     name: String,
@@ -1044,13 +1147,6 @@ fn measured_time(reported: Duration, whole: Option<Duration>) -> Duration {
 /// catches the cheating worth doing -- a program spending seconds past its
 /// limit, which is what a limit of 100 to 600 ms makes worth attempting.
 const UNEXPLAINED_GAP: Duration = Duration::from_secs(1);
-
-/// The signal a program gets on the write that would cross `RLIMIT_FSIZE`.
-///
-/// Named rather than written as 25 at the one place it is used: `128 + n` is
-/// how a shell reports a fatal signal, and `153` is not a number anybody
-/// reading this file would recognise.
-const SIGXFSZ: i64 = 25;
 
 /// How often a run's processor time is looked at while it runs.
 ///

@@ -104,7 +104,7 @@ pub struct Profile {
     ///
     /// `None` leaves stdout where it was, which is what every step that is not
     /// judging a submission wants: a build's output *is* its compiler log.
-    pub stdout_directory: Option<StdoutDirectory>,
+    pub pipes: Option<Pipes>,
 
     pub mounts: Vec<Mount>,
 
@@ -218,32 +218,59 @@ pub struct Profile {
 // every image has a shell, which is a requirement it has no business having,
 // and `exec` keeps the process tree the same size either way.
 
-/// Where a measured run's stdout is written, on both sides of the mount.
+/// The directory a measured run's channels live in, on both sides of the mount.
 ///
-/// One file per run and the name is fixed, because the directory is one
-/// run's: a name carried from the test would be a second thing to keep in
-/// step for nothing.
+/// **One directory per run and the names are fixed**, because the directory is
+/// already one run's: a name carried from the test would be a second thing to
+/// keep in step for nothing.
+///
+/// Two channels live here today and a third is coming. The Runner makes each of
+/// them and owns it; the shim opens what it is given and creates nothing, so a
+/// channel that is missing means the Runner did not do its half rather than
+/// something for the far end to invent.
 #[derive(Debug, Clone)]
-pub struct StdoutDirectory {
-    /// The directory on the host. The Runner makes it; the shim writes in
-    /// it; nothing else is ever put there.
+pub struct Pipes {
+    /// Where **this process** sees the directory.
+    ///
+    /// **Three views and not two, and the third is the one that bites.** The
+    /// daemon resolves the bind mount, so `on_host` is its view; the command
+    /// names `at`, so that is the container's. But the channels are *made and
+    /// read by the Runner*, which where it is itself containerised sees neither
+    /// of those — and a `mkfifo` against the daemon's path fails with "no such
+    /// file or directory" while naming a path that plainly exists, which is a
+    /// confusing hour for whoever meets it.
+    pub here: PathBuf,
+    /// Where the **daemon** sees it, for the bind mount.
     pub on_host: PathBuf,
-    /// Where it is mounted inside the container.
+    /// Where the **container** sees it, for the command.
     pub at: String,
 }
 
-impl StdoutDirectory {
-    /// What the file is called, inside and out.
-    pub const FILE: &'static str = "stdout";
+impl Pipes {
+    /// What the submission's own output travels on.
+    pub const OUTPUT: &'static str = "stdout";
 
-    /// The path the command must name, as the container sees it.
-    pub fn inside(&self) -> String {
-        format!("{}/{}", self.at, Self::FILE)
+    /// What the shim's measurement report travels on.
+    ///
+    /// **Its own channel, and that is the point of it.** The report used to
+    /// share the container's stderr with whatever the submission printed there,
+    /// picked back out by a nonce and by being written last. Nothing else can
+    /// write here, so the nonce is now belt to a brace.
+    pub const REPORT: &'static str = "report";
+
+    /// Where a channel is, as the container sees it.
+    pub fn inside(&self, channel: &str) -> String {
+        format!("{}/{channel}", self.at)
     }
 
-    /// The path the Runner reads back afterwards.
-    pub fn on_disk(&self) -> PathBuf {
-        self.on_host.join(Self::FILE)
+    /// Where a channel is, as the daemon sees it.
+    pub fn on_host(&self, channel: &str) -> PathBuf {
+        self.on_host.join(channel)
+    }
+
+    /// Where a channel is, as this process sees it: what to make and read.
+    pub fn here(&self, channel: &str) -> PathBuf {
+        self.here.join(channel)
     }
 }
 
@@ -263,7 +290,7 @@ impl Profile {
             wall_clock: Duration::from_secs(10),
             cpu_limit: None,
             max_output_bytes: 64 * 1024 * 1024,
-            stdout_directory: None,
+            pipes: None,
             mounts: Vec::new(),
             measured: false,
             tmpfs_bytes: None,
@@ -303,12 +330,19 @@ impl Profile {
         self
     }
 
-    /// Send the submission's stdout to a file in `on_host`, mounted at `at`.
+    /// Give the run a directory of channels, made by the caller and mounted
+    /// at `at`.
     ///
-    /// The file is [`StdoutDirectory::FILE`] inside it, and the caller wants
-    /// [`StdoutDirectory::inside`] to build the path the command must name.
-    pub fn stdout_directory(mut self, on_host: impl Into<PathBuf>, at: impl Into<String>) -> Self {
-        self.stdout_directory = Some(StdoutDirectory {
+    /// The caller makes every channel in it before the run starts, and names
+    /// them with [`Pipes::inside`] when building the command.
+    pub fn pipes(
+        mut self,
+        here: impl Into<PathBuf>,
+        on_host: impl Into<PathBuf>,
+        at: impl Into<String>,
+    ) -> Self {
+        self.pipes = Some(Pipes {
+            here: here.into(),
             on_host: on_host.into(),
             at: at.into(),
         });

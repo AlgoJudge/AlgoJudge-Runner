@@ -29,7 +29,7 @@ mod profile;
 pub use beside::{Beside, Enough};
 pub use cgroups::Cgroups;
 pub use docker::Docker;
-pub use profile::{Mount, Outcome, Profile, StdoutDirectory, Stopped, SHIM};
+pub use profile::{Mount, Outcome, Pipes, Profile, Stopped, SHIM};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

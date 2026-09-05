@@ -19,6 +19,21 @@ use std::ffi::CString;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Lets go of a reader waiting for a writer that will never come.
+///
+/// **Every path out of a run has to pass through this**, because the reader is
+/// a blocking thread and the thing it is waiting for is a container that failed
+/// to start. Opening the far end for an instant is what ends its wait: the open
+/// succeeds only if somebody is blocked on the other side, and the close that
+/// follows immediately reaches them as an ordinary end of file.
+pub fn release(at: &Path) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(at);
+}
+
 /// One named pipe, removed when this is dropped.
 ///
 /// **Ownership is what the type is for.** A FIFO left behind is a few bytes,

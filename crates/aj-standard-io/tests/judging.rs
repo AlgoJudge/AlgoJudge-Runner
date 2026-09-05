@@ -666,22 +666,31 @@ groups:
     let _ = std::fs::remove_dir_all(&elsewhere.here);
 }
 
-/// **A submission that floods is stopped by the kernel, and it is still an
-/// output limit.**
+/// **A flood is a wrong answer now, found in milliseconds, and still not a
+/// crash.**
 ///
-/// Since 2026-09-05 a judged run's stdout goes to a file the shim opens, so the
-/// cap is `RLIMIT_FSIZE` on the child rather than a count of the stream — the
-/// kernel stops the program on the write that would cross it. That means the
-/// child dies of `SIGXFSZ`, and **every other path in the pipeline reads a
-/// fatal signal as a runtime error**. This is the test that says which it is,
-/// and it went red the first time it was run.
+/// Three things are being held down at once here, and they used to be one.
 ///
-/// The cap a judged run carries is 64 MiB, so this writes until it is stopped
-/// rather than counting to a number of its own: a test that knew the figure
-/// would pass on a cap that had quietly moved.
+/// It *was* an output limit: stdout went to a file, the cap was `RLIMIT_FSIZE`,
+/// and the kernel stopped the program on the write that crossed 64 MiB. Since
+/// 2026-09-05 the output goes to a pipe the Runner reads as it is written, and a
+/// program whose very first token is wrong is decided against before it has
+/// printed a second one. The flood never happens.
+///
+/// So the verdict changes, and it changes for the better: "token 1 differs" is
+/// something a participant can act on, where "you printed too much" is a fact
+/// about the judge's patience. What has **not** changed is the danger the test
+/// was written for — the program is killed mid-write, so it dies of a signal,
+/// and every other path in this pipeline reads a fatal signal as a runtime
+/// error. That is still the assertion that would go red first.
+///
+/// And the time is the measurement that says the mechanism works at all. This
+/// program never stops on its own; if the reported figure is a fraction of the
+/// limit then it was stopped, and it cannot be a fraction of the limit if
+/// anybody is waiting for the output to end.
 #[tokio::test]
 #[ignore = "needs a container runtime and the language images"]
-async fn a_flooding_submission_is_an_output_limit_and_not_a_crash() {
+async fn a_flooding_submission_is_stopped_at_its_first_token_and_is_not_a_crash() {
     let flooding = r#"
 #include <cstdio>
 int main() {
@@ -692,10 +701,64 @@ int main() {
 "#;
     let judged = verdict(judge("cpp-flooding", "cpp", flooding).await);
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    let first = &document["tests"][0];
+
+    assert_eq!(
+        first["reason"], "wrongAnswer",
+        "stopped for being wrong, not for being loud, and above all not for \
+         dying of the signal that stopped it: {document}"
+    );
+    assert!(
+        first["note"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("token 1 differs"),
+        "and the note says where, which is what the participant can use: {document}"
+    );
+
+    // The limit these tests are judged under. Named here rather than divided
+    // into, so that a limit which moves makes this arithmetic visible.
+    const LIMIT_MS: u64 = 2000;
+    let spent = first["timeMs"].as_u64().unwrap_or(LIMIT_MS);
+    assert!(
+        spent * 4 < LIMIT_MS,
+        "a program that never stops on its own reported {spent} ms of {LIMIT_MS} ms, \
+         which is not the shape of a run somebody waited out: {document}"
+    );
+
+    assert_ne!(judged.judgement.score, judged.judgement.max_score);
+}
+
+/// **What is left of the output limit, and why it is still needed.**
+///
+/// Too much output is decidable the moment it arrives — the expected tokens run
+/// out, so the next one is a difference — which is why the flood above is a
+/// wrong answer and not this. There is exactly one way to print without ever
+/// producing a token: never print whitespace. A token is only whole once
+/// something follows it, so the Runner holds an unfinished one, and a program
+/// that never finishes one is filling the **judge's** memory rather than its
+/// own.
+///
+/// That is what the cap is for now. It is not a verdict about output being
+/// impolite; it is the bound on what one submission can make this process hold.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn one_endless_token_is_an_output_limit() {
+    let endless = r#"
+#include <cstdio>
+int main() {
+    long long a, b;
+    if (scanf("%lld %lld", &a, &b) != 2) return 1;
+    // No newline, no space, no end: one token as far as anybody can tell.
+    for (;;) fputs("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", stdout);
+}
+"#;
+    let judged = verdict(judge("cpp-endless-token", "cpp", endless).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
 
     assert_eq!(
         document["tests"][0]["reason"], "outputLimit",
-        "a flood is an output limit and not a crash: {document}"
+        "nothing could be compared, so the cap is what stopped it: {document}"
     );
     assert!(
         document["tests"][0]["note"]

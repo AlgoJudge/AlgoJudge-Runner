@@ -532,17 +532,17 @@ pub fn with_input(start: &[String], test: &str, output: &str) -> Vec<String> {
         .join(" ");
     let input = quoted(&format!("{INPUT}/{test}.in"));
     let output = quoted(output);
-    // **The two branches differ in where stdout goes, and the difference is
-    // legible afterwards.** With the shim it is a file the Runner reads back —
-    // which keeps a flooding submission out of the daemon's log, where it was
-    // measured writing 76 MB against a 64 MiB cap. Without one, stdout stays on
-    // the container's stream and the collector counts it exactly as it always
-    // did. Which happened is not guessed at: the shim creates the file even for
-    // a program that printed nothing, so the file's existence is the answer.
-    shell(&format!(
-        "if [ -x {SHIM} ]; then exec {SHIM} {input} {output} {program}; \
-         else exec {program} < {input}; fi"
-    ))
+    // **There is no branch any more, and that is the change of 2026-09-05.**
+    // It used to fall back to running the program directly when the image had
+    // no shim, with stdout left on the container's stream for the collector to
+    // count. That stream now goes nowhere — a judged container is started with
+    // no log driver — so the fallback would have handed the comparison an empty
+    // answer for every test, and blamed the participant for it.
+    //
+    // An image with no shim cannot judge. The sandbox refuses such a run before
+    // it starts, which is a sentence an operator can act on; this line is only
+    // what makes the refusal reachable.
+    shell(&format!("exec {SHIM} {input} {output} {program}"))
 }
 
 #[cfg(test)]
@@ -685,52 +685,53 @@ mod tests {
     }
 
     #[test]
-    fn the_shim_is_given_the_input_and_the_fallback_redirects_it() {
-        let wrapped = with_input(
+    fn the_shim_is_given_the_input_and_the_output_in_that_order() {
+        let script = with_input(
             &["python3".into(), "/program/program.py".into()],
             "1a",
             "/aj-out/stdout",
-        );
-        let script = wrapped.last().unwrap();
+        )
+        .pop()
+        .unwrap();
 
-        // Through the shim both files are arguments, because the shim opens
-        // both -- the input to read and the output to write. **Their order is
-        // the assertion**: swapped, the shim would truncate the test's input
-        // and feed the submission its own empty output, which is a wrong answer
-        // rather than an error anybody would see.
-        let through_the_shim = concat!(
-            "exec /usr/local/bin/aj-shim ",
-            "'/in/1a.in' '/aj-out/stdout' 'python3' '/program/program.py'",
-        );
-        assert!(script.contains(through_the_shim), "got {script}");
-        // Without one the input is a redirect and the output stays on the
-        // container's stream, which is what it has always been.
-        assert!(
-            script.contains("exec 'python3' '/program/program.py' < '/in/1a.in'"),
-            "got {script}"
+        // Both files are arguments, because the shim opens both — the input to
+        // read and the output to write. **Their order is the assertion**:
+        // swapped, the shim would truncate the test's input and feed the
+        // submission its own empty output, which is a wrong answer rather than
+        // an error anybody would see.
+        assert_eq!(
+            script,
+            concat!(
+                "exec /usr/local/bin/aj-shim ",
+                "'/in/1a.in' '/aj-out/stdout' 'python3' '/program/program.py'",
+            ),
+            "got {script}",
         );
     }
 
-    /// **Both arms, or the shell is a process in the accounting.** It would also
-    /// be a second entry against a process limit set at sixteen, and a signal
-    /// aimed at the submission would reach the shell instead.
+    /// **There is no arm without an `exec`, and now there is only one arm.**
+    ///
+    /// A shell left behind would be a process in the accounting, a second entry
+    /// against a process limit set at sixteen, and something for a signal aimed
+    /// at the submission to reach instead of it.
+    ///
+    /// The other arm was the fallback for an image with no shim, deleted on
+    /// 2026-09-05: a judged container's own streams go nowhere, so a program
+    /// run without the shim would have produced an answer that reached nobody.
+    /// This asserts the fallback has not grown back — an `if` here is a silent
+    /// wrong answer for every test in the package.
     #[test]
-    fn neither_arm_leaves_a_shell_behind() {
+    fn nothing_but_the_shim_and_no_shell_behind_it() {
         let script = with_input(&["/program/program".into()], "0a", "/aj-out/stdout")
             .pop()
             .unwrap();
 
-        assert_eq!(script.matches("exec ").count(), 2, "got {script}");
-        for arm in script.split("; ") {
-            let arm = arm
-                .trim()
-                .trim_start_matches("then ")
-                .trim_start_matches("else ");
-            if arm.starts_with("if ") || arm == "fi" {
-                continue;
-            }
-            assert!(arm.starts_with("exec "), "an arm that does not exec: {arm}");
-        }
+        assert!(script.starts_with("exec "), "got {script}");
+        assert_eq!(script.matches("exec ").count(), 1, "got {script}");
+        assert!(
+            !script.contains("if ") && !script.contains(';'),
+            "the fallback is back, and it judges nobody: {script}",
+        );
     }
 
     /// A quote in a path would otherwise end the quoting and hand the rest of

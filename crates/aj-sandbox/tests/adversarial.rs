@@ -24,7 +24,8 @@
 
 use std::time::Duration;
 
-use aj_sandbox::{Cgroups, Docker, Error, Mount, Profile, Sandbox, Stopped};
+use aj_sandbox::pipes::{release, Fifo};
+use aj_sandbox::{Cgroups, Docker, Error, Mount, Pipes, Profile, Sandbox, Stopped};
 
 const IMAGE: &str = "alpine:3";
 
@@ -1426,8 +1427,8 @@ async fn an_image_without_a_shim_is_still_measured_from_the_cgroup() {
 ///
 /// **What this pins is the outcome, not the mechanism, and the difference is
 /// worth stating.** The shim kills every process in the namespace before it
-/// reports, which is what stops a `setsid` escapee -- one that has left the
-/// process group and would survive a group kill -- writing after the report.
+/// reports, which is what stops a `setsid` escapee — one that has left the
+/// process group and would survive a group kill — writing after the report.
 /// But the runtime tears the container down when PID 1 exits, and that kills the
 /// escapee too: sabotaging `kill(-1)` leaves this test green. Measured, not
 /// assumed.
@@ -1437,6 +1438,13 @@ async fn an_image_without_a_shim_is_still_measured_from_the_cgroup() {
 /// escapee's output never reaches the participant's record, and no container is
 /// left behind. The guard that keeps `kill(-1)` to PID 1 is unit-tested; the
 /// ordering it buys is argued in the shim's own comment.
+///
+/// **It watched stderr until 2026-09-05 and now watches the pipe**, because the
+/// record moved. A submission's stderr goes to `/dev/null`, so a straggler
+/// writing there is not caught being harmless — it is unobservable, and a test
+/// that cannot observe its own subject passes for the wrong reason. Standard
+/// output is what is judged, so that is where a straggler's line would have to
+/// land to do any damage, and that is where this looks for it.
 #[tokio::test]
 #[ignore = "needs a container runtime and the language images"]
 async fn a_child_that_escapes_the_process_group_cannot_write_after_the_report() {
@@ -1446,12 +1454,16 @@ async fn a_child_that_escapes_the_process_group_cannot_write_after_the_report() 
         .await
         .expect("a language image");
 
-    // The forged line names a nonce it cannot know, so it can only be a guess --
-    // the point here is that nothing of the submission's is alive to write at
-    // all, whatever it would have written.
+    let (here, on_the_host) = fixture("escapee");
+    let output = Fifo::make(here.join(Pipes::OUTPUT), 0o600).expect("the output channel");
+    let reading = tokio::task::spawn_blocking({
+        let at = output.path().to_path_buf();
+        move || std::fs::read(at).unwrap_or_default()
+    });
+
     // One line and no escapes at all: `os.fork()` answers 0 in the child,
     // which is falsy, so the child evaluates the tuple and the parent skips it.
-    let escapee = "import os, sys, time; print('before', file=sys.stderr); os.fork() or (os.setsid(), time.sleep(3), print('AFTER THE REPORT', file=sys.stderr), os._exit(0))";
+    let escapee = "import os, time; print('before', flush=True); os.fork() or (os.setsid(), time.sleep(3), print('AFTER THE REPORT', flush=True), os._exit(0))";
 
     let profile = Profile::new(
         WITH_SHIM,
@@ -1459,29 +1471,36 @@ async fn a_child_that_escapes_the_process_group_cannot_write_after_the_report() 
             aj_sandbox::SHIM.into(),
             // Input, then output. See the note on the test above.
             "/dev/null".into(),
-            "/dev/null".into(),
+            format!("/pipes/{}", Pipes::OUTPUT),
             "python3".into(),
             "-c".into(),
             escapee.into(),
         ],
     )
     .wall_clock(Duration::from_secs(20))
-    .measured();
+    .measured()
+    .silent()
+    .pipes(&here, &on_the_host, "/pipes");
 
     let outcome = docker.run(&profile).await.expect("the run");
-    let stderr = String::from_utf8_lossy(&outcome.stderr);
+    // The escapee holds the writing end, so the end of the channel is the end of
+    // the last process that had it — which is the ordering under test. This is
+    // only for the run that never got that far.
+    release(output.path());
+    let said = String::from_utf8_lossy(&reading.await.expect("the reader")).into_owned();
 
+    assert!(said.contains("before"), "the program's own output survives");
     assert!(
-        stderr.contains("before"),
-        "the program's own output survives"
+        !said.contains("AFTER THE REPORT"),
+        "a child outlived the report: {said}"
     );
     assert!(
-        !stderr.contains("AFTER THE REPORT"),
-        "a child outlived the report: {stderr}"
+        !said.contains("aj-shim1"),
+        "the report travels on its own channel and not this one: {said}"
     );
     assert!(
-        !stderr.contains("aj-shim1"),
-        "the report is taken out of what is stored: {stderr}"
+        outcome.cpu_time.is_some(),
+        "the report arrived, so there was one to be too late for"
     );
     assert_eq!(leftovers(&docker).await, 0);
 }
