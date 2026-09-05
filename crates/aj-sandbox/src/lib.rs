@@ -18,7 +18,13 @@ pub mod affinity;
 pub mod beside;
 mod cgroups;
 pub mod docker;
-pub mod profile;
+/// Named pipes, and why a judged run travels on one.
+///
+/// Unix only, and that is not a gap: the sandbox starts Linux containers
+/// through a Linux daemon, and `./x` builds it in one.
+#[cfg(unix)]
+pub mod pipes;
+mod profile;
 
 pub use beside::{Beside, Enough};
 pub use cgroups::Cgroups;

@@ -21,6 +21,9 @@ license = "MIT"
 repository = "https://github.com/AlgoJudge/AlgoJudge-Runner"
 
 [workspace.dependencies]
+# Only for `mkfifo`, which std does not expose. Already in the tree as a
+# transitive dependency of tokio, so the graph does not grow.
+libc = "0.2"
 # These are ranges, not the record. **`Cargo.lock` is the record** — it is
 # committed, it names an exact version and a checksum for every crate in the
 # graph, and it is what a reviewer reads to answer "which version". A comment
