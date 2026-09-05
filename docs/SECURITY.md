@@ -124,7 +124,12 @@ has a test rather than a paragraph.
    `<name>.in`, mounted read-only and opened by the measuring shim, which is
    handed exactly two paths — what to read and what to write. Mounting the whole
    `tests/` directory would put `<name>.out` — the answer — inside the
-   submission's own container. See `pipeline.rs::input_mount`.
+   submission's own container. See `pipeline.rs::input_mount`, and
+   `judging.rs::a_judged_submission_cannot_read_the_answer_key`, which proves it
+   from **inside** a container: a submission that calls `open` on every test file
+   the package has reaches its own `.in` and nothing else — not its own `.out`,
+   and not another test's anything. Its interactive twin reaches nothing at all,
+   `/in` included.
 3. **Nothing a program writes reaches the next test.** Asserted in
    `adversarial.rs::nothing_survives_from_one_run_to_the_next`, for the scratch
    tmpfs **and** for `/dev/shm`.
@@ -137,6 +142,16 @@ has a test rather than a paragraph.
    cgroup gate for its whole length, and on the systemd cgroup driver that gate
    is an owned mutex, so a program beside it asking for one of its own would wait
    for a run that is waiting for it.
+
+   That was two differences until 2026-09-05, and this document named one. The
+   `--cpuset-cpus` row above was applied to the judged run alone, so on a host an
+   operator had divided, **every build and every judge floated across the whole
+   machine** while the program being measured sat on its one processor. All five
+   containers carry the set now, and
+   `pipeline.rs::every_container_this_pipeline_starts_is_confined_to_the_runners_processors`
+   is what keeps a sixth from being added without it — a source check, because
+   the behaviour is only observable on a machine that has been divided up, which
+   neither a developer's nor CI's is.
 
 Two things that follow, and are easy to get wrong in the opposite direction:
 

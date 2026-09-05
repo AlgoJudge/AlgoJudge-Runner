@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aj_package::{Config, TestSet};
+use aj_package::{Config, Test, TestSet};
 use aj_sandbox::pipes::{open_for_writing, release, release_writer, Fifo};
 use aj_sandbox::{Beside, Enough, Mount, Pipes, Profile, Sandbox, Stopped};
 
@@ -135,6 +135,37 @@ const MAX_REPORTED_VIOLATIONS: usize = 100;
 pub struct Places {
     pub here: PathBuf,
     pub on_host: PathBuf,
+}
+
+/// Everything a judged submission's container is given.
+///
+/// **An interactive one is given no input file, and that is the whole of what
+/// makes a problem interactive.** Everything it reads is what the interactor
+/// decided to send in answer to what it wrote; mounting the file as well would
+/// let it skip the conversation, and for a problem whose secret is derived from
+/// the input it would hand over the answer.
+///
+/// `PACKAGE_FORMAT.md` says the submission is given nothing at the start. That
+/// was prose and not code until 2026-09-05: the mount was applied to every
+/// judged run, interactive or not.
+///
+/// **The forbidden-identifier dictionary already refuses `fopen` and `ifstream`
+/// to a submission**, so this was never the only thing standing there — which is
+/// also why the hole was invisible. It is not enough on its own for the reason
+/// `docs/SECURITY.md` §4 gives: it is a *policy* control by decision (D-10) and
+/// **every rule in it is expected to be bypassable**. `open` and `read` are not
+/// on it at all, deliberately, so a submission that declares them itself reads
+/// whatever it is given — which is exactly what
+/// `a_judged_submission_cannot_read_the_answer_key` does.
+///
+/// A function rather than a chain at the call site, because this is the one
+/// place the rule is stated and it can then be asserted without a container.
+fn judged_mounts(artefacts: &Path, package: &Path, test: &str, interactive: bool) -> Vec<Mount> {
+    let mut mounts = vec![Mount::read_only(artefacts, PROGRAM)];
+    if !interactive {
+        mounts.push(input_mount(package, test));
+    }
+    mounts
 }
 
 /// What a running submission is given of the package: **one input file.**
@@ -288,6 +319,18 @@ impl<S: Sandbox> Pipeline<S> {
     ///
     /// **Given, not chosen.** Where the Runner may use the whole machine this
     /// adds nothing and the host's scheduler places the job.
+    /// **Every container this pipeline starts goes through here.**
+    ///
+    /// Five do: the submission's build, the judged run, a checker's or an
+    /// interactor's build, and the checker or interactor itself. Only the judged
+    /// run did until 2026-09-05, which left the other four ignoring an
+    /// operator's division of the host — on a machine cut into twelve, every
+    /// compiler and every judge floated across all sixteen processors while the
+    /// program being measured sat on one. `docs/SECURITY.md` said the division
+    /// was carried to the job containers, and it was carried to one of five.
+    ///
+    /// The two builds are the ones that mattered most: a compiler is the most
+    /// processor-hungry thing here, and a checker mostly waits on a pipe.
     fn pinned(&self, profile: Profile) -> Profile {
         pin(profile, self.cpus.as_deref())
     }
@@ -413,16 +456,18 @@ impl<S: Sandbox> Pipeline<S> {
             let built = self
                 .sandbox
                 .run(
-                    &Profile::new(&language.image, command)
-                        .memory_bytes(512 * 1024 * 1024)
-                        .pids(128)
-                        .wall_clock(Duration::from_secs(60))
-                        .max_output_bytes(BUILD_LOG_BYTES)
-                        .max_file_bytes(BUILD_ARTEFACT_BYTES as i64)
-                        .tmpfs_bytes(BUILD_TMPFS_BYTES)
-                        .writable_root()
-                        .collect(BUILD_OUTPUT, BUILD_ARTEFACT_BYTES)
-                        .mount(Mount::read_only(&source.on_host, SOURCE)),
+                    &self.pinned(
+                        Profile::new(&language.image, command)
+                            .memory_bytes(512 * 1024 * 1024)
+                            .pids(128)
+                            .wall_clock(Duration::from_secs(60))
+                            .max_output_bytes(BUILD_LOG_BYTES)
+                            .max_file_bytes(BUILD_ARTEFACT_BYTES as i64)
+                            .tmpfs_bytes(BUILD_TMPFS_BYTES)
+                            .writable_root()
+                            .collect(BUILD_OUTPUT, BUILD_ARTEFACT_BYTES)
+                            .mount(Mount::read_only(&source.on_host, SOURCE)),
+                    ),
                 )
                 .await
                 .map_err(|e| format!("the build could not be run: {e}"))?;
@@ -464,6 +509,16 @@ impl<S: Sandbox> Pipeline<S> {
             }
             (None, None) => None,
         };
+
+        // **`tests/` may legitimately not be there**, since an interactive
+        // package may name its tests by a count and ship no files at all — and
+        // a checker's and an interactor's container binds the directory whole.
+        // A bind mount of a missing source is not an error: the daemon makes an
+        // empty directory and the run proceeds against nothing.
+        if aside.is_some() {
+            std::fs::create_dir_all(job.package.here.join("tests"))
+                .map_err(|e| format!("the package's tests/ could not be made: {e}"))?;
+        }
 
         // ── each test, in its own container ─────────────────────────────────
         let mut outcomes = Vec::new();
@@ -543,10 +598,23 @@ impl<S: Sandbox> Pipeline<S> {
 
             let watching = match &aside {
                 Some(_) => Watching::Relay(beside_channels[0].path().to_path_buf()),
+                // **Unreachable without a `.out`, and the reader is what makes
+                // that so.** `TestSet::read` refuses a package that has neither
+                // a judge nor an expected output, so arriving here with `None`
+                // means the two have disagreed — an infrastructure failure and
+                // not a verdict, because nothing about it is the submission's.
                 None => Watching::Against(
-                    String::from_utf8_lossy(
-                        &std::fs::read(&test.expected).map_err(|e| e.to_string())?,
-                    )
+                    String::from_utf8_lossy(&match &test.expected {
+                        Some(at) => std::fs::read(at)
+                            .map_err(|e| format!("test {}: the expected output: {e}", test.name))?,
+                        None => {
+                            return Err(format!(
+                                "test {}: nothing decides this test — the package declares \
+                                 no checker and no interactor, and ships no expected output",
+                                test.name
+                            ))
+                        }
+                    })
                     .into_owned(),
                 ),
             };
@@ -579,36 +647,42 @@ impl<S: Sandbox> Pipeline<S> {
 
             // Bound rather than passed as a temporary: the future below holds
             // a reference to it for as long as it runs.
-            let judged = self.pinned(
-                Profile::new(
-                    &language.image,
-                    language::with_channels(
-                        &language.start,
-                        &match &feeding {
-                            Some(_) => format!("{OUTPUT}/{}", Pipes::INPUT),
-                            None => language::test_input(&test.name),
-                        },
-                        &format!("{OUTPUT}/{}", Pipes::OUTPUT),
-                    ),
-                )
-                .memory_bytes(limits.memory_bytes)
-                .pids(16)
-                // The one step a participant is judged on the time of, and
-                // so the one that goes through the shim.
-                .measured()
-                // **Nothing leaves this container on its stdio.** The
-                // output travels on the pipe and the shim's report on
-                // its own, so the daemon has nothing to write down and
-                // no log driver to write it with.
-                .silent()
-                .wall_clock(reaping_deadline(limits.time_ms))
-                // What the deadline above measures progress against,
-                // and what "plainly past its budget" is measured from.
-                .cpu_limit(Duration::from_millis(limits.time_ms))
-                .pipes(&channels.here, &channels.on_host, OUTPUT)
-                .mount(Mount::read_only(&artefacts.on_host, PROGRAM))
-                .mount(input_mount(&job.package.on_host, &test.name)),
-            );
+            let judged = Profile::new(
+                &language.image,
+                language::with_channels(
+                    &language.start,
+                    &match &feeding {
+                        Some(_) => format!("{OUTPUT}/{}", Pipes::INPUT),
+                        None => language::test_input(&test.name),
+                    },
+                    &format!("{OUTPUT}/{}", Pipes::OUTPUT),
+                ),
+            )
+            .memory_bytes(limits.memory_bytes)
+            .pids(16)
+            // The one step a participant is judged on the time of, and
+            // so the one that goes through the shim.
+            .measured()
+            // **Nothing leaves this container on its stdio.** The
+            // output travels on the pipe and the shim's report on
+            // its own, so the daemon has nothing to write down and
+            // no log driver to write it with.
+            .silent()
+            .wall_clock(reaping_deadline(limits.time_ms))
+            // What the deadline above measures progress against,
+            // and what "plainly past its budget" is measured from.
+            .cpu_limit(Duration::from_millis(limits.time_ms))
+            .pipes(&channels.here, &channels.on_host, OUTPUT);
+
+            let judged = judged_mounts(
+                &artefacts.on_host,
+                &job.package.on_host,
+                &test.name,
+                feeding.is_some(),
+            )
+            .into_iter()
+            .fold(judged, Profile::mount);
+            let judged = self.pinned(judged);
 
             // **The checker runs beside the submission, not after it.** It is
             // reading the answer as the program writes it, which is what makes
@@ -622,12 +696,12 @@ impl<S: Sandbox> Pipeline<S> {
             let running = self.sandbox.run_beside(&judged, &beside);
             let (run, said) = match &aside {
                 Some(Aside::Checker(built)) => {
-                    let checking = self.check(job, built, &beside_them, &test.name);
+                    let checking = self.check(job, built, &beside_them, test);
                     let (run, said) = tokio::join!(running, checking);
                     (run, Some(said))
                 }
                 Some(Aside::Interactor(built)) => {
-                    let interacting = self.interact(job, built, &beside_them, &test.name);
+                    let interacting = self.interact(job, built, &beside_them, test);
                     let (run, said) = tokio::join!(running, interacting);
                     (run, Some(said))
                 }
@@ -888,16 +962,18 @@ impl<S: Sandbox> Pipeline<S> {
         let built = self
             .sandbox
             .run(
-                &Profile::new(&language.image, language.build.clone().unwrap_or_default())
-                    .memory_bytes(512 * 1024 * 1024)
-                    .pids(128)
-                    .wall_clock(Duration::from_secs(60))
-                    .max_output_bytes(BUILD_LOG_BYTES)
-                    .max_file_bytes(BUILD_ARTEFACT_BYTES as i64)
-                    .tmpfs_bytes(BUILD_TMPFS_BYTES)
-                    .writable_root()
-                    .collect(BUILD_OUTPUT, BUILD_ARTEFACT_BYTES)
-                    .mount(Mount::read_only(&source.on_host, SOURCE)),
+                &self.pinned(
+                    Profile::new(&language.image, language.build.clone().unwrap_or_default())
+                        .memory_bytes(512 * 1024 * 1024)
+                        .pids(128)
+                        .wall_clock(Duration::from_secs(60))
+                        .max_output_bytes(BUILD_LOG_BYTES)
+                        .max_file_bytes(BUILD_ARTEFACT_BYTES as i64)
+                        .tmpfs_bytes(BUILD_TMPFS_BYTES)
+                        .writable_root()
+                        .collect(BUILD_OUTPUT, BUILD_ARTEFACT_BYTES)
+                        .mount(Mount::read_only(&source.on_host, SOURCE)),
+                ),
             )
             .await
             .map_err(|e| format!("the checker could not be built: {e}"))?;
@@ -941,8 +1017,10 @@ impl<S: Sandbox> Pipeline<S> {
         job: &Job<'_>,
         interactor: &Built,
         beside_them: &Places,
-        test: &str,
+        test: &Test,
     ) -> Result<Result<crate::checker::Checked, Broken>, String> {
+        let group = test.group;
+        let test = &test.name;
         let mut command = interactor.start.clone();
         command.extend([
             format!("{INPUT}/{test}.in"),
@@ -962,7 +1040,8 @@ impl<S: Sandbox> Pipeline<S> {
         let run = self
             .sandbox
             .run(
-                &Profile::new(
+                &self.pinned(
+                    Profile::new(
                     &interactor.image,
                     vec![
                         "/bin/sh".to_owned(),
@@ -975,7 +1054,24 @@ impl<S: Sandbox> Pipeline<S> {
                 .memory_bytes(256 * 1024 * 1024)
                 .pids(16)
                 .wall_clock(CHECKER_WALL_CLOCK)
-                .max_output_bytes(64 * 1024)
+                // The same two a checker is given, for the same reason.
+                .env(format!("AJ_TEST={test}"))
+                .env(format!("AJ_GROUP={group}"))
+                // **Nothing here reads this container's streams**, so it keeps
+                // no log: the conversation is on two FIFOs and the verdict on a
+                // third, and all that is left on stderr is whatever the author
+                // chose to print for themselves.
+                //
+                // **The output cap went with it, and that is a repair.** It was
+                // 64 KiB, it bounded only that stderr — and crossing it gave
+                // `Stopped::Output`, which the check below turns into "the
+                // interactor was stopped", a broken-package error for an
+                // interactor that was working and merely talkative. What bounds
+                // this run now is `CHECKER_WALL_CLOCK` alone: an interactor that
+                // never stops costs thirty seconds **per test**, because this is
+                // `run` rather than `run_beside` and nothing ends it when the
+                // submission does.
+                .silent()
                 // See `check`: this is what keeps the systemd cgroup driver's
                 // gate from deadlocking two runs against each other.
                 .alongside()
@@ -986,6 +1082,7 @@ impl<S: Sandbox> Pipeline<S> {
                 .mount(Mount::writable(&beside_them.on_host, ANSWER))
                 .mount(Mount::read_only(&interactor.at.on_host, PROGRAM))
                 .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT)),
+                ),
             )
             .await
             .map_err(|e| format!("the interactor could not be run: {e}"))?;
@@ -1006,8 +1103,10 @@ impl<S: Sandbox> Pipeline<S> {
         job: &Job<'_>,
         checker: &Built,
         beside_them: &Places,
-        test: &str,
+        test: &Test,
     ) -> Result<Result<crate::checker::Checked, Broken>, String> {
+        let group = test.group;
+        let test = &test.name;
         let mut command = checker.start.clone();
         command.extend([
             format!("{INPUT}/{test}.in"),
@@ -1018,22 +1117,36 @@ impl<S: Sandbox> Pipeline<S> {
         let run = self
             .sandbox
             .run(
-                &Profile::new(&checker.image, command)
-                    .memory_bytes(256 * 1024 * 1024)
-                    .pids(16)
-                    .wall_clock(CHECKER_WALL_CLOCK)
-                    .max_output_bytes(64 * 1024)
-                    .mount(Mount::read_only(&checker.at.on_host, PROGRAM))
-                    .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT))
-                    // **Alongside, and this is the flag that stops a hard
-                    // deadlock.** The judged run holds the measurement gate for
-                    // its whole length, and on the systemd cgroup driver that
-                    // gate is an owned mutex — a checker asking for one of its
-                    // own would wait for a run that is waiting for it.
-                    .alongside()
-                    // Read-only, and a pipe opened for reading is a read: what
-                    // the mount refuses is creating or replacing the name.
-                    .mount(Mount::read_only(&beside_them.on_host, ANSWER)),
+                &self.pinned(
+                    Profile::new(&checker.image, command)
+                        .memory_bytes(256 * 1024 * 1024)
+                        .pids(16)
+                        .wall_clock(CHECKER_WALL_CLOCK)
+                        .max_output_bytes(64 * 1024)
+                        // **Which test this is, said rather than parsed.** It is in
+                        // `argv[1]` already — `/in/2a.in` — so this adds nothing a
+                        // checker could not work out. What it removes is the working
+                        // out: the split of `2a` into a group and a letter is a rule of
+                        // the package format, and a checker deriving it again is that
+                        // rule copied into code we do not control and cannot correct.
+                        //
+                        // **Variables rather than a fourth argument**, because
+                        // `argv[1..3]` is SIO2's contract taken verbatim and a checker
+                        // moved from there must keep working untouched.
+                        .env(format!("AJ_TEST={test}"))
+                        .env(format!("AJ_GROUP={group}"))
+                        .mount(Mount::read_only(&checker.at.on_host, PROGRAM))
+                        .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT))
+                        // **Alongside, and this is the flag that stops a hard
+                        // deadlock.** The judged run holds the measurement gate for
+                        // its whole length, and on the systemd cgroup driver that
+                        // gate is an owned mutex — a checker asking for one of its
+                        // own would wait for a run that is waiting for it.
+                        .alongside()
+                        // Read-only, and a pipe opened for reading is a read: what
+                        // the mount refuses is creating or replacing the name.
+                        .mount(Mount::read_only(&beside_them.on_host, ANSWER)),
+                ),
             )
             .await
             .map_err(|e| format!("the checker could not be run: {e}"))?;
@@ -1111,14 +1224,29 @@ fn relay(
         // until the program has produced something would hold it there for as
         // long as the program thinks.
         let mut far = match &watching {
+            // **A checker that never opens its answer is not an error, and
+            // giving up on the run because of it was one.** Reading argv[2] is
+            // the ordinary thing to do and not a requirement: a checker may
+            // decide on the input alone, or refuse on its arguments and exit.
+            //
+            // This used to return here, which left nothing reading the
+            // submission's pipe — so the shim blocked opening it, the run was
+            // reaped, and a correct submission came back **Time limit
+            // exceeded**. The verdict belonged to a checker that had already
+            // answered. Now the bytes are read and dropped, exactly as they are
+            // after a checker exits early.
+            //
+            // The wait stays the checker's whole wall clock, and it has to: a
+            // shorter one could give up on a checker that was going to read,
+            // and *that* would be a wrong verdict rather than a slow one.
             Watching::Relay(to) => match open_for_writing(to, CHECKER_WALL_CLOCK) {
                 Ok(open) => Some(open),
                 Err(e) => {
-                    tracing::warn!(path = %to.display(), %e, "the checker never opened its answer");
-                    return Produced {
-                        found: None,
-                        capped: false,
-                    };
+                    tracing::warn!(
+                        path = %to.display(), %e,
+                        "nothing opened the answer channel; the run is drained and discarded",
+                    );
+                    None
                 }
             },
             _ => None,
@@ -1516,6 +1644,29 @@ mod tests {
         assert_eq!(pin(a_run(), None).cpuset, None);
     }
 
+    /// **Every profile this file builds is pinned, and this is what says so.**
+    ///
+    /// A source check rather than a behavioural one, because the behaviour is
+    /// only observable on a host that has been divided up — which neither a
+    /// developer's machine nor CI is, so a container test would pass on both
+    /// while the property was false. Reading the source is what is left.
+    ///
+    /// It caught four of five call sites on 2026-09-05: only the judged run was
+    /// pinned, so every compiler and every judge escaped the operator's cpuset.
+    #[test]
+    fn every_container_this_pipeline_starts_is_confined_to_the_runners_processors() {
+        let source = include_str!("pipeline.rs");
+        let production = &source[..source.find("#[cfg(test)]").expect("a test module")];
+
+        let built = production.matches("Profile::new(").count();
+        let pinned = production.matches("self.pinned(").count();
+        assert_eq!(
+            built, pinned,
+            "{built} profiles are built and {pinned} are pinned; a container that \
+             skips `pinned` ignores an operator's division of the host",
+        );
+    }
+
     /// And a Runner that *was* given a set hands that set on, because a job
     /// container is the daemon's child and inherits no affinity from the Runner
     /// that asked for it.
@@ -1581,6 +1732,43 @@ mod tests {
 
         assert_eq!(shown.len(), 3);
         assert!(shown.iter().all(|line| !line.contains("not listed")));
+    }
+
+    /// **An interactive submission is given no input file at all.**
+    ///
+    /// Everything it reads is what the interactor decided to send. Mounting the
+    /// file as well would let it skip the conversation — and where the secret is
+    /// derived from the input, as it is in every guessing problem, it would hand
+    /// over the answer.
+    ///
+    /// **Asserted here rather than in a container**, because from inside there
+    /// is no way to look: reading a file needs `fopen` or `ifstream`, and the
+    /// forbidden-identifier dictionary refuses a submission both. That
+    /// dictionary is why the hole went unnoticed, and it is also why it is not
+    /// enough — it is a policy control by decision, and a package may turn it
+    /// off.
+    #[test]
+    fn an_interactive_submission_is_given_no_input_file() {
+        let package = std::path::Path::new("/packages/one");
+        let artefacts = std::path::Path::new("/work/build/out");
+
+        let batch = judged_mounts(artefacts, package, "2a", false);
+        assert!(
+            batch.iter().any(|m| m.to == "/in/2a.in"),
+            "a batch problem's input is a mounted file: {batch:?}",
+        );
+
+        let interactive = judged_mounts(artefacts, package, "2a", true);
+        assert!(
+            !interactive.iter().any(|m| m.to.starts_with("/in")),
+            "an interactive submission was handed the input it is supposed to ask for: \
+             {interactive:?}",
+        );
+        assert_eq!(
+            interactive.len(),
+            1,
+            "the program, and nothing else: {interactive:?}",
+        );
     }
 
     /// The answer key is not in the container the submission runs in.
@@ -1692,8 +1880,8 @@ mod tests {
             name: "1a".into(),
             group: 1,
             letter: "a".into(),
-            input: PathBuf::from("1a.in"),
-            expected: PathBuf::from("1a.out"),
+            input: Some(PathBuf::from("1a.in")),
+            expected: Some(PathBuf::from("1a.out")),
         };
 
         let ran = failed(

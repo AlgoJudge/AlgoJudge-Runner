@@ -170,6 +170,12 @@ pub struct Profile {
     /// Off for a build and for a checker: those two are read through
     /// [`Outcome::stdout`] and [`Outcome::stderr`], and a driver of `none`
     /// refuses the endpoint that reads them.
+    ///
+    /// **It also takes [`Profile::max_output_bytes`] with it**, which is the
+    /// consequence a caller is likeliest to miss. That cap is counted by the
+    /// collector, and the collector is not started for a silent run at all — so
+    /// a profile that is silent and states a cap is stating one nothing applies.
+    /// Set one or the other.
     pub silent: bool,
 
     /// This container runs **beside** a measured one, and opens no measurement.
@@ -185,6 +191,15 @@ pub struct Profile {
     /// than its own exit already makes it a *broken* checker rather than a
     /// verdict.
     pub alongside: bool,
+
+    /// What to put in this container's environment, as `NAME=value`.
+    ///
+    /// **For a program the package brought, and never for a submission.** The
+    /// shim's own variables are added by the sandbox and are not these; a
+    /// submission's container gets nothing here, because everything it is told
+    /// arrives as an argument or a mounted file, and an environment is a place
+    /// to leak something into by accident.
+    pub env: Vec<String>,
 
     /// A path inside the container to read back after it exits.
     ///
@@ -308,6 +323,7 @@ impl Profile {
             writable_root: false,
             silent: false,
             alongside: false,
+            env: Vec::new(),
             collect: None,
             max_collected_bytes: 0,
         }
@@ -394,10 +410,18 @@ impl Profile {
         self
     }
 
-    /// What to read back, and the most of it that will be held. **One call for
-    /// both**, so a caller cannot ask for the first and forget the second.
+    /// Keep no log of this container, and read nothing back from it.
+    ///
+    /// For a run whose output travels somewhere the Runner already holds. See
+    /// [`Profile::silent`] for what it costs, including the output cap.
     pub fn silent(mut self) -> Self {
         self.silent = true;
+        self
+    }
+
+    /// Adds one `NAME=value` to the container's environment.
+    pub fn env(mut self, entry: impl Into<String>) -> Self {
+        self.env.push(entry.into());
         self
     }
 

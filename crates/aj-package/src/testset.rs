@@ -18,8 +18,20 @@ pub struct Test {
     pub group: u32,
     /// `a`, `b`, … — kept for ordering rather than for display.
     pub letter: String,
-    pub input: PathBuf,
-    pub expected: PathBuf,
+    /// Where `<name>.in` is, when the package ships one.
+    ///
+    /// **Nothing opens this path.** The pipeline rebuilds it from `name` when it
+    /// mounts one file into the submission's container, which is what lets that
+    /// rule be asserted without a container at all. What this field answers is
+    /// *is there one* — and only an interactive problem may say no, because
+    /// everywhere else the submission reads it.
+    pub input: Option<PathBuf>,
+    /// Where `<name>.out` is, when the package ships one.
+    ///
+    /// Absent only where something else decides the verdict: a checker is handed
+    /// the path whether or not the file is behind it, and an interactor knows
+    /// the answer by construction.
+    pub expected: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,43 +46,117 @@ impl TestSet {
     /// a group the config does not declare is a package error, not a test worth
     /// zero. Silently scoring it would make a mistyped group number look like a
     /// failing solution.
+    ///
+    /// **The census is the union of two sources**, and it is keyed by name. A
+    /// name is a test if `<name>.in` exists, or `<name>.out` does, or a group
+    /// declares a count that reaches it. Keyed, because the same name arriving
+    /// from two of those is one test: pushed twice it would double
+    /// [`TestSet::in_group`], which is the divisor for a test's share of the
+    /// group's points — every group would quietly score half.
+    ///
+    /// **Which of the two files a test needs depends on what judges it**, and on
+    /// nothing else. With neither a checker nor an interactor the `.out` file is
+    /// the whole verdict and the `.in` is what the program reads, so both are
+    /// required. A checker replaces the comparison, so `.out` becomes the
+    /// author's choice. An interactor replaces the input as well — the
+    /// submission is handed no file at all — so both do.
+    ///
+    /// `output-only@1` shares this reader and is untouched by any of it: it
+    /// declares no judge, so it lands in the first case and still needs both.
     pub fn read(root: &Path, config: &Config) -> Result<Self> {
         let directory = root.join("tests");
-        if !directory.is_dir() {
+
+        // What the configuration names, before anything is looked at.
+        let mut named: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for group in &config.groups {
+            for index in 0..group.tests.unwrap_or(0) {
+                named.insert(format!("{}{}", group.group, (b'a' + index as u8) as char));
+            }
+        }
+
+        // What is on disk. `(has .in, has .out)` per name.
+        let mut found: std::collections::BTreeMap<String, (bool, bool)> =
+            std::collections::BTreeMap::new();
+        if directory.is_dir() {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(&directory)?
+                .flatten()
+                .map(|e| e.path())
+                .collect();
+            entries.sort();
+
+            for path in entries {
+                let extension = path.extension().and_then(|e| e.to_str());
+                let Some(extension) = extension.filter(|e| *e == "in" || *e == "out") else {
+                    continue;
+                };
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| Error::invalid("a test file has an unreadable name"))?
+                    .to_owned();
+
+                let (group, _) = split(&name)?;
+                let Some(declared) = config.group(group) else {
+                    return Err(Error::invalid(format!(
+                        "test {name} is in group {group}, which config.yml does not declare"
+                    )));
+                };
+
+                // **A file outside a declared count is refused, not ignored.**
+                // An ignored test is one the author believes is running while
+                // the divisor leaves it out, and the score says nothing.
+                if let Some(count) = declared.tests {
+                    if !named.contains(&name) {
+                        return Err(Error::invalid(format!(
+                            "tests/{name}.{extension} is in group {group}, which declares \
+                             {count} tests — {name} is not one of them"
+                        )));
+                    }
+                }
+
+                let entry = found.entry(name).or_default();
+                if extension == "in" {
+                    entry.0 = true;
+                } else {
+                    entry.1 = true;
+                }
+            }
+        } else if named.is_empty() {
             return Err(Error::invalid("the package has no tests/ directory"));
         }
 
         let mut tests = Vec::new();
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(&directory)?
-            .flatten()
-            .map(|e| e.path())
-            .collect();
-        entries.sort();
-
-        for input in entries {
-            if input.extension().and_then(|e| e.to_str()) != Some("in") {
-                continue;
-            }
-            let name = input
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| Error::invalid("a test file has an unreadable name"))?
-                .to_owned();
-
+        for name in named
+            .iter()
+            .cloned()
+            .chain(found.keys().cloned())
+            .collect::<std::collections::BTreeSet<String>>()
+        {
             let (group, letter) = split(&name)?;
-
             if config.group(group).is_none() {
                 return Err(Error::invalid(format!(
                     "test {name} is in group {group}, which config.yml does not declare"
                 )));
             }
 
-            let expected = directory.join(format!("{name}.out"));
-            if !expected.is_file() {
-                return Err(Error::invalid(format!(
-                    "test {name} has no {name}.out; a test with no expected output \
-                     cannot be judged, and a checker replaces the comparison, not the file"
-                )));
+            let (has_input, has_expected) = found.get(&name).copied().unwrap_or((false, false));
+            let input = has_input.then(|| directory.join(format!("{name}.in")));
+            let expected = has_expected.then(|| directory.join(format!("{name}.out")));
+
+            if config.interactor.is_none() {
+                if input.is_none() {
+                    return Err(Error::invalid(format!(
+                        "test {name} has no {name}.in; only an interactive problem judges \
+                         without one, because only there is the input something the \
+                         submission is not given"
+                    )));
+                }
+                if config.checker.is_none() && expected.is_none() {
+                    return Err(Error::invalid(format!(
+                        "test {name} has no {name}.out; with no checker and no interactor \
+                         the file is what decides the verdict"
+                    )));
+                }
             }
 
             tests.push(Test {
@@ -193,8 +279,17 @@ groups:
         assert_eq!(set.in_group(1), 2);
     }
 
+    /// A judging program, appended to [`CONFIG`].
+    fn judged_by(what: &str) -> Config {
+        Config::parse(&format!(
+            "{CONFIG}{what}:\n  source: judge/judge.cpp\n  language: cpp\n"
+        ))
+        .unwrap()
+    }
+
+    /// **With nothing else to decide, the file is the verdict.**
     #[test]
-    fn a_test_without_expected_output_is_refused() {
+    fn a_test_without_expected_output_is_refused_when_nothing_else_decides() {
         let root = package(
             "no-out",
             &[
@@ -203,10 +298,150 @@ groups:
                 ("tests/1a.in", "a"),
             ],
         );
-        let config = Config::parse(CONFIG).unwrap();
+
+        let error = TestSet::read(&root, &Config::parse(CONFIG).unwrap()).unwrap_err();
+        assert!(matches!(error, Error::Invalid(_)), "got {error}");
+    }
+
+    /// **A checker replaces the comparison, so the file it replaced is the
+    /// author's choice.** It is still handed the path as `argv[3]`; whether
+    /// anything is behind it is between the author and their own checker.
+    #[test]
+    fn a_checker_makes_the_expected_output_optional() {
+        let root = package(
+            "checker-no-out",
+            &[
+                ("tests/0a.in", "a"),
+                ("tests/0a.out", "A"),
+                ("tests/1a.in", "a"),
+            ],
+        );
+
+        let set = TestSet::read(&root, &judged_by("checker")).expect("a checker package");
+        let one = set.iter().find(|t| t.name == "1a").expect("1a");
+        assert!(one.input.is_some(), "the submission still reads its input");
+        assert!(
+            one.expected.is_none(),
+            "and nothing else was invented for it"
+        );
+    }
+
+    /// **An interactor replaces the input as well**, because the submission is
+    /// handed no file at all — so a test may have neither.
+    #[test]
+    fn an_interactor_makes_both_files_optional() {
+        let root = package(
+            "interactor-bare",
+            &[("tests/0a.in", "a"), ("tests/1a.out", "A")],
+        );
+
+        let set = TestSet::read(&root, &judged_by("interactor")).expect("an interactive package");
+        let names: Vec<&str> = set.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["0a", "1a"], "either file names a test");
+
+        let zero = set.iter().find(|t| t.name == "0a").unwrap();
+        assert!(zero.input.is_some() && zero.expected.is_none());
+        let one = set.iter().find(|t| t.name == "1a").unwrap();
+        assert!(one.input.is_none() && one.expected.is_some());
+    }
+
+    /// **A count is a census of its own**, for the problem where an interactor
+    /// is the whole of a test and there is no file to enumerate.
+    #[test]
+    fn a_declared_count_names_tests_that_have_no_files() {
+        let root = package("counted", &[]);
+        let config = Config::parse(
+            "type: \"standard-io@1\"\n\
+             limits:\n  timeMs: 1000\n  memoryBytes: 268435456\n\
+             interactor:\n  source: judge/judge.cpp\n  language: cpp\n\
+             groups:\n  - group: 1\n    points: 100\n    tests: 3\n",
+        )
+        .unwrap();
+
+        let set = TestSet::read(&root, &config).expect("a counted package");
+        let names: Vec<&str> = set.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["1a", "1b", "1c"]);
+        assert_eq!(
+            set.in_group(1),
+            3,
+            "the divisor for a test's share of the points comes from here",
+        );
+        assert!(set
+            .iter()
+            .all(|t| t.input.is_none() && t.expected.is_none()));
+    }
+
+    /// **A file outside a declared count is refused, not ignored.** An ignored
+    /// test is one the author believes is running while the divisor leaves it
+    /// out, and nothing anywhere says so.
+    #[test]
+    fn a_file_naming_a_test_outside_the_count_is_refused() {
+        let root = package("counted-stray", &[("tests/1d.in", "a")]);
+        let config = Config::parse(
+            "type: \"standard-io@1\"\n\
+             limits:\n  timeMs: 1000\n  memoryBytes: 268435456\n\
+             interactor:\n  source: judge/judge.cpp\n  language: cpp\n\
+             groups:\n  - group: 1\n    points: 100\n    tests: 3\n",
+        )
+        .unwrap();
 
         let error = TestSet::read(&root, &config).unwrap_err();
-        assert!(matches!(error, Error::Invalid(_)), "got {error}");
+        assert!(error.to_string().contains("not one of them"), "got {error}");
+    }
+
+    /// **A count and files together, which is the case the count is for.**
+    ///
+    /// An author seeds some tests from `.in` — a guessing problem's interactor
+    /// reads `argv[1]` to learn its secret — and leaves the rest to the
+    /// interactor to invent. So a name arrives from the count *and* from disk,
+    /// and that is the only way the same name can be built twice.
+    ///
+    /// It is also the only shape that catches an unkeyed union: with no count,
+    /// the map on disk is already unique.
+    #[test]
+    fn a_counted_group_may_also_ship_files_for_some_of_its_tests() {
+        let root = package("counted-and-seeded", &[("tests/1a.in", "a")]);
+        let config = Config::parse(
+            "type: \"standard-io@1\"\n\
+             limits:\n  timeMs: 1000\n  memoryBytes: 268435456\n\
+             interactor:\n  source: judge/judge.cpp\n  language: cpp\n\
+             groups:\n  - group: 1\n    points: 100\n    tests: 2\n",
+        )
+        .unwrap();
+
+        let set = TestSet::read(&root, &config).expect("a seeded interactive package");
+        let names: Vec<&str> = set.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["1a", "1b"], "1a came from both and is one test");
+        assert_eq!(
+            set.in_group(1),
+            2,
+            "counted twice, every test in this group would be worth half its share",
+        );
+
+        let seeded = set.iter().find(|t| t.name == "1a").unwrap();
+        assert!(seeded.input.is_some(), "the file the author did ship");
+        let invented = set.iter().find(|t| t.name == "1b").unwrap();
+        assert!(invented.input.is_none() && invented.expected.is_none());
+    }
+
+    /// **A name arriving from two sources is one test.** Pushed twice it would
+    /// double `in_group`, which is the divisor at `score.rs` — every group would
+    /// quietly score half its points, while still reading as all passed.
+    #[test]
+    fn a_paired_test_is_counted_once_now_that_both_extensions_are_read() {
+        let root = package(
+            "paired",
+            &[
+                ("tests/0a.in", "a"),
+                ("tests/0a.out", "A"),
+                ("tests/1a.in", "a"),
+                ("tests/1a.out", "A"),
+            ],
+        );
+
+        let set = TestSet::read(&root, &Config::parse(CONFIG).unwrap()).expect("a plain package");
+        assert_eq!(set.len(), 2);
+        assert_eq!(set.in_group(1), 1);
     }
 
     #[test]

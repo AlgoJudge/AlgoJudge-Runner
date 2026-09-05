@@ -28,6 +28,13 @@
 
 services:
   runner-2:
+    # **The four lines rather than the anchor**, because a YAML anchor does not
+    # cross files and the anchor this overlay's own base defines is out of reach.
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     build:
       context: .
     restart: unless-stopped

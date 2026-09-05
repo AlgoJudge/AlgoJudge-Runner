@@ -256,12 +256,7 @@ impl Docker {
         Ok(swept)
     }
 
-    fn host_config(
-        &self,
-        profile: &Profile,
-        cgroup_parent: Option<&str>,
-        shim: bool,
-    ) -> HostConfig {
+    fn host_config(profile: &Profile, cgroup_parent: Option<&str>, shim: bool) -> HostConfig {
         let memory = profile.memory_bytes as i64;
 
         HostConfig {
@@ -332,16 +327,47 @@ impl Docker {
                     .collect(),
             ),
 
-            // **Nothing is written about a silent container.** `none` is the
-            // one driver that stores nothing; it also refuses the endpoint
-            // `collect` reads, which is why only a run nobody reads that way
-            // may ask for it.
-            log_config: profile
-                .silent
-                .then(|| bollard::models::HostConfigLogConfig {
+            // **Every container this Runner starts states its driver**, and
+            // never inherits the daemon's. The default on a stock host is an
+            // unbounded `json-file`, and these are the containers that produce
+            // the most: one per test, thousands in a burst.
+            //
+            // `none` where nothing reads the stream — it stores nothing, and it
+            // also refuses the endpoint `collect` reads, which is why only a run
+            // nobody reads that way may ask for it. `local` everywhere else,
+            // because a build's output *is* the compilation error a participant
+            // reads and a checker's output *is* its verdict.
+            //
+            // **This overrides an operator's own daemon-wide driver**, a remote
+            // one included, for these containers alone. Nothing was shippable
+            // from them anyway: every path out of a run removes the container,
+            // so its log outlives it by nothing.
+            log_config: Some(if profile.silent {
+                bollard::models::HostConfigLogConfig {
                     typ: Some("none".to_owned()),
                     config: None,
-                }),
+                }
+            } else {
+                bollard::models::HostConfigLogConfig {
+                    typ: Some("local".to_owned()),
+                    config: Some(HashMap::from([
+                        ("max-size".to_owned(), format!("{}m", KEPT_LOG_MIB)),
+                        // One file, because the container is removed the moment
+                        // it exits: a second only doubles the peak on disk for
+                        // history nobody can reach.
+                        ("max-file".to_owned(), "1".to_owned()),
+                        // **Stated, and not left to the default, because the
+                        // default refuses.** `local` compresses rotated files
+                        // unless told otherwise, and the daemon rejects the pair
+                        // outright — *"compression cannot be enabled when max
+                        // file count is 1"*, a 500 at container start that
+                        // arrives as "the build could not be run" and names
+                        // nothing a reader would connect to a log driver.
+                        // Measured 2026-09-05.
+                        ("compress".to_owned(), "false".to_owned()),
+                    ])),
+                }
+            }),
 
             tmpfs: profile.tmpfs_bytes.map(|bytes| {
                 HashMap::from([(
@@ -508,20 +534,29 @@ impl Sandbox for Docker {
             // the shim that applies it, as `RLIMIT_FSIZE` on the child before
             // dropping privileges — so it is meaningless without one, and the
             // shim scrubs both.
-            env: nonce.as_ref().map(|nonce| {
-                let mut env = vec![format!("AJ_SHIM_NONCE={nonce}")];
-                if let Some(pipes) = &profile.pipes {
-                    env.push(format!("AJ_SHIM_REPORT={}", pipes.inside(Pipes::REPORT)));
+            // **The shim's own, and then the caller's.** The two never meet:
+            // a nonce is issued only for a measured run, which is a submission,
+            // and a caller states variables only for a program the package
+            // brought. Merged rather than chosen between so that neither can
+            // silently drop the other if that ever stops being true.
+            env: {
+                let mut env = Vec::new();
+                if let Some(nonce) = nonce.as_ref() {
+                    env.push(format!("AJ_SHIM_NONCE={nonce}"));
+                    if let Some(pipes) = &profile.pipes {
+                        env.push(format!("AJ_SHIM_REPORT={}", pipes.inside(Pipes::REPORT)));
+                    }
                 }
-                env
-            }),
+                env.extend(profile.env.iter().cloned());
+                (!env.is_empty()).then_some(env)
+            },
             labels: Some(self.labels()),
             // Asked for only where something reads them back. A silent
             // container's stdio carries nothing and is attached by nobody.
             attach_stdout: Some(!profile.silent),
             attach_stderr: Some(!profile.silent),
             network_disabled: Some(true),
-            host_config: Some(self.host_config(
+            host_config: Some(Self::host_config(
                 profile,
                 cgroup.as_ref().map(|(_, parent)| parent.as_str()),
                 shim,
@@ -1103,6 +1138,37 @@ fn container_user(measured: bool, shim: bool) -> &'static str {
     }
 }
 
+/// How much of a read container's log the daemon keeps.
+///
+/// **Sized well above what the reader will accept, and that is the point.** The
+/// collector *follows* the stream while the container runs, so a rotation under
+/// a live follower is a way to lose the middle of a compiler's diagnostics — the
+/// half a participant needs. `BUILD_LOG_BYTES` is what the Runner will hold of a
+/// build; this is many times it, so the daemon never rotates before the reader
+/// has stopped caring.
+///
+/// It is not a second cap. What bounds the bytes is `max_output_bytes`, counted
+/// by the collector, which kills the container. This only bounds the disk if
+/// that ever fails to.
+const KEPT_LOG_MIB: u64 = 8;
+
+/// **The kept log has to outlast the reader's appetite**, and this is where that
+/// is enforced.
+///
+/// The collector follows the stream while the container runs, so a rotation
+/// under a live follower loses the middle of a compiler's diagnostics — and the
+/// middle is where the first error is. `BUILD_LOG_BYTES` in `aj-standard-io` is
+/// the most the Runner will hold of a build; the figure is restated rather than
+/// imported, because this crate does not depend on that one and it is the
+/// **relation** that matters.
+///
+/// A build-time assertion rather than a test: nothing here is decided at run
+/// time, and a check that cannot be skipped is worth more than one that can.
+const _: () = assert!(
+    KEPT_LOG_MIB * 1024 * 1024 >= 16 * 256 * 1024,
+    "the kept log leaves no room above what a build's collector will hold",
+);
+
 /// A run's processor time, from the precise instrument and the coarse one.
 ///
 /// **The report is charged, and the reading is used to disbelieve it.** The two
@@ -1670,6 +1736,54 @@ mod tests {
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
             "ffff aj-shim1 ok 0 0 1 1 1 1 0\n"
+        );
+    }
+
+    /// **Every container this Runner starts names its driver.** Inheriting the
+    /// daemon's would put a judged fleet on an unbounded `json-file` — thousands
+    /// of containers a burst — on whatever host an operator happened to install
+    /// on, with nothing here saying so.
+    #[test]
+    fn a_container_never_inherits_the_daemons_log_driver() {
+        for profile in [
+            Profile::new("image", vec!["true".to_owned()]),
+            Profile::new("image", vec!["true".to_owned()]).silent(),
+            Profile::new("image", vec!["true".to_owned()]).measured(),
+            Profile::new("image", vec!["true".to_owned()]).alongside(),
+        ] {
+            let config = Docker::host_config(&profile, None, false);
+            assert!(
+                config.log_config.is_some(),
+                "a profile fell through to the daemon's default",
+            );
+        }
+    }
+
+    /// Silence is the whole of what `none` is for: a run nobody reads.
+    #[test]
+    fn a_silent_run_keeps_no_log_and_a_read_one_keeps_a_bounded_one() {
+        let silent = Docker::host_config(
+            &Profile::new("image", vec!["true".to_owned()]).silent(),
+            None,
+            false,
+        );
+        assert_eq!(silent.log_config.unwrap().typ.as_deref(), Some("none"));
+
+        let read =
+            Docker::host_config(&Profile::new("image", vec!["true".to_owned()]), None, false);
+        let log = read.log_config.expect("a driver");
+        assert_eq!(
+            log.typ.as_deref(),
+            Some("local"),
+            "a container something reads needs a driver that serves the logs endpoint",
+        );
+        let options = log.config.expect("bounds");
+        assert_eq!(options.get("max-size").map(String::as_str), Some("8m"));
+        assert_eq!(options.get("max-file").map(String::as_str), Some("1"));
+        assert_eq!(
+            options.get("compress").map(String::as_str),
+            Some("false"),
+            "the daemon refuses compression beside a single file, and refuses it              as a 500 at container start that names no log driver",
         );
     }
 
