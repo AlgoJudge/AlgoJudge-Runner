@@ -145,7 +145,35 @@ pub struct Group {
     /// ceiling for every test in the problem.
     #[serde(default)]
     pub limits: Option<PartialLimits>,
+
+    /// How many tests this group has, when the package ships no files for them.
+    ///
+    /// **Only an interactive problem may say this**, and it exists because an
+    /// interactor can be the whole of a test: it reads nothing, decides its own
+    /// case, and there is no file to enumerate. Everywhere else the census is
+    /// the files in `tests/`, and a count beside them would be a second source
+    /// of truth that can disagree with the first.
+    ///
+    /// It fixes the group's **names** — `1a`, `1b`, … — and not the files. A
+    /// count and files together is the useful case: an author seeds some tests
+    /// from `.in` and leaves the rest to the interactor. A file naming a test
+    /// outside the count is refused rather than ignored, because an ignored
+    /// test is one the author believes is running while the divisor at
+    /// `score.rs` quietly leaves it out.
+    ///
+    /// **Twenty-six at most, for now.** Tests are ordered by comparing their
+    /// letters as strings, so `z` and `aa` would sort as `aa, ab, …, z`. Going
+    /// further needs a fixed width — `1aa` through `1zz` — which `split` already
+    /// parses and which nothing here has yet wanted.
+    #[serde(default)]
+    pub tests: Option<u32>,
 }
+
+/// The most tests a group may declare a count for.
+///
+/// One letter each. `TestSet` orders tests by comparing letters as text, so
+/// `aa` would sort before `z` and a result document would read out of order.
+pub const MOST_TESTS_IN_A_GROUP: u32 = 26;
 
 /// How a measurement of a model solution becomes a limit, and what was measured.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -268,6 +296,19 @@ impl Config {
 
         // A Runner that does not know the version refuses the package rather
         // than guessing at what changed in it.
+        // **A judging program belongs to the type that runs one.** The shape is
+        // shared between problem types — that is why `parse_as` exists — but
+        // `output-only@1` executes nothing and has no checker by decision, so a
+        // package of that type naming one has said something this Runner would
+        // silently ignore. It also keeps the relaxations in `TestSet::read`,
+        // which key on these two fields, out of a type that must not have them.
+        if format != FORMAT && (config.checker.is_some() || config.interactor.is_some()) {
+            return Err(Error::invalid(format!(
+                "a {format} package declares a checker or an interactor, and that type \
+                 runs neither"
+            )));
+        }
+
         if declared != envelope(format) {
             return Err(Error::UnknownFormat {
                 format: declared,
@@ -342,6 +383,38 @@ impl Config {
         // produces the input that output answers. Declaring both leaves nothing
         // to say which of them is the judge, and picking one here would be this
         // Runner inventing an answer the author did not give.
+        // **A count is an interactive problem's census and nothing else's.**
+        // With a checker the submission still reads `<test>.in`, so a count that
+        // outruns the files names tests that cannot be run; with neither judge
+        // both files are what decide. In both cases the files are the census
+        // already, and a second one can only disagree with them.
+        for group in &self.groups {
+            let Some(count) = group.tests else { continue };
+            if self.interactor.is_none() {
+                return Err(Error::invalid(format!(
+                    "group {} states a test count, which only an interactive package may \
+                     do: with no interactor a test's input is a file the submission reads, \
+                     and this package ships none for it",
+                    group.group
+                )));
+            }
+            if count == 0 {
+                return Err(Error::invalid(format!(
+                    "group {} states 0 tests; every test in a group of none passing is \
+                     vacuously true, so the group would award its points to anybody",
+                    group.group
+                )));
+            }
+            if count > MOST_TESTS_IN_A_GROUP {
+                return Err(Error::invalid(format!(
+                    "group {} states {count} tests and {MOST_TESTS_IN_A_GROUP} is the most \
+                     that can be named: tests are ordered by their letters as text, so a \
+                     second letter would sort before the first twenty-six",
+                    group.group
+                )));
+            }
+        }
+
         if self.checker.is_some() && self.interactor.is_some() {
             return Err(Error::invalid(
                 "a package declares a checker or an interactor, never both: they                  decide the same question and nothing here says which of them judges",
@@ -1043,6 +1116,65 @@ calibration:
         );
         let error = Config::parse(&yaml).unwrap_err();
         assert!(matches!(error, Error::Invalid(_)), "got {error}");
+    }
+
+    /// A group's test count, and the three ways it is refused.
+    ///
+    /// **It is an interactive problem's census and nothing else's.** With a
+    /// checker the submission still reads `<test>.in`, so a count that outruns
+    /// the files names tests nothing can run; with neither judge both files are
+    /// what decide. In both cases the files are already the census, and a second
+    /// one can only disagree with them.
+    #[test]
+    fn a_test_count_belongs_to_an_interactive_package_alone() {
+        let counted = |extra: &str, count: u32| {
+            format!(
+                "type: \"standard-io@1\"\n\
+                 limits:\n  timeMs: 1000\n  memoryBytes: 268435456\n\
+                 {extra}\
+                 groups:\n  - group: 1\n    points: 100\n    tests: {count}\n"
+            )
+        };
+        let interactive = "interactor:\n  source: judge/judge.cpp\n  language: cpp\n";
+        let checked = "checker:\n  source: judge/judge.cpp\n  language: cpp\n";
+
+        Config::parse(&counted(interactive, 3)).expect("an interactive package may count");
+
+        for (what, extra) in [("no judge", ""), ("a checker", checked)] {
+            let said = Config::parse(&counted(extra, 3))
+                .expect_err("only an interactive package may count")
+                .to_string();
+            assert!(
+                said.contains("only an interactive package may do"),
+                "with {what}: {said}"
+            );
+        }
+
+        let zero = Config::parse(&counted(interactive, 0))
+            .expect_err("a group of none")
+            .to_string();
+        assert!(zero.contains("vacuously true"), "got {zero}");
+
+        let many = Config::parse(&counted(interactive, MOST_TESTS_IN_A_GROUP + 1))
+            .expect_err("more letters than there are")
+            .to_string();
+        assert!(many.contains("ordered by their letters"), "got {many}");
+    }
+
+    /// **A judging program belongs to the type that runs one.** `output-only@1`
+    /// executes nothing, so a package of that type naming a checker has said
+    /// something that would otherwise be read and ignored.
+    #[test]
+    fn only_the_type_that_runs_a_judge_may_declare_one() {
+        let yaml = "type: \"output-only@1\"\n\
+                    limits:\n  timeMs: 1000\n  memoryBytes: 268435456\n\
+                    checker:\n  source: judge/judge.cpp\n  language: cpp\n\
+                    groups:\n  - group: 1\n    points: 100\n";
+
+        let said = Config::parse_as(yaml, "output-only")
+            .expect_err("output-only runs no checker")
+            .to_string();
+        assert!(said.contains("runs neither"), "got {said}");
     }
 
     /// An interactive problem parses, and says so in one field.

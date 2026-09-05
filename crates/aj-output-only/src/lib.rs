@@ -99,10 +99,18 @@ pub fn mark(package: &Path, config: &Config, tests: &TestSet, answers: &Answers)
     let mut outcomes = Vec::new();
 
     for test in tests.iter() {
-        let expected = match std::fs::read(&test.expected) {
-            Ok(bytes) => bytes,
-            Err(e) => {
+        // `None` is unreachable for this type — `TestSet::read` relaxes the
+        // rule only for a package that declares a checker or an interactor, and
+        // `output-only@1` declares neither — but it lands in the same arm,
+        // because a package that cannot say what the answer is is broken the
+        // same way whether the path is missing or the file behind it is.
+        let expected = match test.expected.as_ref().ok_or(()).and_then(|at| {
+            std::fs::read(at).map_err(|e| {
                 tracing::error!(test = %test.name, %e, "the package's expected output is unreadable");
+            })
+        }) {
+            Ok(bytes) => bytes,
+            Err(()) => {
                 outcomes.push(missing(
                     test,
                     "the package has no expected output for this test",

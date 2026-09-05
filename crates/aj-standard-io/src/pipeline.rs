@@ -496,6 +496,16 @@ impl<S: Sandbox> Pipeline<S> {
             (None, None) => None,
         };
 
+        // **`tests/` may legitimately not be there**, since an interactive
+        // package may name its tests by a count and ship no files at all — and
+        // a checker's and an interactor's container binds the directory whole.
+        // A bind mount of a missing source is not an error: the daemon makes an
+        // empty directory and the run proceeds against nothing.
+        if aside.is_some() {
+            std::fs::create_dir_all(job.package.here.join("tests"))
+                .map_err(|e| format!("the package's tests/ could not be made: {e}"))?;
+        }
+
         // ── each test, in its own container ─────────────────────────────────
         let mut outcomes = Vec::new();
         for test in job.tests.iter() {
@@ -574,10 +584,23 @@ impl<S: Sandbox> Pipeline<S> {
 
             let watching = match &aside {
                 Some(_) => Watching::Relay(beside_channels[0].path().to_path_buf()),
+                // **Unreachable without a `.out`, and the reader is what makes
+                // that so.** `TestSet::read` refuses a package that has neither
+                // a judge nor an expected output, so arriving here with `None`
+                // means the two have disagreed — an infrastructure failure and
+                // not a verdict, because nothing about it is the submission's.
                 None => Watching::Against(
-                    String::from_utf8_lossy(
-                        &std::fs::read(&test.expected).map_err(|e| e.to_string())?,
-                    )
+                    String::from_utf8_lossy(&match &test.expected {
+                        Some(at) => std::fs::read(at)
+                            .map_err(|e| format!("test {}: the expected output: {e}", test.name))?,
+                        None => {
+                            return Err(format!(
+                                "test {}: nothing decides this test — the package declares \
+                                 no checker and no interactor, and ships no expected output",
+                                test.name
+                            ))
+                        }
+                    })
                     .into_owned(),
                 ),
             };
@@ -1814,8 +1837,8 @@ mod tests {
             name: "1a".into(),
             group: 1,
             letter: "a".into(),
-            input: PathBuf::from("1a.in"),
-            expected: PathBuf::from("1a.out"),
+            input: Some(PathBuf::from("1a.in")),
+            expected: Some(PathBuf::from("1a.out")),
         };
 
         let ran = failed(
