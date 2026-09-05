@@ -1271,6 +1271,12 @@ async fn a_measured_run_reports_the_program_and_not_the_container() {
         WITH_SHIM,
         vec![
             aj_sandbox::SHIM.into(),
+            // Input, then **output** -- the second argument has been the file
+            // the child's stdout is redirected to since 2026-09-05, and these
+            // two tests were left at the three-argument form. `#[ignore]` hid
+            // it: the shim would have made a file called `python3` and tried
+            // to exec `-c`.
+            "/dev/null".into(),
             "/dev/null".into(),
             "python3".into(),
             "-c".into(),
@@ -1357,6 +1363,8 @@ async fn a_child_that_escapes_the_process_group_cannot_write_after_the_report() 
         WITH_SHIM,
         vec![
             aj_sandbox::SHIM.into(),
+            // Input, then output. See the note on the test above.
+            "/dev/null".into(),
             "/dev/null".into(),
             "python3".into(),
             "-c".into(),
