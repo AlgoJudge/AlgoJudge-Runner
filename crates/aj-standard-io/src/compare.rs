@@ -83,34 +83,129 @@ fn quote(token: &str) -> String {
     }
 }
 
+/// A comparison in progress, fed the program's output as it arrives.
+///
+/// **The point is not the memory, it is the moment.** Held to the end, a
+/// submission wrong on its first token still spends its whole limit, still
+/// prints whatever it was going to print, and is only then found out. Compared
+/// as it goes, it is decided in microseconds and can be stopped — which is what
+/// makes a wrong answer, the commonest verdict there is, also the cheapest.
+///
+/// **One asymmetry runs through this and it is worth stating plainly.** Too
+/// *much* output is decidable the moment it arrives: the expected tokens have
+/// run out, so anything further is a difference. Too *little* is not decidable
+/// at all until the stream ends, because a program that has printed half its
+/// answer looks exactly like one that is about to print the rest. So a short
+/// answer is found by [`Comparing::finish`] and never by [`Comparing::feed`].
+pub struct Comparing<'a> {
+    ours: std::str::SplitWhitespace<'a>,
+    /// What the program has written since the last complete token.
+    ///
+    /// Bytes rather than text: a multi-byte character split across two chunks
+    /// would otherwise be converted to a replacement character on the first of
+    /// them, and the token would differ for a reason the program did not cause.
+    holding: Vec<u8>,
+    index: usize,
+    decided: Option<Comparison>,
+}
+
+impl<'a> Comparing<'a> {
+    /// Against a reference answer the Runner already holds, in full.
+    ///
+    /// Only the participant's side is a stream. The `.out` file is ours, it is
+    /// small, and reading it twice would buy nothing.
+    pub fn against(expected: &'a str) -> Self {
+        Self {
+            ours: expected.split_whitespace(),
+            holding: Vec::new(),
+            index: 0,
+            decided: None,
+        }
+    }
+
+    /// Takes what has arrived. `Some` once the answer is settled.
+    ///
+    /// Settled means settled: further bytes change nothing, and a caller that
+    /// keeps feeding — a relay draining a pipe so the program does not take a
+    /// `SIGPIPE` — costs only the copy.
+    pub fn feed(&mut self, bytes: &[u8]) -> Option<&Comparison> {
+        if self.decided.is_some() {
+            return self.decided.as_ref();
+        }
+        self.holding.extend_from_slice(bytes);
+
+        // **Split at the last ASCII space, and everything before it is whole.**
+        // An ASCII whitespace byte cannot be part of a multi-byte character, so
+        // the prefix is safe to convert; the tokens in it are then found by the
+        // same `split_whitespace` the whole-slice comparison uses, keeping the
+        // Unicode-aware set of separators rather than quietly narrowing it.
+        let cut = self.holding.iter().rposition(u8::is_ascii_whitespace)?;
+        let whole: Vec<u8> = self.holding.drain(..=cut).collect();
+        let whole = String::from_utf8_lossy(&whole);
+        for got in whole.split_whitespace() {
+            if let Some(found) = self.settle(Some(got)) {
+                self.decided = Some(found);
+                return self.decided.as_ref();
+            }
+        }
+        None
+    }
+
+    /// No more is coming.
+    pub fn finish(mut self) -> Comparison {
+        if let Some(decided) = self.decided {
+            return decided;
+        }
+        // Whatever is left had no whitespace after it, which is the ordinary
+        // way a program ends: `printf("%d", answer)` with no newline.
+        let last = std::mem::take(&mut self.holding);
+        let last = String::from_utf8_lossy(&last);
+        for got in last.split_whitespace() {
+            if let Some(found) = self.settle(Some(got)) {
+                return found;
+            }
+        }
+        // And now, and only now, a side that ran out means something.
+        match self.settle(None) {
+            Some(found) => found,
+            None => Comparison::Equal,
+        }
+    }
+
+    /// One token of theirs against one of ours. `Some` ends it.
+    fn settle(&mut self, got: Option<&str>) -> Option<Comparison> {
+        let want = self.ours.next();
+        if want.is_none() && got.is_none() {
+            return None;
+        }
+        self.index += 1;
+        if want == got {
+            return None;
+        }
+        Some(Comparison::Different {
+            token: self.index,
+            expected: want.unwrap_or_default().to_owned(),
+            actual: got.unwrap_or_default().to_owned(),
+        })
+    }
+}
+
+/// The whole of both sides at once, for a caller that has them.
+///
+/// **The same code as the streaming form**, deliberately: two comparisons that
+/// could disagree would disagree about a verdict, and the one place it would
+/// show is a participant told different things by two paths through the same
+/// judge. `output-only@1` uses this one, where the answers arrive as files and
+/// there is nothing to stream.
 pub fn compare(expected: &[u8], actual: &[u8]) -> Comparison {
     // Lossy on purpose. A program that emitted invalid UTF-8 has produced wrong
     // output, and refusing to compare it would turn a wrong answer into an
     // infrastructure failure — which is a claim about the system, not about the
     // solution.
     let expected = String::from_utf8_lossy(expected);
-    let actual = String::from_utf8_lossy(actual);
-
-    let mut theirs = actual.split_whitespace();
-    let mut ours = expected.split_whitespace();
-    let mut index = 0;
-
-    loop {
-        index += 1;
-        match (ours.next(), theirs.next()) {
-            (None, None) => return Comparison::Equal,
-            (want, got) => {
-                if want == got {
-                    continue;
-                }
-                return Comparison::Different {
-                    token: index,
-                    expected: want.unwrap_or_default().to_owned(),
-                    actual: got.unwrap_or_default().to_owned(),
-                };
-            }
-        }
-    }
+    let mut comparing = Comparing::against(&expected);
+    comparing.feed(actual);
+    comparing.finish()
 }
 
 #[cfg(test)]
@@ -213,6 +308,108 @@ mod tests {
         let note = found.note();
         assert!(note.ends_with("got nothing"), "{note}");
         assert!(note.is_ascii(), "{note}");
+    }
+
+    /// **A token that arrives in pieces is still one token.**
+    ///
+    /// A pipe hands over whatever has been written, not whatever is meant; a
+    /// four-digit answer can reach the reader as `12` and then `34`. Compared
+    /// piece by piece it would be two wrong tokens, and the participant would
+    /// be told their first answer was wrong when it was right.
+    #[test]
+    fn a_token_split_across_chunks_is_one_token() {
+        let expected = "1234 5\n";
+        let mut comparing = Comparing::against(expected);
+        assert!(comparing.feed(b"12").is_none(), "nothing is settled yet");
+        assert!(comparing.feed(b"34 ").is_none());
+        assert!(comparing.feed(b"5").is_none());
+        assert_eq!(comparing.finish(), Comparison::Equal);
+    }
+
+    /// **Too little is only knowable at the end, and this is the asymmetry the
+    /// whole design turns on.**
+    ///
+    /// A program that has printed half its answer is indistinguishable from one
+    /// about to print the rest. Deciding against it on `feed` would fail every
+    /// correct submission that pauses to think.
+    #[test]
+    fn a_short_answer_is_decided_only_when_it_ends() {
+        let mut comparing = Comparing::against("1 2 3\n");
+        assert!(
+            comparing.feed(b"1 2 ").is_none(),
+            "two of three tokens is not yet a wrong answer",
+        );
+        assert_eq!(
+            comparing.finish(),
+            Comparison::Different {
+                token: 3,
+                expected: "3".into(),
+                actual: String::new(),
+            },
+        );
+    }
+
+    /// **Too much is knowable at once**, which is the other half of it: the
+    /// expected tokens have run out, so anything further can only be wrong.
+    /// This is what stops a flooding submission before it floods.
+    #[test]
+    fn output_that_runs_on_is_decided_as_it_arrives() {
+        let mut comparing = Comparing::against("1 2\n");
+        assert!(comparing.feed(b"1 2 ").is_none());
+        let found = comparing
+            .feed(b"3 ")
+            .expect("a token past the end of the answer settles it at once");
+        assert!(matches!(found, Comparison::Different { token: 3, .. }));
+    }
+
+    /// A mismatch settles on the chunk that carries it, and not a byte later.
+    #[test]
+    fn a_wrong_token_settles_on_the_chunk_that_carries_it() {
+        let mut comparing = Comparing::against("1 2 3\n");
+        assert!(comparing.feed(b"1 ").is_none());
+        assert!(
+            comparing.feed(b"9 ").is_some(),
+            "the second token was wrong and there was nothing left to learn",
+        );
+    }
+
+    /// Settled is settled: a relay goes on draining the pipe so the program
+    /// does not take a `SIGPIPE` before it can be stopped properly, and none of
+    /// what it drains may change the answer.
+    #[test]
+    fn nothing_fed_after_a_decision_changes_it() {
+        let mut comparing = Comparing::against("1\n");
+        let decided = comparing.feed(b"9 ").cloned().expect("wrong at once");
+        comparing.feed(b"1 1 1 ");
+        assert_eq!(comparing.finish(), decided);
+    }
+
+    /// The two forms are one implementation, so this can only fail if somebody
+    /// gives the slice version a shortcut of its own.
+    #[test]
+    fn feeding_it_a_byte_at_a_time_agrees_with_comparing_the_whole() {
+        for (expected, actual) in [
+            (&b"1 2 3\n"[..], &b"1 2 3\n"[..]),
+            (b"1 2 3\n", b"1 9 3\n"),
+            (b"1 2 3\n", b"1 2\n"),
+            (b"1 2\n", b"1 2 3\n"),
+            (b"3\n", b"   3   "),
+            (b"", b"  \n"),
+        ] {
+            let whole = compare(expected, actual);
+            let text = String::from_utf8_lossy(expected);
+            let mut comparing = Comparing::against(&text);
+            for byte in actual {
+                comparing.feed(&[*byte]);
+            }
+            assert_eq!(
+                comparing.finish(),
+                whole,
+                "{:?} against {:?}",
+                String::from_utf8_lossy(expected),
+                String::from_utf8_lossy(actual),
+            );
+        }
     }
 
     /// Invalid bytes are a wrong answer, not a broken evaluation.
