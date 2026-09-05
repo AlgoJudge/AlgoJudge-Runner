@@ -1396,13 +1396,27 @@ async fn a_measured_run_reports_the_program_and_not_the_container() {
     assert_eq!(leftovers(&docker).await, 0);
 }
 
-/// **An image with no shim judges, and says nothing about it per submission.**
-/// A toolchain may name an operator's own image, and one built without this is
-/// not refused: the report is absent, the cgroup reading stands on its own, and
-/// the container start is inside the number again.
+/// **An image with no shim can still be measured. It can no longer judge.**
+///
+/// The two halves used to be one sentence, and the change of 2026-09-05 split
+/// them. A run that is only *measured* — a build, a checker, anything whose
+/// output comes back on the container's own stream — is not refused for want of
+/// a shim: the report is absent, the cgroup reading stands on its own, and the
+/// container's start is inside the number again. That is still true and this
+/// still asserts it.
+///
+/// A **judged** run is `measured` and `silent` together, and silence is what
+/// makes the missing shim fatal rather than merely coarse. The container's
+/// streams go nowhere, so a program run without the shim writes its answer into
+/// a channel nothing opened; the pipeline would compare every test against
+/// nothing and report the participant wrong. Refused, and refused before the
+/// container starts, so the sentence an operator reads names their image.
+///
+/// **This is the change's largest deliberate loss**: an operator's own language
+/// image must now carry the shim.
 #[tokio::test]
 #[ignore = "needs a container runtime"]
-async fn an_image_without_a_shim_is_still_measured_from_the_cgroup() {
+async fn an_image_without_a_shim_is_measured_but_cannot_judge() {
     let docker = sandbox().await;
 
     let profile = Profile::new(IMAGE, vec!["/bin/sh".into(), "-c".into(), "exit 7".into()])
@@ -1420,6 +1434,21 @@ async fn an_image_without_a_shim_is_still_measured_from_the_cgroup() {
         outcome.cpu_time.unwrap() >= Duration::from_millis(5),
         "and it is the container's own reading, which carries the start"
     );
+
+    // The same image and the same command, in the shape a judged run has.
+    let judged = Profile::new(IMAGE, vec!["/bin/sh".into(), "-c".into(), "exit 7".into()])
+        .wall_clock(Duration::from_secs(10))
+        .measured()
+        .silent();
+
+    match docker.run(&judged).await {
+        Err(Error::Refused(said)) => assert!(
+            said.contains(IMAGE) && said.contains("aj-shim"),
+            "the refusal has to name the image and what it is missing: {said}",
+        ),
+        other => panic!("a judged run in an image with no shim was not refused: {other:?}"),
+    }
+
     assert_eq!(leftovers(&docker).await, 0);
 }
 

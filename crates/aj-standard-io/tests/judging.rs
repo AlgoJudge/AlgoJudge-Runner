@@ -176,7 +176,7 @@ async fn judge(name: &str, language: &str, source: &str) -> Evaluated {
             source: source.as_bytes(),
             package,
             work: work(name),
-            outputs: None,
+            pipes: None,
         })
         .await
 }
@@ -257,7 +257,7 @@ groups:
                 source: CORRECT_CPP.as_bytes(),
                 package: Places { here, on_host },
                 work: work("excluded-language"),
-                outputs: None,
+                pipes: None,
             })
             .await,
     );
@@ -383,7 +383,7 @@ async fn a_file_the_chosen_toolchain_does_not_accept_is_a_compilation_error() {
                 source: CORRECT_PYTHON.as_bytes(),
                 package,
                 work: work("wrong-extension"),
-                outputs: None,
+                pipes: None,
             })
             .await,
     );
@@ -570,7 +570,7 @@ async fn waited_for(name: &str, limit_ms: u64, seconds: u64) -> serde_json::Valu
                 source: waiting.as_bytes(),
                 package: Places { here, on_host },
                 work: work(name),
-                outputs: None,
+                pipes: None,
             })
             .await,
     );
@@ -578,36 +578,41 @@ async fn waited_for(name: &str, limit_ms: u64, seconds: u64) -> serde_json::Valu
     serde_json::from_slice(&judged.details.to_bytes()).unwrap()
 }
 
-/// **The stdout file follows where it is pointed, and a wrong path is a wrong
+/// **The channels follow where they are pointed, and a wrong path is a wrong
 /// answer rather than an error.**
 ///
-/// `Job::outputs` exists so an operator can put the one file in the loop that
-/// nothing needs to keep — a submission's own output — on a host tmpfs, and
-/// keep it off a disk entirely. This drives that path with a directory of its
-/// own and judges a correct solution through it.
+/// `Job::pipes` exists because the work directory cannot always hold a named
+/// pipe — a bind mount of a Windows or macOS directory refuses `mkfifo` — so an
+/// operator can put the channels somewhere that can. This drives that path with
+/// a directory of its own and judges a correct solution through it.
 ///
-/// **It bites for the reason the field is dangerous.** The daemon resolves the
-/// bind mount, so a path it cannot open produces an *empty directory* rather
-/// than an error; the shim then writes into nothing, the Runner reads nothing,
-/// and every test is compared against an empty answer. That is a wrong verdict
-/// with no error anywhere — so the assertion here is the score, not the plumbing.
+/// **It bites for the reason the field is dangerous, and that reason survived
+/// the file becoming a pipe.** The daemon resolves the bind mount, so a path it
+/// cannot open produces an *empty directory* rather than an error. The Runner
+/// then makes its pipe in one directory and the container is handed another,
+/// the shim opens a name that is not there, and what comes back is an empty
+/// answer for every test. A wrong verdict with no error anywhere — so the
+/// assertion here is the score, and not the plumbing.
+///
+/// It was `Job::outputs` and a file until 2026-09-05. The bug class is
+/// unchanged, which is why the test is.
 #[tokio::test]
 #[ignore = "needs a container runtime and the language images"]
-async fn the_stdout_file_follows_where_the_outputs_are_pointed() {
-    let name = "cpp-outputs-elsewhere";
+async fn the_channels_follow_where_the_pipes_are_pointed() {
+    let name = "cpp-pipes-elsewhere";
     let correct = r#"
 #include <iostream>
 int main() { long long a, b; std::cin >> a >> b; std::cout << a + b << "\n"; }
 "#;
 
     // A root of its own, and deliberately not under `work`: on a real host this
-    // is where a tmpfs would be mounted.
+    // is where an operator would point the channels.
     // **Through `fixture`, and that is the lesson this test paid for.** The
     // first version pointed at this process's own `temp_dir()`, which the
-    // daemon cannot open -- so it made an empty directory, the shim wrote into
+    // daemon cannot open — so it made an empty directory, the shim wrote into
     // nothing, and the verdict came back `Wrong answer` with no error anywhere.
     // Exactly the failure the doc comment above predicts.
-    let (out_here, out_on_host) = fixture(&format!("{name}-outputs"));
+    let (out_here, out_on_host) = fixture(&format!("{name}-channels"));
     let elsewhere = Places {
         here: out_here,
         on_host: out_on_host,
@@ -652,14 +657,14 @@ groups:
                 source: correct.as_bytes(),
                 package: Places { here, on_host },
                 work: work(name),
-                outputs: Some(elsewhere.clone()),
+                pipes: Some(elsewhere.clone()),
             })
             .await,
     );
 
     assert_eq!(
         judged.judgement.verdict, "Accepted",
-        "the answer came back through the directory it was pointed at",
+        "the answer came back through the channels it was pointed at",
     );
     assert_eq!(judged.judgement.score, judged.judgement.max_score);
 
@@ -1059,7 +1064,7 @@ async fn the_committed_package_judges_a_correct_solution() {
                 on_host: on_the_host.join("package"),
             },
             work: work("archive"),
-            outputs: None,
+            pipes: None,
         })
         .await;
 
@@ -1234,7 +1239,7 @@ groups:
                 source: b"a, b = map(int, input().split())\nprint(a + b)\n",
                 package: Places { here, on_host },
                 work: work("limits-reported"),
-                outputs: None,
+                pipes: None,
             })
             .await,
     );
@@ -1309,7 +1314,7 @@ groups:
                 source: slow.as_bytes(),
                 package: Places { here, on_host },
                 work: work("overrun"),
-                outputs: None,
+                pipes: None,
             })
             .await,
     );

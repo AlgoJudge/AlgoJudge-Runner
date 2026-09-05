@@ -759,10 +759,12 @@ async fn judge(
     // differs from the work scratch's because the two roots are the same by
     // default, and `Scratch::new` clears what it finds — pointed at the same
     // directory it would take the job's own work away with it.
-    let outputs = match (&config.output_path, &config.output_host_path) {
-        (Some(here), Some(on_host)) => {
-            Some(Scratch::new(here, on_host, &format!("{}-out", job.job_id))?)
-        }
+    let pipes = match (&config.pipes_path, &config.pipes_host_path) {
+        (Some(here), Some(on_host)) => Some(Scratch::new(
+            here,
+            on_host,
+            &format!("{}-pipes", job.job_id),
+        )?),
         _ => None,
     };
 
@@ -847,7 +849,7 @@ async fn judge(
                     source: &bytes,
                     package,
                     work: work.places.join("scratch"),
-                    outputs: outputs.as_ref().map(|s| s.places.clone()),
+                    pipes: pipes.as_ref().map(|s| s.places.clone()),
                 })
                 .await;
             finish(evaluated, &job.lease_token).map_err(Trouble::from)
@@ -1418,8 +1420,8 @@ mod tests {
             cache_max_bytes: 0,
             work_path: "/dev/null".into(),
             work_host_path: "/dev/null".into(),
-            output_path: None,
-            output_host_path: None,
+            pipes_path: None,
+            pipes_host_path: None,
             images: aj_standard_io::Images::default(),
             allow_unmeasured: false,
         }

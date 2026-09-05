@@ -52,24 +52,27 @@ pub struct Config {
     pub work_path: PathBuf,
     pub work_host_path: PathBuf,
 
-    /// Where a judged run's stdout file goes, when it should not go to a disk.
+    /// Where a judged run's channels are made, when the work directory will
+    /// not hold them.
+    ///
+    /// **It was `Work__OutputPath` and it named a file.** There is no file: a
+    /// judged run's output travels on a named pipe, which holds no bytes at all
+    /// — so the reason to move it is no longer *this output is too large for
+    /// that disk* but *that filesystem cannot make a pipe*. The one arrangement
+    /// where that bites is a developer's: a bind mount of a Windows or macOS
+    /// directory refuses `mkfifo`, and the work directory is exactly what such a
+    /// checkout is bound to.
+    ///
+    /// Absent leaves them in the job's own scratch, which is where they belong.
+    /// Nothing is saved by moving them, and a tmpfs buys nothing it used to:
+    /// there is no size to keep off a disk.
     ///
     /// **Both or neither**, and for the same reason the pair above exists: the
     /// daemon resolves the bind mount, so the Runner's view and the daemon's
     /// have to be given separately wherever the Runner is itself in a
-    /// container. Absent leaves the file in the job's own scratch, which is
-    /// what it always did.
-    ///
-    /// Point it at a **host** tmpfs and a submission's output never reaches a
-    /// disk: it is written once by the program and read once by the Runner, and
-    /// nothing about it needs to outlive the test. A `tmpfs:` entry on the
-    /// Runner's own service will not do -- that is private to its mount
-    /// namespace, and the daemon would make an empty directory instead.
-    ///
-    /// Budget the size: one file per running job, capped by the profile's
-    /// output limit. Twelve Runners at 64 MiB is 768 MiB in the worst case.
-    pub output_path: Option<PathBuf>,
-    pub output_host_path: Option<PathBuf>,
+    /// container.
+    pub pipes_path: Option<PathBuf>,
+    pub pipes_host_path: Option<PathBuf>,
 
     pub images: aj_standard_io::Images,
 
@@ -167,9 +170,9 @@ impl Config {
 
             work_path: work.clone().into(),
             work_host_path: var("Work__HostPath").unwrap_or(work).into(),
-            output_path: var("Work__OutputPath").map(Into::into),
-            output_host_path: var("Work__OutputHostPath")
-                .or_else(|| var("Work__OutputPath"))
+            pipes_path: var("Pipes__Path").map(Into::into),
+            pipes_host_path: var("Pipes__HostPath")
+                .or_else(|| var("Pipes__Path"))
                 .map(Into::into),
 
             // Either name. The old one is not deprecated so much as narrower
@@ -428,13 +431,25 @@ mod tests {
     }
 
     /// A configuration key exactly, and not a sentence that mentions one.
+    /// **A section missing from the list below is invisible to the check**, not
+    /// caught by it: the variable is neither reported as unlisted nor as stale,
+    /// and `.env.example` may then disagree with the code silently. Adding a
+    /// section is part of adding its first variable.
     fn a_key(piece: &str) -> bool {
         let Some((section, rest)) = piece.split_once("__") else {
             return false;
         };
         matches!(
             section,
-            "Server" | "Runner" | "Cache" | "Lease" | "Poll" | "Heartbeat" | "Work" | "Sandbox"
+            "Server"
+                | "Runner"
+                | "Cache"
+                | "Lease"
+                | "Poll"
+                | "Heartbeat"
+                | "Work"
+                | "Sandbox"
+                | "Pipes"
         ) && !rest.is_empty()
             && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     }

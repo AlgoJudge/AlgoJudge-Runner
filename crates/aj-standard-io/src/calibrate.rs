@@ -75,7 +75,7 @@ pub async fn measure<S: Sandbox>(
                 // Calibration runs a jury's own solutions, not a submission --
                 // and it wants the same paths judging uses, so nothing here
                 // chooses differently from what the operator configured.
-                outputs: None,
+                pipes: None,
             })
             .await;
 

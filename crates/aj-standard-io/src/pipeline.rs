@@ -196,7 +196,7 @@ pub struct Job<'a> {
     /// resolves the bind mount, and a path only the Runner's mount namespace
     /// knows produces an empty directory rather than an error — every test
     /// would then be compared against nothing.
-    pub outputs: Option<Places>,
+    pub pipes: Option<Places>,
 }
 
 /// The package's checker, built and ready to be run over a test.
@@ -450,12 +450,12 @@ impl<S: Sandbox> Pipeline<S> {
             // submission — which runs as `nobody` — cannot create, rename or
             // read anything in it. The shim opens the file inside it before it
             // drops privileges and hands over the descriptor alone.
-            let outputs = job
-                .outputs
+            let channels = job
+                .pipes
                 .clone()
                 .unwrap_or_else(|| job.work.join("out"))
                 .join(&test.name);
-            std::fs::create_dir_all(&outputs.here).map_err(|e| {
+            std::fs::create_dir_all(&channels.here).map_err(|e| {
                 format!(
                     "test {}: the output directory could not be made: {e}",
                     test.name
@@ -470,7 +470,7 @@ impl<S: Sandbox> Pipeline<S> {
             // Made here, because the shim creates nothing — it opens what it is
             // given, so a channel that is not there is the Runner's failure to
             // prepare rather than something for the far end to invent.
-            let output = Fifo::make(outputs.here.join(Pipes::OUTPUT), 0o600).map_err(|e| {
+            let output = Fifo::make(channels.here.join(Pipes::OUTPUT), 0o600).map_err(|e| {
                 format!(
                     "test {}: the output channel could not be made: {e}",
                     test.name
@@ -526,7 +526,7 @@ impl<S: Sandbox> Pipeline<S> {
                         // What the deadline above measures progress against,
                         // and what "plainly past its budget" is measured from.
                         .cpu_limit(Duration::from_millis(limits.time_ms))
-                        .pipes(&outputs.here, &outputs.on_host, OUTPUT)
+                        .pipes(&channels.here, &channels.on_host, OUTPUT)
                         .mount(Mount::read_only(&artefacts.on_host, PROGRAM))
                         .mount(input_mount(&job.package.on_host, &test.name)),
                     ),
@@ -545,7 +545,7 @@ impl<S: Sandbox> Pipeline<S> {
             let run = run.map_err(|e| format!("a test could not be run: {e}"))?;
 
             // The channels are gone with it; nothing in here outlives a test.
-            let _ = std::fs::remove_dir_all(&outputs.here);
+            let _ = std::fs::remove_dir_all(&channels.here);
             let measured = Measured::of(&run).map_err(|e| format!("test {}: {e}", test.name))?;
             let time_ms = measured.time_ms;
 
