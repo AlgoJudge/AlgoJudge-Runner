@@ -40,6 +40,59 @@ groups:
 "#;
 
 /// Adds two numbers, correctly.
+/// Guesses a number by halving, and flushes every question.
+const GUESSING: &str = r#"
+#include <cstdio>
+int main() {
+    long long lo = 0, hi = 4000000;
+    for (;;) {
+        long long mid = lo + (hi - lo) / 2;
+        printf("? %lld\n", mid);
+        fflush(stdout);
+        char said = 0;
+        if (scanf(" %c", &said) != 1) return 0;
+        if (said == 61) return 0;
+        if (said == 60) hi = mid - 1; else lo = mid + 1;
+    }
+}
+"#;
+
+/// The other side of it: thinks of the test's own answer and says higher or
+/// lower, then writes its verdict where `argv[2]` points.
+const ASKING: &str = r#"
+#include <cstdio>
+int main(int argc, char** argv) {
+    if (argc < 4) return 1;
+    FILE* in = fopen(argv[1], "r");
+    long long a = 0, b = 0;
+    if (!in || fscanf(in, "%lld %lld", &a, &b) != 2) return 1;
+    long long secret = a + b;
+    FILE* say = fopen(argv[2], "w");
+    if (!say) return 1;
+    int asked = 0;
+    for (;;) {
+        char q = 0; long long guess = 0;
+        if (scanf(" %c %lld", &q, &guess) != 2) {
+            fprintf(say, "WRONG\nstopped asking\n");
+            break;
+        }
+        if (++asked > 40) {
+            fprintf(say, "WRONG\ntoo many questions\n");
+            break;
+        }
+        if (guess == secret) {
+            printf("=\n"); fflush(stdout);
+            fprintf(say, "OK\nfound it in %d questions\n", asked);
+            break;
+        }
+        printf(guess > secret ? "<\n" : ">\n");
+        fflush(stdout);
+    }
+    fclose(say);
+    return 0;
+}
+"#;
+
 const CORRECT_CPP: &str = r#"
 #include <iostream>
 int main() { long long a, b; std::cin >> a >> b; std::cout << a + b << "\n"; }
@@ -176,6 +229,7 @@ async fn judge(name: &str, language: &str, source: &str) -> Evaluated {
             source: source.as_bytes(),
             package,
             work: work(name),
+            pipes: None,
         })
         .await
 }
@@ -256,6 +310,7 @@ groups:
                 source: CORRECT_CPP.as_bytes(),
                 package: Places { here, on_host },
                 work: work("excluded-language"),
+                pipes: None,
             })
             .await,
     );
@@ -381,6 +436,7 @@ async fn a_file_the_chosen_toolchain_does_not_accept_is_a_compilation_error() {
                 source: CORRECT_PYTHON.as_bytes(),
                 package,
                 work: work("wrong-extension"),
+                pipes: None,
             })
             .await,
     );
@@ -567,11 +623,468 @@ async fn waited_for(name: &str, limit_ms: u64, seconds: u64) -> serde_json::Valu
                 source: waiting.as_bytes(),
                 package: Places { here, on_host },
                 work: work(name),
+                pipes: None,
             })
             .await,
     );
 
     serde_json::from_slice(&judged.details.to_bytes()).unwrap()
+}
+
+/// **The channels follow where they are pointed, and a wrong path is a wrong
+/// answer rather than an error.**
+///
+/// `Job::pipes` exists because the work directory cannot always hold a named
+/// pipe — a bind mount of a Windows or macOS directory refuses `mkfifo` — so an
+/// operator can put the channels somewhere that can. This drives that path with
+/// a directory of its own and judges a correct solution through it.
+///
+/// **It bites for the reason the field is dangerous, and that reason survived
+/// the file becoming a pipe.** The daemon resolves the bind mount, so a path it
+/// cannot open produces an *empty directory* rather than an error. The Runner
+/// then makes its pipe in one directory and the container is handed another,
+/// the shim opens a name that is not there, and what comes back is an empty
+/// answer for every test. A wrong verdict with no error anywhere — so the
+/// assertion here is the score, and not the plumbing.
+///
+/// It was `Job::outputs` and a file until 2026-09-05. The bug class is
+/// unchanged, which is why the test is.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn the_channels_follow_where_the_pipes_are_pointed() {
+    let name = "cpp-pipes-elsewhere";
+    let correct = r#"
+#include <iostream>
+int main() { long long a, b; std::cin >> a >> b; std::cout << a + b << "\n"; }
+"#;
+
+    // A root of its own, and deliberately not under `work`: on a real host this
+    // is where an operator would point the channels.
+    // **Through `fixture`, and that is the lesson this test paid for.** The
+    // first version pointed at this process's own `temp_dir()`, which the
+    // daemon cannot open — so it made an empty directory, the shim wrote into
+    // nothing, and the verdict came back `Wrong answer` with no error anywhere.
+    // Exactly the failure the doc comment above predicts.
+    let (out_here, out_on_host) = fixture(&format!("{name}-channels"));
+    let elsewhere = Places {
+        here: out_here,
+        on_host: out_on_host,
+    };
+
+    let pipeline = pipeline().await;
+    let (here, on_host) = fixture(name);
+    std::fs::create_dir_all(here.join("tests")).unwrap();
+    let config_yml = "type: \"standard-io@1\"
+limits:
+  timeMs: 2000
+  memoryBytes: 268435456
+groups:
+  - group: 1
+    points: 100
+"
+    .to_owned();
+    std::fs::write(here.join("config.yml"), &config_yml).unwrap();
+    std::fs::write(
+        here.join("tests/1a.in"),
+        "2 3
+",
+    )
+    .unwrap();
+    std::fs::write(
+        here.join("tests/1a.out"),
+        "5
+",
+    )
+    .unwrap();
+
+    let config = Config::parse(&config_yml).unwrap();
+    let tests = TestSet::read(&here, &config).unwrap();
+
+    let judged = verdict(
+        pipeline
+            .evaluate(&Job {
+                config: &config,
+                tests: &tests,
+                language: "cpp",
+                file_name: "main.cpp",
+                source: correct.as_bytes(),
+                package: Places { here, on_host },
+                work: work(name),
+                pipes: Some(elsewhere.clone()),
+            })
+            .await,
+    );
+
+    assert_eq!(
+        judged.judgement.verdict, "Accepted",
+        "the answer came back through the channels it was pointed at",
+    );
+    assert_eq!(judged.judgement.score, judged.judgement.max_score);
+
+    let _ = std::fs::remove_dir_all(&elsewhere.here);
+}
+
+/// **A flood is a wrong answer now, found in milliseconds, and still not a
+/// crash.**
+///
+/// Three things are being held down at once here, and they used to be one.
+///
+/// It *was* an output limit: stdout went to a file, the cap was `RLIMIT_FSIZE`,
+/// and the kernel stopped the program on the write that crossed 64 MiB. Since
+/// 2026-09-05 the output goes to a pipe the Runner reads as it is written, and a
+/// program whose very first token is wrong is decided against before it has
+/// printed a second one. The flood never happens.
+///
+/// So the verdict changes, and it changes for the better: "token 1 differs" is
+/// something a participant can act on, where "you printed too much" is a fact
+/// about the judge's patience. What has **not** changed is the danger the test
+/// was written for — the program is killed mid-write, so it dies of a signal,
+/// and every other path in this pipeline reads a fatal signal as a runtime
+/// error. That is still the assertion that would go red first.
+///
+/// And the time is the measurement that says the mechanism works at all. This
+/// program never stops on its own; if the reported figure is a fraction of the
+/// limit then it was stopped, and it cannot be a fraction of the limit if
+/// anybody is waiting for the output to end.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_flooding_submission_is_stopped_at_its_first_token_and_is_not_a_crash() {
+    let flooding = r#"
+#include <cstdio>
+int main() {
+    long long a, b;
+    if (scanf("%lld %lld", &a, &b) != 2) return 1;
+    for (;;) puts("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+}
+"#;
+    let judged = verdict(judge("cpp-flooding", "cpp", flooding).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    let first = &document["tests"][0];
+
+    assert_eq!(
+        first["reason"], "wrongAnswer",
+        "stopped for being wrong, not for being loud, and above all not for \
+         dying of the signal that stopped it: {document}"
+    );
+    assert!(
+        first["note"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("token 1 differs"),
+        "and the note says where, which is what the participant can use: {document}"
+    );
+
+    // The limit these tests are judged under. Named here rather than divided
+    // into, so that a limit which moves makes this arithmetic visible.
+    const LIMIT_MS: u64 = 2000;
+    let spent = first["timeMs"].as_u64().unwrap_or(LIMIT_MS);
+    assert!(
+        spent * 4 < LIMIT_MS,
+        "a program that never stops on its own reported {spent} ms of {LIMIT_MS} ms, \
+         which is not the shape of a run somebody waited out: {document}"
+    );
+
+    assert_ne!(judged.judgement.score, judged.judgement.max_score);
+}
+
+/// **What is left of the output limit, and why it is still needed.**
+///
+/// Too much output is decidable the moment it arrives — the expected tokens run
+/// out, so the next one is a difference — which is why the flood above is a
+/// wrong answer and not this. There is exactly one way to print without ever
+/// producing a token: never print whitespace. A token is only whole once
+/// something follows it, so the Runner holds an unfinished one, and a program
+/// that never finishes one is filling the **judge's** memory rather than its
+/// own.
+///
+/// That is what the cap is for now. It is not a verdict about output being
+/// impolite; it is the bound on what one submission can make this process hold.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn one_endless_token_is_an_output_limit() {
+    let endless = r#"
+#include <cstdio>
+int main() {
+    long long a, b;
+    if (scanf("%lld %lld", &a, &b) != 2) return 1;
+    // No newline, no space, no end: one token as far as anybody can tell.
+    for (;;) fputs("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", stdout);
+}
+"#;
+    let judged = verdict(judge("cpp-endless-token", "cpp", endless).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+
+    assert_eq!(
+        document["tests"][0]["reason"], "outputLimit",
+        "nothing could be compared, so the cap is what stopped it: {document}"
+    );
+    assert!(
+        document["tests"][0]["note"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Output limit exceeded"),
+        "the note says so in the words the Client and every package share: {document}"
+    );
+    assert_ne!(judged.judgement.score, judged.judgement.max_score);
+}
+
+/// A package like [`package`], with a checker of the caller's own.
+async fn judge_with_checker(name: &str, source: &str, checker: &str) -> Evaluated {
+    let pipeline = pipeline().await;
+    let (package, _, _) = package(name);
+
+    std::fs::create_dir_all(package.here.join("checker")).unwrap();
+    std::fs::write(package.here.join("checker/checker.cpp"), checker).unwrap();
+    let declared = format!("{CONFIG}checker:\n  source: checker/checker.cpp\n  language: cpp\n");
+    std::fs::write(package.here.join("config.yml"), &declared).unwrap();
+
+    let config = Config::parse(&declared).unwrap();
+    let tests = TestSet::read(&package.here, &config).unwrap();
+
+    let evaluated = pipeline
+        .evaluate(&Job {
+            config: &config,
+            tests: &tests,
+            language: "cpp",
+            file_name: "main.cpp",
+            source: source.as_bytes(),
+            package: package.clone(),
+            work: work(name),
+            pipes: None,
+        })
+        .await;
+    evaluated
+}
+
+/// **What a checker is handed is a stream, and a checker can find that out.**
+///
+/// Since 2026-09-05 the participant's output reaches a checker on a pipe, as
+/// the program writes it — which is what lets a checker's own exit stop the
+/// submission. The cost is real and it falls on the package author: a pipe
+/// cannot be seeked, and cannot be read twice.
+///
+/// **The Runner cannot rescue a checker that ignores this**, and saying so is
+/// the point of the test. `seekg` sets the stream's fail bit rather than
+/// throwing; a checker that does not look will read nothing, print `WRONG`, and
+/// a correct submission is rejected with no error anywhere. What is asserted
+/// here is the half that is knowable: the failure is *visible* to a checker
+/// that checks. The rest belongs in `PACKAGE_FORMAT.md`, not in code.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_checker_is_given_a_stream_and_can_tell() {
+    let seeking = r#"
+#include <fstream>
+#include <iostream>
+int main(int argc, char** argv) {
+    if (argc < 4) { std::cout << "WRONG\nno arguments\n"; return 0; }
+    std::ifstream answer(argv[2]);
+    answer.seekg(0, std::ios::end);
+    if (!answer) { std::cout << "WRONG\nNOT SEEKABLE\n"; return 0; }
+    std::cout << "WRONG\nit was seekable after all\n";
+    return 0;
+}
+"#;
+    let judged = verdict(judge_with_checker("cpp-seeking-checker", CORRECT_CPP, seeking).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+
+    assert_eq!(
+        document["tests"][0]["note"], "NOT SEEKABLE",
+        "the answer must be a stream, and a checker that looks must see so: {document}"
+    );
+}
+
+/// **A checker's exit is what stops the submission**, and it is the only thing
+/// a separate program can say while it is still running.
+///
+/// This is the checker's half of the change: the built-in comparison stops a
+/// program by deciding, and a checker stops one by finishing. Both arrive at
+/// the sandbox the same way — the Runner's write into the far pipe fails, and
+/// it asks for the run to end.
+///
+/// The submission here never stops on its own. If it is judged at all, it was
+/// stopped; and the reported time says it was stopped almost at once rather
+/// than waited out.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_checker_that_has_seen_enough_stops_the_submission() {
+    // Prints the right answer, then never stops. Correct on everything the
+    // checker below reads, so the verdict cannot come from the flood.
+    let then_forever = r#"
+#include <cstdio>
+int main() {
+    long long a, b;
+    if (scanf("%lld %lld", &a, &b) != 2) return 1;
+    printf("%lld\n", a + b);
+    fflush(stdout);
+    for (;;) puts("and so on and so on and so on and so on and so on and so on");
+}
+"#;
+    // Reads one number and leaves. Everything after it is unread, and the
+    // closing of this end is what the Runner turns into a kill.
+    let one_number = r#"
+#include <fstream>
+#include <iostream>
+int main(int argc, char** argv) {
+    if (argc < 4) { std::cout << "WRONG\nno arguments\n"; return 0; }
+    std::ifstream answer(argv[2]), expected(argv[3]);
+    long long theirs = 0, ours = 0;
+    if (!(answer >> theirs) || !(expected >> ours) || theirs != ours) {
+        std::cout << "WRONG\nnot the number\n";
+        return 0;
+    }
+    std::cout << "OK\n";
+    return 0;
+}
+"#;
+    let judged = verdict(judge_with_checker("cpp-checker-leaves", then_forever, one_number).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    let first = &document["tests"][0];
+
+    assert_eq!(
+        first["status"], "OK",
+        "the checker read its number and was satisfied: {document}"
+    );
+
+    // The limit these tests are judged under.
+    const LIMIT_MS: u64 = 2000;
+    let spent = first["timeMs"].as_u64().unwrap_or(LIMIT_MS);
+    assert!(
+        spent * 4 < LIMIT_MS,
+        "a program that never stops reported {spent} ms of {LIMIT_MS} ms, which is \
+         not the shape of a run that was stopped: {document}"
+    );
+    assert_eq!(judged.judgement.score, judged.judgement.max_score);
+}
+
+/// A package like [`package`], judged by an interactor of the caller's own.
+async fn judge_interactive(name: &str, source: &str, interactor: &str) -> Evaluated {
+    let pipeline = pipeline().await;
+    let (package, _, _) = package(name);
+
+    std::fs::create_dir_all(package.here.join("checker")).unwrap();
+    std::fs::write(package.here.join("checker/checker.cpp"), interactor).unwrap();
+    let declared = format!("{CONFIG}interactor:\n  source: checker/checker.cpp\n  language: cpp\n");
+    std::fs::write(package.here.join("config.yml"), &declared).unwrap();
+
+    let config = Config::parse(&declared).unwrap();
+    let tests = TestSet::read(&package.here, &config).unwrap();
+
+    let w = work(name);
+    pipeline
+        .evaluate(&Job {
+            config: &config,
+            tests: &tests,
+            language: "cpp",
+            file_name: "main.cpp",
+            source: source.as_bytes(),
+            package,
+            work: w,
+            pipes: None,
+        })
+        .await
+}
+
+/// **An interactive problem is judged, and both directions carry.**
+///
+/// The submission is told nothing at the start: its standard input is a pipe
+/// with the interactor on the far end, and every number it reads is one the
+/// interactor decided to send after reading what it wrote. Twenty-odd round
+/// trips per test, so a wiring that works once and then stalls fails here.
+///
+/// **The Runner is in the middle of both directions** and neither program holds
+/// the other's descriptors. That is what makes the traffic countable, which is
+/// what lets a run be told apart from a wedged one: an interactive run spends
+/// most of its life with neither side on a processor.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn an_interactor_judges_a_conversation() {
+    let judged = verdict(judge_interactive("cpp-guessing", GUESSING, ASKING).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+
+    assert_eq!(
+        judged.judgement.verdict, "Accepted",
+        "the guesser found every number: {document}"
+    );
+    assert_eq!(judged.judgement.score, judged.judgement.max_score);
+    assert!(
+        document["tests"][0]["note"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("found it in"),
+        "the interactor's own comment reaches the participant: {document}"
+    );
+}
+
+/// **An interactor that has heard enough stops the submission**, exactly as a
+/// checker does: it exits, its end of the conversation closes, and the Runner
+/// turns the failed write into a kill.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn an_interactor_that_gives_up_stops_the_submission() {
+    // Asks the same question forever and never listens to the answer.
+    let deaf = r#"
+#include <cstdio>
+int main() {
+    for (;;) { printf("? 1\n"); fflush(stdout); }
+}
+"#;
+    let judged = verdict(judge_interactive("cpp-deaf", deaf, ASKING).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    let first = &document["tests"][0];
+
+    assert_eq!(
+        first["reason"], "wrongAnswer",
+        "the interactor gave up on it, and that is a verdict about the answer \
+         rather than about the machinery: {document}"
+    );
+
+    // The limit these tests are judged under.
+    const LIMIT_MS: u64 = 2000;
+    let spent = first["timeMs"].as_u64().unwrap_or(LIMIT_MS);
+    assert!(
+        spent < LIMIT_MS,
+        "a program that never stops reported {spent} ms of {LIMIT_MS} ms: {document}"
+    );
+}
+
+/// **A program that does not flush deadlocks, and the judge has to say which
+/// kind of stuck it is.**
+///
+/// This is the one failure an interactive problem has that a batch problem does
+/// not, and the one a participant cannot debug from a bare "time limit": their
+/// program is not slow, it is holding its question in a buffer while the
+/// interactor waits for it. Neither side spends a processor, so it is the
+/// reaper's no-progress deadline that ends it — and the note it writes is the
+/// only thing telling them where to look.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_submission_that_never_flushes_is_a_time_limit_with_no_processor_time() {
+    let unflushed = r#"
+#include <cstdio>
+int main() {
+    long long lo = 0, hi = 4000000;
+    for (;;) {
+        long long mid = lo + (hi - lo) / 2;
+        printf("? %lld\n", mid);
+        char said = 0;
+        if (scanf(" %c", &said) != 1) return 0;
+        if (said == 61) return 0;
+        if (said == 60) hi = mid - 1; else lo = mid + 1;
+    }
+}
+"#;
+    let judged = verdict(judge_interactive("cpp-unflushed", unflushed, ASKING).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    let first = &document["tests"][0];
+
+    assert_eq!(first["reason"], "timeLimit", "{document}");
+    assert!(
+        first["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no processor time"),
+        "the note has to separate a slow program from a stuck one: {document}"
+    );
 }
 
 // ── Every other outcome a participant can get ───────────────────────────────
@@ -863,6 +1376,7 @@ async fn the_committed_package_judges_a_correct_solution() {
                 on_host: on_the_host.join("package"),
             },
             work: work("archive"),
+            pipes: None,
         })
         .await;
 
@@ -1037,6 +1551,7 @@ groups:
                 source: b"a, b = map(int, input().split())\nprint(a + b)\n",
                 package: Places { here, on_host },
                 work: work("limits-reported"),
+                pipes: None,
             })
             .await,
     );
@@ -1111,6 +1626,7 @@ groups:
                 source: slow.as_bytes(),
                 package: Places { here, on_host },
                 work: work("overrun"),
+                pipes: None,
             })
             .await,
     );

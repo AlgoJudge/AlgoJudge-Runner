@@ -24,7 +24,8 @@
 
 use std::time::Duration;
 
-use aj_sandbox::{Cgroups, Docker, Error, Mount, Profile, Sandbox, Stopped};
+use aj_sandbox::pipes::{release, Fifo};
+use aj_sandbox::{Cgroups, Docker, Error, Mount, Pipes, Profile, Sandbox, Stopped};
 
 const IMAGE: &str = "alpine:3";
 
@@ -611,6 +612,100 @@ async fn there_is_no_network() {
 }
 
 // ── A6 — it floods ──────────────────────────────────────────────────────────
+
+/// **A silent run's output does not come back**, which is the half of silence a
+/// test can see.
+///
+/// `Profile::silent` does two things and this asserts one of them. It stops the
+/// daemon attaching to the container's stdio, so nothing is captured and the
+/// collector is not started — and that is what this proves, against a control,
+/// because "the output was empty" is also what a broken run looks like.
+///
+/// **The other half is not observable from here** and was measured on the host
+/// instead: the same container under the default driver leaves a 95-byte
+/// `*-json.log`, and under `none` leaves none at all (2026-09-05). That is the
+/// half the 76 MB was, and it is the daemon's own behaviour rather than
+/// something this code can assert.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn a_silent_runs_output_does_not_come_back() {
+    let docker = sandbox().await;
+
+    let loud = docker
+        .run(&shell("echo the-daemon-kept-this"))
+        .await
+        .expect("the control run");
+    assert_eq!(
+        String::from_utf8_lossy(&loud.stdout).trim(),
+        "the-daemon-kept-this",
+        "the control must come back, or this test proves nothing",
+    );
+
+    let quiet = docker
+        .run(&shell("echo the-daemon-kept-this").silent())
+        .await
+        .expect("the silent run");
+    assert!(
+        quiet.stdout.is_empty() && quiet.stderr.is_empty(),
+        "a silent run is read by nobody: {:?}",
+        String::from_utf8_lossy(&quiet.stdout),
+    );
+    assert_eq!(
+        quiet.stopped,
+        Stopped::OnItsOwn,
+        "and it still ran to the end",
+    );
+    assert_eq!(quiet.exit_code, 0);
+    assert_eq!(leftovers(&docker).await, 0);
+}
+
+/// **Two runs at once must not wait for each other**, and on the driver most
+/// installations have they would.
+///
+/// A checker reads the submission's output while the submission is producing
+/// it, so both containers are alive at once. Under the `systemd` cgroup
+/// driver — Docker's own default wherever cgroup v2 and systemd are both
+/// present — one slice serves every run and `Cgroups::begin` holds its gate for
+/// the whole of the run that took it. A second run asking for one would wait
+/// for a gate the first holds while the first waits for the second to read, and
+/// that is a hard deadlock, not slow scheduling.
+///
+/// `Profile::alongside` is what closes it: such a run opens no measurement.
+///
+/// **This test is meaningless on `cgroupfs` and CI is where it counts.** There
+/// is no gate there, so both arrangements pass; only the `systemd` leg can fail
+/// it. The timeout is what turns the deadlock into a failure rather than a
+/// suite that never finishes.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn two_runs_at_once_do_not_wait_for_each_other() {
+    let docker = sandbox().await;
+
+    // Bound before the futures, so neither profile is a temporary the future
+    // outlives.
+    let slow = shell("sleep 2; echo first").measured();
+    let quick = shell("echo second").alongside();
+    let measured = docker.run(&slow);
+    let beside = docker.run(&quick);
+
+    let both = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(measured, beside)
+    })
+    .await
+    .expect("neither run may wait for the other; on systemd this is the gate");
+
+    let (measured, beside) = both;
+    let measured = measured.expect("the measured run");
+    let beside = beside.expect("the run beside it");
+
+    assert_eq!(String::from_utf8_lossy(&measured.stdout).trim(), "first");
+    assert_eq!(String::from_utf8_lossy(&beside.stdout).trim(), "second");
+    assert_eq!(
+        beside.cpu_time, None,
+        "a run beside another opens no measurement of its own",
+    );
+    assert_eq!(leftovers(&docker).await, 0);
+}
 
 #[tokio::test]
 #[ignore = "needs a container runtime"]
@@ -1271,6 +1366,12 @@ async fn a_measured_run_reports_the_program_and_not_the_container() {
         WITH_SHIM,
         vec![
             aj_sandbox::SHIM.into(),
+            // Input, then **output** -- the second argument has been the file
+            // the child's stdout is redirected to since 2026-09-05, and these
+            // two tests were left at the three-argument form. `#[ignore]` hid
+            // it: the shim would have made a file called `python3` and tried
+            // to exec `-c`.
+            "/dev/null".into(),
             "/dev/null".into(),
             "python3".into(),
             "-c".into(),
@@ -1295,13 +1396,27 @@ async fn a_measured_run_reports_the_program_and_not_the_container() {
     assert_eq!(leftovers(&docker).await, 0);
 }
 
-/// **An image with no shim judges, and says nothing about it per submission.**
-/// A toolchain may name an operator's own image, and one built without this is
-/// not refused: the report is absent, the cgroup reading stands on its own, and
-/// the container start is inside the number again.
+/// **An image with no shim can still be measured. It can no longer judge.**
+///
+/// The two halves used to be one sentence, and the change of 2026-09-05 split
+/// them. A run that is only *measured* — a build, a checker, anything whose
+/// output comes back on the container's own stream — is not refused for want of
+/// a shim: the report is absent, the cgroup reading stands on its own, and the
+/// container's start is inside the number again. That is still true and this
+/// still asserts it.
+///
+/// A **judged** run is `measured` and `silent` together, and silence is what
+/// makes the missing shim fatal rather than merely coarse. The container's
+/// streams go nowhere, so a program run without the shim writes its answer into
+/// a channel nothing opened; the pipeline would compare every test against
+/// nothing and report the participant wrong. Refused, and refused before the
+/// container starts, so the sentence an operator reads names their image.
+///
+/// **This is the change's largest deliberate loss**: an operator's own language
+/// image must now carry the shim.
 #[tokio::test]
 #[ignore = "needs a container runtime"]
-async fn an_image_without_a_shim_is_still_measured_from_the_cgroup() {
+async fn an_image_without_a_shim_is_measured_but_cannot_judge() {
     let docker = sandbox().await;
 
     let profile = Profile::new(IMAGE, vec!["/bin/sh".into(), "-c".into(), "exit 7".into()])
@@ -1319,6 +1434,21 @@ async fn an_image_without_a_shim_is_still_measured_from_the_cgroup() {
         outcome.cpu_time.unwrap() >= Duration::from_millis(5),
         "and it is the container's own reading, which carries the start"
     );
+
+    // The same image and the same command, in the shape a judged run has.
+    let judged = Profile::new(IMAGE, vec!["/bin/sh".into(), "-c".into(), "exit 7".into()])
+        .wall_clock(Duration::from_secs(10))
+        .measured()
+        .silent();
+
+    match docker.run(&judged).await {
+        Err(Error::Refused(said)) => assert!(
+            said.contains(IMAGE) && said.contains("aj-shim"),
+            "the refusal has to name the image and what it is missing: {said}",
+        ),
+        other => panic!("a judged run in an image with no shim was not refused: {other:?}"),
+    }
+
     assert_eq!(leftovers(&docker).await, 0);
 }
 
@@ -1326,8 +1456,8 @@ async fn an_image_without_a_shim_is_still_measured_from_the_cgroup() {
 ///
 /// **What this pins is the outcome, not the mechanism, and the difference is
 /// worth stating.** The shim kills every process in the namespace before it
-/// reports, which is what stops a `setsid` escapee -- one that has left the
-/// process group and would survive a group kill -- writing after the report.
+/// reports, which is what stops a `setsid` escapee — one that has left the
+/// process group and would survive a group kill — writing after the report.
 /// But the runtime tears the container down when PID 1 exits, and that kills the
 /// escapee too: sabotaging `kill(-1)` leaves this test green. Measured, not
 /// assumed.
@@ -1337,6 +1467,13 @@ async fn an_image_without_a_shim_is_still_measured_from_the_cgroup() {
 /// escapee's output never reaches the participant's record, and no container is
 /// left behind. The guard that keeps `kill(-1)` to PID 1 is unit-tested; the
 /// ordering it buys is argued in the shim's own comment.
+///
+/// **It watched stderr until 2026-09-05 and now watches the pipe**, because the
+/// record moved. A submission's stderr goes to `/dev/null`, so a straggler
+/// writing there is not caught being harmless — it is unobservable, and a test
+/// that cannot observe its own subject passes for the wrong reason. Standard
+/// output is what is judged, so that is where a straggler's line would have to
+/// land to do any damage, and that is where this looks for it.
 #[tokio::test]
 #[ignore = "needs a container runtime and the language images"]
 async fn a_child_that_escapes_the_process_group_cannot_write_after_the_report() {
@@ -1346,40 +1483,53 @@ async fn a_child_that_escapes_the_process_group_cannot_write_after_the_report() 
         .await
         .expect("a language image");
 
-    // The forged line names a nonce it cannot know, so it can only be a guess --
-    // the point here is that nothing of the submission's is alive to write at
-    // all, whatever it would have written.
+    let (here, on_the_host) = fixture("escapee");
+    let output = Fifo::make(here.join(Pipes::OUTPUT), 0o600).expect("the output channel");
+    let reading = tokio::task::spawn_blocking({
+        let at = output.path().to_path_buf();
+        move || std::fs::read(at).unwrap_or_default()
+    });
+
     // One line and no escapes at all: `os.fork()` answers 0 in the child,
     // which is falsy, so the child evaluates the tuple and the parent skips it.
-    let escapee = "import os, sys, time; print('before', file=sys.stderr); os.fork() or (os.setsid(), time.sleep(3), print('AFTER THE REPORT', file=sys.stderr), os._exit(0))";
+    let escapee = "import os, time; print('before', flush=True); os.fork() or (os.setsid(), time.sleep(3), print('AFTER THE REPORT', flush=True), os._exit(0))";
 
     let profile = Profile::new(
         WITH_SHIM,
         vec![
             aj_sandbox::SHIM.into(),
+            // Input, then output. See the note on the test above.
             "/dev/null".into(),
+            format!("/pipes/{}", Pipes::OUTPUT),
             "python3".into(),
             "-c".into(),
             escapee.into(),
         ],
     )
     .wall_clock(Duration::from_secs(20))
-    .measured();
+    .measured()
+    .silent()
+    .pipes(&here, &on_the_host, "/pipes");
 
     let outcome = docker.run(&profile).await.expect("the run");
-    let stderr = String::from_utf8_lossy(&outcome.stderr);
+    // The escapee holds the writing end, so the end of the channel is the end of
+    // the last process that had it — which is the ordering under test. This is
+    // only for the run that never got that far.
+    release(output.path());
+    let said = String::from_utf8_lossy(&reading.await.expect("the reader")).into_owned();
 
+    assert!(said.contains("before"), "the program's own output survives");
     assert!(
-        stderr.contains("before"),
-        "the program's own output survives"
+        !said.contains("AFTER THE REPORT"),
+        "a child outlived the report: {said}"
     );
     assert!(
-        !stderr.contains("AFTER THE REPORT"),
-        "a child outlived the report: {stderr}"
+        !said.contains("aj-shim1"),
+        "the report travels on its own channel and not this one: {said}"
     );
     assert!(
-        !stderr.contains("aj-shim1"),
-        "the report is taken out of what is stored: {stderr}"
+        outcome.cpu_time.is_some(),
+        "the report arrived, so there was one to be too late for"
     );
     assert_eq!(leftovers(&docker).await, 0);
 }

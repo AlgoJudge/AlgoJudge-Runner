@@ -29,10 +29,18 @@ The reason is §3.
 ## 2. What contains a submission
 
 Each step of the pipeline runs in its own container, started by the Runner
-through the container runtime's API. **One container per test, never reused** —
-state carried between tests is a thing untrusted code tries, and a fresh
-container is the only answer that does not depend on cleanup having been written
-correctly.
+through the container runtime's API. **One container per test — two where the
+package brought a checker or an interactor — and never reused.** State carried
+between tests is a thing untrusted code tries, and a fresh container is the only
+answer that does not depend on cleanup having been written correctly.
+
+**The two containers never share a directory** (2026-09-05). Both run as the
+same unprivileged user, so anything they shared would be a place each could reach
+the other's: the submission's own channels are in one directory mounted only into
+its container, and what the checker is given is in another mounted only into the
+checker's. Nothing is passed between them directly — every byte is copied by the
+Runner, which is what keeps the counting, the output cap and the early stop in
+trusted code.
 
 | | Applied to every step that runs a submission |
 |---|---|
@@ -48,7 +56,8 @@ correctly.
 | wall clock = **four times the limit plus four seconds without progress** | not a limit anybody is judged against: a time limit is processor time, so this reaps what is *not* spending any — one stuck in an uninterruptible syscall, or one that waits for input that never comes. It counts **consecutive** time: any processor time at all resets it, so a program descheduled on a busy host is never reaped for it. Four times the limit is roughly a host loaded four times past what it can carry, and the four seconds are what make this the guard against a hang at a limit small enough that four times it would not be |
 | processor time past **the limit plus two seconds** | there is no reason to keep waiting; the verdict is still decided afterwards on the measurement. Added rather than multiplied: the reading is the cgroup's, so it carries the container's own start, and a container costs what it costs whatever limit the problem set |
 | wall clock past **five times that ceiling**, whatever the progress | the last bound there is, and the only one a program making steady progress can reach — one waking for a millisecond a tick never stalls and never approaches its limit. Five times what the run was entitled to spend, so a problem allowed more processor time has earned more wall clock. It is reported as its own outcome, because "no processor time for four seconds" is false about a run that spent some in every one of them |
-| an output cap enforced **while it runs** | read afterwards, a flooding program fills the host's disk first |
+| an output cap counted **as the bytes cross** | 2026-09-05. Nothing stores a submission's output any more: it goes from the program to whatever is comparing it, one 64 KiB copy at a time, and the count is taken there. It used to be `RLIMIT_FSIZE` on a file, and before that a count of what the daemon had already written to its own log — 76 MB of it, measured, for one flooding submission against a 64 MiB cap. What the cap now bounds is what one submission can make the **Runner** hold, and it is reached only by output with no separator in it: anything else is decided wrong long before |
+| **nothing on the container's own streams** | 2026-09-05. A judged container is started with no log driver at all, its output travels on a pipe, and its standard error goes to `/dev/null`. There is nothing for the daemon to write down, which is what removed the write amplification above; and an image with no measuring shim can no longer judge, because for it that silence would be indistinguishable from a program that printed nothing |
 
 **No step that runs a submission is given a tmpfs.** The two profiles that ask
 for one are the submission build and the checker build, and both ask for a
@@ -112,16 +121,22 @@ has a test rather than a paragraph.
 1. **One test, one container, never reused.** A fresh container is the only
    answer that does not depend on cleanup having been written correctly.
 2. **The program is given its own test's input and nothing else.** One file:
-   `<name>.in`, mounted read-only, and the program is started as
-   `exec … < /in/<name>.in`. Mounting the whole `tests/` directory would put
-   `<name>.out` — the answer — inside the submission's own container. See
-   `pipeline.rs::input_mount`.
+   `<name>.in`, mounted read-only and opened by the measuring shim, which is
+   handed exactly two paths — what to read and what to write. Mounting the whole
+   `tests/` directory would put `<name>.out` — the answer — inside the
+   submission's own container. See `pipeline.rs::input_mount`.
 3. **Nothing a program writes reaches the next test.** Asserted in
    `adversarial.rs::nothing_survives_from_one_run_to_the_next`, for the scratch
    tmpfs **and** for `/dev/shm`.
-4. **The checker is contained on the same terms.** Same `Sandbox::run`, so the
-   same table above applies to it, with its own limits. A checker stopped by a
-   limit is reported as a **broken checker**, never as a wrong answer.
+4. **The checker is contained on the same terms, and so is an interactor.**
+   Same `Sandbox::run`, so the same table above applies to it, with its own
+   limits. One stopped by a limit is reported as a **broken checker**, never as a
+   wrong answer — a bug in the package must not become a rejected submission.
+
+   The one difference is that it opens **no measurement**: a judged run holds the
+   cgroup gate for its whole length, and on the systemd cgroup driver that gate
+   is an owned mutex, so a program beside it asking for one of its own would wait
+   for a run that is waiting for it.
 
 Two things that follow, and are easy to get wrong in the opposite direction:
 
@@ -131,11 +146,25 @@ Two things that follow, and are easy to get wrong in the opposite direction:
   and tmpfs pages are charged to the memory limit, so a program spending it is
   spending its own budget — but it is a surface nobody declared, which is why
   rule 3's test names it explicitly.
-- **The input is a mounted file, not a pipe.** A pipe would be marginally
-  stricter and is deliberately not used: it is **not seekable**, so a solution
-  that reads its input twice would work on the author's machine and fail here.
-  The access surface is already one test either way, so the stricter option buys
-  nothing and costs a participant a verdict they cannot explain.
+- **The input is a mounted file, not a pipe — for a batch problem.** A pipe
+  would be marginally stricter and is deliberately not used: it is **not
+  seekable**, so a solution that reads its input twice would work on the author's
+  machine and fail here. The access surface is already one test either way, so
+  the stricter option buys nothing and costs a participant a verdict they cannot
+  explain.
+
+  **For an interactive problem it is a pipe, and consciously so** (2026-09-05).
+  There is no file to mount: the input does not exist until an interactor decides
+  what to send, having read what the submission wrote. The cost above is real and
+  is paid — a solution cannot re-read its input — and it is inherent to the
+  problem type rather than a choice this document is making.
+
+- **The submission's output is a pipe in every case** (2026-09-05), and this is
+  where the paragraph above stops applying: nobody re-reads their own output. It
+  is read once, forwards, by the Runner, which either compares it token by token
+  or copies it onward to a checker. What that buys is the point of it — a wrong
+  answer is found at the first differing token and the program is stopped there,
+  instead of being left to produce an answer nobody was going to look at.
 
 ## 3. What this does **not** buy — read this part
 

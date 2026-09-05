@@ -15,13 +15,21 @@
 //! command and limits, and reports what happened.
 
 pub mod affinity;
-pub mod cgroups;
+pub mod beside;
+mod cgroups;
 pub mod docker;
-pub mod profile;
+/// Named pipes, and why a judged run travels on one.
+///
+/// Unix only, and that is not a gap: the sandbox starts Linux containers
+/// through a Linux daemon, and `./x` builds it in one.
+#[cfg(unix)]
+pub mod pipes;
+mod profile;
 
+pub use beside::{Beside, Enough};
 pub use cgroups::Cgroups;
 pub use docker::Docker;
-pub use profile::{Mount, Outcome, Profile, Stopped, SHIM};
+pub use profile::{Mount, Outcome, Pipes, Profile, Stopped, SHIM};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -53,5 +61,16 @@ pub trait Sandbox: Send + Sync {
     /// enforce a limit produces wrong verdicts rather than errors.
     async fn preflight(&self) -> Result<()>;
 
-    async fn run(&self, profile: &Profile) -> Result<Outcome>;
+    /// Runs it with nothing beside it, which is what most callers want.
+    async fn run(&self, profile: &Profile) -> Result<Outcome> {
+        self.run_beside(profile, &Beside::alone()).await
+    }
+
+    /// Runs it while somebody watches, and stops it when they have decided.
+    ///
+    /// **The sandbox never sees a byte.** [`Beside`] carries two facts and no
+    /// content: how much has crossed between this run and whatever is checking
+    /// it, and whether that checking is finished. What is being checked, and
+    /// how, stays entirely outside this crate.
+    async fn run_beside(&self, profile: &Profile, beside: &Beside) -> Result<Outcome>;
 }

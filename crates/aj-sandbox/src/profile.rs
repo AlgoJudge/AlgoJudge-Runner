@@ -86,6 +86,26 @@ pub struct Profile {
 
     pub max_output_bytes: u64,
 
+    /// A directory the shim writes the submission's stdout into, instead of
+    /// leaving it on the container's own stream.
+    ///
+    /// **This is a disk measurement, not a preference.** Left on the container's
+    /// stdout, every byte a submission prints is written by the daemon to its
+    /// `*-json.log` — JSON-escaped, stamped per line — and read back through a
+    /// socket. Measured 2026-09-05 across a twelve-Runner burst: a single
+    /// flooding submission left a **76 MB** log against a 64 MiB cap, and the
+    /// daemon wrote at 72 MB/s for the length of the run.
+    ///
+    /// **The submission is handed a descriptor and never a path.** The shim runs
+    /// as root, opens the file before it forks, and only then drops to the
+    /// submission's user — which cannot create, rename or read anything in a
+    /// directory that is root's. It is what is already done for the input,
+    /// pointing the other way.
+    ///
+    /// `None` leaves stdout where it was, which is what every step that is not
+    /// judging a submission wants: a build's output *is* its compiler log.
+    pub pipes: Option<Pipes>,
+
     pub mounts: Vec<Mount>,
 
     /// A writable scratch area, mounted `noexec`.
@@ -139,6 +159,33 @@ pub struct Profile {
     /// container is removed, which is immediately.
     pub writable_root: bool,
 
+    /// Nothing reaches this container's stdio, and the daemon keeps no log.
+    ///
+    /// **A disk measurement, not tidiness.** The `json-file` driver writes every
+    /// byte a container prints, JSON-escaped and stamped per line, and one
+    /// flooding submission left a **76 MB** file against a 64 MiB cap while the
+    /// daemon wrote at 72 MB/s — measured 2026-09-05. A run whose output travels
+    /// on a pipe the Runner holds has no use for a second copy of it on a disk.
+    ///
+    /// Off for a build and for a checker: those two are read through
+    /// [`Outcome::stdout`] and [`Outcome::stderr`], and a driver of `none`
+    /// refuses the endpoint that reads them.
+    pub silent: bool,
+
+    /// This container runs **beside** a measured one, and opens no measurement.
+    ///
+    /// **Without it a checker deadlocks against the submission it is checking**,
+    /// and only where Docker puts most installations. Under the `systemd` cgroup
+    /// driver one slice serves every run, so a second run in it waits for a gate
+    /// the first holds — and the first is waiting for the second to read its
+    /// output. It would pass every unit test and the whole `cgroupfs` leg of CI.
+    ///
+    /// Such a container is placed wherever the daemon puts it and is measured by
+    /// nothing. It needs no measurement: anything that stops a checker other
+    /// than its own exit already makes it a *broken* checker rather than a
+    /// verdict.
+    pub alongside: bool,
+
     /// A path inside the container to read back after it exits.
     ///
     /// **This is how a build hands over what it made**, instead of being given
@@ -171,6 +218,70 @@ pub struct Profile {
 // every image has a shell, which is a requirement it has no business having,
 // and `exec` keeps the process tree the same size either way.
 
+/// The directory a measured run's channels live in, on both sides of the mount.
+///
+/// **One directory per run and the names are fixed**, because the directory is
+/// already one run's: a name carried from the test would be a second thing to
+/// keep in step for nothing.
+///
+/// Two channels live here today and a third is coming. The Runner makes each of
+/// them and owns it; the shim opens what it is given and creates nothing, so a
+/// channel that is missing means the Runner did not do its half rather than
+/// something for the far end to invent.
+#[derive(Debug, Clone)]
+pub struct Pipes {
+    /// Where **this process** sees the directory.
+    ///
+    /// **Three views and not two, and the third is the one that bites.** The
+    /// daemon resolves the bind mount, so `on_host` is its view; the command
+    /// names `at`, so that is the container's. But the channels are *made and
+    /// read by the Runner*, which where it is itself containerised sees neither
+    /// of those — and a `mkfifo` against the daemon's path fails with "no such
+    /// file or directory" while naming a path that plainly exists, which is a
+    /// confusing hour for whoever meets it.
+    pub here: PathBuf,
+    /// Where the **daemon** sees it, for the bind mount.
+    pub on_host: PathBuf,
+    /// Where the **container** sees it, for the command.
+    pub at: String,
+}
+
+impl Pipes {
+    /// What the submission's own output travels on.
+    pub const OUTPUT: &'static str = "stdout";
+
+    /// What a submission's standard input travels on, where it has one.
+    ///
+    /// **Only an interactive problem has one.** Everywhere else the input is a
+    /// file the package brought, mounted read-only, which is what makes a batch
+    /// problem reproducible; this is the channel that exists when the input is
+    /// being written by something reading the answers.
+    pub const INPUT: &'static str = "stdin";
+
+    /// What the shim's measurement report travels on.
+    ///
+    /// **Its own channel, and that is the point of it.** The report used to
+    /// share the container's stderr with whatever the submission printed there,
+    /// picked back out by a nonce and by being written last. Nothing else can
+    /// write here, so the nonce is now belt to a brace.
+    pub const REPORT: &'static str = "report";
+
+    /// Where a channel is, as the container sees it.
+    pub fn inside(&self, channel: &str) -> String {
+        format!("{}/{channel}", self.at)
+    }
+
+    /// Where a channel is, as the daemon sees it.
+    pub fn on_host(&self, channel: &str) -> PathBuf {
+        self.on_host.join(channel)
+    }
+
+    /// Where a channel is, as this process sees it: what to make and read.
+    pub fn here(&self, channel: &str) -> PathBuf {
+        self.here.join(channel)
+    }
+}
+
 impl Profile {
     /// A profile with everything closed, to be opened deliberately.
     ///
@@ -187,6 +298,7 @@ impl Profile {
             wall_clock: Duration::from_secs(10),
             cpu_limit: None,
             max_output_bytes: 64 * 1024 * 1024,
+            pipes: None,
             mounts: Vec::new(),
             measured: false,
             tmpfs_bytes: None,
@@ -194,6 +306,8 @@ impl Profile {
             max_file_bytes: 256 * 1024 * 1024,
             cpuset: None,
             writable_root: false,
+            silent: false,
+            alongside: false,
             collect: None,
             max_collected_bytes: 0,
         }
@@ -221,6 +335,25 @@ impl Profile {
 
     pub fn max_output_bytes(mut self, bytes: u64) -> Self {
         self.max_output_bytes = bytes;
+        self
+    }
+
+    /// Give the run a directory of channels, made by the caller and mounted
+    /// at `at`.
+    ///
+    /// The caller makes every channel in it before the run starts, and names
+    /// them with [`Pipes::inside`] when building the command.
+    pub fn pipes(
+        mut self,
+        here: impl Into<PathBuf>,
+        on_host: impl Into<PathBuf>,
+        at: impl Into<String>,
+    ) -> Self {
+        self.pipes = Some(Pipes {
+            here: here.into(),
+            on_host: on_host.into(),
+            at: at.into(),
+        });
         self
     }
 
@@ -263,6 +396,16 @@ impl Profile {
 
     /// What to read back, and the most of it that will be held. **One call for
     /// both**, so a caller cannot ask for the first and forget the second.
+    pub fn silent(mut self) -> Self {
+        self.silent = true;
+        self
+    }
+
+    pub fn alongside(mut self) -> Self {
+        self.alongside = true;
+        self
+    }
+
     pub fn collect(mut self, path: impl Into<String>, max_bytes: u64) -> Self {
         self.collect = Some(path.into());
         self.max_collected_bytes = max_bytes;
@@ -313,6 +456,13 @@ pub enum Stopped {
     /// happened, and "no processor time for 8 s" is plainly false about a run
     /// that spent some in every one of those seconds.
     Overall,
+    /// **Whatever was reading this run's output had already decided.**
+    ///
+    /// The exit code and any signal are the kill's doing and say nothing about
+    /// the program — a run stopped here must be reported as what the reader
+    /// decided, never as the runtime error a `SIGKILL` would otherwise look
+    /// like. It is the one stop whose meaning lives outside the sandbox.
+    Decided,
 }
 
 #[derive(Debug, Clone)]

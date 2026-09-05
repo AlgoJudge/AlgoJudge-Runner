@@ -96,6 +96,38 @@ struct Built {
     shim: PathBuf,
     helper: PathBuf,
     input: PathBuf,
+    /// The directory the child's stdout is written into, one file per run.
+    ///
+    /// **Per run and not per suite**, which cost a debugging round: the tests
+    /// share one `Built` and cargo runs them in parallel, so a single path had
+    /// them truncating each other's output and four of them failed together
+    /// while each passed alone.
+    outputs: PathBuf,
+}
+
+/// One run of the shim: what the process did, and what the child wrote.
+///
+/// Derefs to the process output so the assertions that were here before —
+/// status, the shim's own stderr — read exactly as they did.
+struct Ran {
+    process: Output,
+    /// What the child printed, read back from the file the shim wrote it to.
+    written: Vec<u8>,
+}
+
+impl std::ops::Deref for Ran {
+    type Target = Output;
+    fn deref(&self) -> &Output {
+        &self.process
+    }
+}
+
+impl Ran {
+    /// The process alone, for the refusals: a shim that refused wrote nothing,
+    /// so there is no file to compare and the arms only need to agree.
+    fn process(self) -> Output {
+        self.process
+    }
 }
 
 fn compile(source: &str, into: &Path, name: &str) -> Option<PathBuf> {
@@ -136,17 +168,68 @@ fn build() -> Option<Built> {
         shim,
         helper,
         input,
+        outputs: root.join("outputs"),
     })
 }
 
-fn run(built: &Built, args: &[&str], nonce: Option<&str>) -> Output {
+fn run(built: &Built, args: &[&str], nonce: Option<&str>) -> Ran {
+    let at = built.output_for(&args.join("-"));
     let mut command = Command::new(&built.shim);
-    command.arg(&built.input).arg(&built.helper).args(args);
+    command
+        .arg(&built.input)
+        .arg(&at)
+        .arg(&built.helper)
+        .args(args);
     match nonce {
         Some(nonce) => command.env("AJ_SHIM_NONCE", nonce),
         None => command.env_remove("AJ_SHIM_NONCE"),
     };
-    command.output().expect("the shim runs")
+    let process = command.output().expect("the shim runs");
+    Ran {
+        written: std::fs::read(&at).unwrap_or_default(),
+        process,
+    }
+}
+
+impl Built {
+    /// A path of this run's own, made unique by the arguments and a counter:
+    /// two tests may run the same helper mode at the same moment.
+    fn output_for(&self, what: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        std::fs::create_dir_all(&self.outputs).expect("a place for the output");
+        // **Writable by anybody, and only here.** One test runs the shim as
+        // 65534 to prove the nonce scrub does not depend on privilege, and a
+        // root-owned directory would stop it opening the file at all -- which
+        // is the production arrangement and the point of it: there the shim is
+        // root, the directory is root's, and the submission gets the descriptor
+        // and never a path. `container_user` and the mount are what hold that,
+        // not this harness.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.outputs, std::fs::Permissions::from_mode(0o777));
+        }
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        let at = self.outputs.join(format!("{what}-{n}"));
+        // **Made here, because the shim no longer makes it.** In the product
+        // the far end is a named pipe the Runner created before the container
+        // was started; the shim opens what it is given and does not create,
+        // so a destination that is not there is a Runner that did not do its
+        // half rather than something to paper over.
+        std::fs::File::create(&at).expect("a destination for the output");
+        // **Writable by anybody, and only here.** One test runs the shim as
+        // 65534 to prove the nonce scrub does not depend on privilege, and a
+        // root-owned destination would stop it writing at all. In the product
+        // the far end is a 0600 pipe the Runner made and the shim is root when
+        // it opens it, which is what keeps the submission away from it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o666));
+        }
+        at
+    }
 }
 
 /// The line the sandbox looks for, parsed the way it parses it.
@@ -274,23 +357,109 @@ fn the_input_file_arrives_as_standard_input() {
     let built = built!();
     let output = run(built, &["echo"], Some(NONCE));
 
+    // **Read from the file, because that is where stdout now goes.** The shim
+    // opens it and `dup2`s it onto the child's stdout; a test still reading the
+    // shim's own stdout would see nothing, and could then be made to pass by a
+    // shim that redirected into a void.
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.written),
         "read 42 the input line\n"
     );
 }
 
+/// **The report goes where it is told, and stderr carries nothing.**
+///
+/// `AJ_SHIM_REPORT` names a channel of the shim's own. In the product it is a
+/// pipe the Runner is reading; here it is a file, because what is being tested
+/// is that the shim writes there and not that a pipe works.
+///
+/// Both halves matter and neither implies the other: a shim that wrote to the
+/// channel *and* to stderr would pass a test that only looked at the channel,
+/// and would go on costing the daemon a write per byte of it.
 #[test]
-fn the_report_comes_after_whatever_the_program_wrote() {
+fn the_report_travels_on_the_channel_it_was_given() {
+    let built = built!();
+    let at = built.output_for("report-channel");
+    let out = built.output_for("report-channel-stdout");
+
+    let output = Command::new(&built.shim)
+        .arg(&built.input)
+        .arg(&out)
+        .arg(&built.helper)
+        .arg("noisy")
+        .env("AJ_SHIM_NONCE", NONCE)
+        .env("AJ_SHIM_REPORT", &at)
+        .output()
+        .expect("the shim runs");
+
+    let channel = std::fs::read(&at).unwrap_or_default();
+    let said = String::from_utf8_lossy(&channel);
+    assert!(
+        said.contains(NONCE) && said.contains("aj-shim1 ok "),
+        "the report went to the channel it was given: {said}",
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "and nowhere else: {:?}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// **A channel that was named and cannot be opened is fatal.**
+///
+/// There is no third behaviour, and the reason is what the Runner does with it:
+/// having named a channel, it is reading that channel. A shim that quietly fell
+/// back to stderr would leave it reading an empty pipe until something else
+/// gave up — an infrastructure failure reported as a timeout, which is a
+/// verdict against somebody's program.
+#[test]
+fn a_report_channel_that_cannot_be_opened_is_fatal() {
+    let built = built!();
+    let out = built.output_for("report-missing-stdout");
+
+    let output = Command::new(&built.shim)
+        .arg(&built.input)
+        .arg(&out)
+        .arg(&built.helper)
+        .arg("exit")
+        .arg("0")
+        .env("AJ_SHIM_NONCE", NONCE)
+        .env(
+            "AJ_SHIM_REPORT",
+            built.shim.parent().unwrap().join("not-a-channel"),
+        )
+        .output()
+        .expect("the shim runs");
+
+    assert_eq!(
+        output.status.code(),
+        Some(125),
+        "the shim failed, and said so as itself rather than as the submission",
+    );
+}
+
+/// **The submission cannot reach the report's channel**, and this is what
+/// replaced "the report is written last".
+///
+/// It used to share stderr with whatever the program printed there, so the
+/// ordering was the defence: the shim killed everything else in the namespace
+/// and then wrote, last. The submission's stderr is `/dev/null` now, so the two
+/// do not share a channel at all -- a stronger thing to be able to say, and a
+/// cheaper one to keep true.
+#[test]
+fn nothing_the_program_writes_reaches_the_report() {
     let built = built!();
     let output = run(built, &["noisy"], Some(NONCE));
     let said = report_in(&output).expect("a report");
 
-    assert_eq!(said.rest, "the program's own complaint\n");
+    assert_eq!(
+        said.rest, "",
+        "the report's channel carried the report and nothing else",
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.find("complaint").unwrap() < stderr.find("aj-shim1").unwrap(),
-        "the report has to be last: {stderr}"
+        !stderr.contains("complaint"),
+        "the submission's own stderr went nowhere: {stderr}",
     );
 }
 
@@ -307,15 +476,17 @@ fn every_way_the_shim_can_fail_says_so_and_measures_nothing() {
         (vec!["exit", "0"], 125, "no input file"),
     ] {
         let output = match because {
-            "no nonce" => run(built, &args, None),
+            "no nonce" => run(built, &args, None).process(),
             "no such program" => Command::new(&built.shim)
                 .arg(&built.input)
+                .arg(built.output_for("no-such-program"))
                 .arg(built.shim.parent().unwrap().join("not-a-program"))
                 .env("AJ_SHIM_NONCE", NONCE)
                 .output()
                 .expect("the shim runs"),
             _ => Command::new(&built.shim)
                 .arg(built.shim.parent().unwrap().join("not-an-input"))
+                .arg(built.output_for("no-such-input"))
                 .arg(&built.helper)
                 .env("AJ_SHIM_NONCE", NONCE)
                 .output()
@@ -350,7 +521,7 @@ fn every_way_the_shim_can_fail_says_so_and_measures_nothing() {
 fn the_nonce_reaches_neither_the_child_nor_its_view_of_the_shim() {
     let built = built!();
     let output = run(built, &["environ"], Some(NONCE));
-    let seen = String::from_utf8_lossy(&output.stdout);
+    let seen = String::from_utf8_lossy(&output.written);
 
     for line in seen.lines() {
         assert!(
@@ -369,7 +540,7 @@ fn the_nonce_reaches_neither_the_child_nor_its_view_of_the_shim() {
 fn the_submission_never_runs_as_root() {
     let built = built!();
     let output = run(built, &["who"], Some(NONCE));
-    let said = String::from_utf8_lossy(&output.stdout);
+    let said = String::from_utf8_lossy(&output.written);
 
     assert!(said.starts_with("uid "), "got {said}");
     assert_ne!(said.trim(), "uid 0", "the submission was left as root");
@@ -397,8 +568,10 @@ fn unprivileged_the_scrub_is_what_hides_the_nonce() {
         return; // Already unprivileged: the case above is this one.
     }
 
-    let output = Command::new(&built.shim)
+    let at = built.output_for("unprivileged-environ");
+    let _ = Command::new(&built.shim)
         .arg(&built.input)
+        .arg(&at)
         .arg(&built.helper)
         .arg("environ")
         .env("AJ_SHIM_NONCE", NONCE)
@@ -407,7 +580,8 @@ fn unprivileged_the_scrub_is_what_hides_the_nonce() {
         .output()
         .expect("the shim runs");
 
-    let seen = String::from_utf8_lossy(&output.stdout);
+    let written = std::fs::read(&at).unwrap_or_default();
+    let seen = String::from_utf8_lossy(&written);
     assert!(
         seen.contains("/proc/") && seen.contains("nonce=0"),
         "the parent's environ was readable and had to be empty of it: {seen}"
@@ -427,6 +601,7 @@ fn a_program_named_without_a_path_is_found() {
     let built = built!();
     let output = Command::new(&built.shim)
         .arg(&built.input)
+        .arg(built.output_for("env-on-path"))
         .arg("env")
         .env("AJ_SHIM_NONCE", NONCE)
         .output()

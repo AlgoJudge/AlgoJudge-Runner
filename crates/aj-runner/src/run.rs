@@ -755,6 +755,18 @@ async fn judge(
     // One directory per job, removed on every path out including a panic
     // upstream, because a Runner that leaks scratch fills its own disk.
     let work = Scratch::new(&config.work_path, &config.work_host_path, &job.job_id)?;
+    // **A second scratch, and only where an operator asked for one.** Its name
+    // differs from the work scratch's because the two roots are the same by
+    // default, and `Scratch::new` clears what it finds — pointed at the same
+    // directory it would take the job's own work away with it.
+    let pipes = match (&config.pipes_path, &config.pipes_host_path) {
+        (Some(here), Some(on_host)) => Some(Scratch::new(
+            here,
+            on_host,
+            &format!("{}-pipes", job.job_id),
+        )?),
+        _ => None,
+    };
 
     // **Not `to_string()`.** These two lines are where a maintenance window
     // reaches a job that has already been claimed: the package and the
@@ -837,6 +849,7 @@ async fn judge(
                     source: &bytes,
                     package,
                     work: work.places.join("scratch"),
+                    pipes: pipes.as_ref().map(|s| s.places.clone()),
                 })
                 .await;
             finish(evaluated, &job.lease_token).map_err(Trouble::from)
@@ -1407,6 +1420,8 @@ mod tests {
             cache_max_bytes: 0,
             work_path: "/dev/null".into(),
             work_host_path: "/dev/null".into(),
+            pipes_path: None,
+            pipes_host_path: None,
             images: aj_standard_io::Images::default(),
             allow_unmeasured: false,
         }

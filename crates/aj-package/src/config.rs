@@ -74,6 +74,28 @@ pub struct Config {
     #[serde(default)]
     pub checker: Option<Source>,
 
+    /// The problem is interactive, and this program is the other side of it.
+    ///
+    /// **A field and not a second package type**, decided 2026-09-05. The format
+    /// said interaction was out of scope, and that was a boundary drawn around a
+    /// mechanism it did not have: judging held a submission's whole output and
+    /// only then compared it, so nothing could answer a program while it ran.
+    /// It can now — a judged run is wired to whatever is checking it by pipes,
+    /// and an interactor is that same wiring with a second pipe pointing back.
+    /// A package type of its own for one field would give an author two formats
+    /// for one idea.
+    ///
+    /// It stands where `checker` stands, and it is refused beside one: the two
+    /// decide the same question and a package that declares both has not said
+    /// which of them judges.
+    ///
+    /// **`deny_unknown_fields` is what makes this safe to add.** A Runner too
+    /// old to know the field refuses the package outright rather than judging an
+    /// interactive problem as a batch one — which would fail every submission
+    /// and look like the participants' doing.
+    #[serde(default)]
+    pub interactor: Option<Source>,
+
     /// Used for calibration, never for judging. The shorthand for one language.
     #[serde(default)]
     pub model_solution: Option<Source>,
@@ -303,11 +325,27 @@ impl Config {
         // it rejects could not have been extracted into the package either. It
         // holds for an overlay too, since `overlaid` ends here — and an
         // activity's `config` can name a checker.
-        for declared in self.checker.iter().chain(self.models()) {
+        for declared in self
+            .checker
+            .iter()
+            .chain(self.interactor.iter())
+            .chain(self.models())
+        {
             crate::archive::safe_path(
                 &declared.source,
                 crate::archive::Limits::default().max_path_length,
             )?;
+        }
+
+        // **Both is not a richer package, it is an unanswered question.** A
+        // checker judges output a program produced on its own; an interactor
+        // produces the input that output answers. Declaring both leaves nothing
+        // to say which of them is the judge, and picking one here would be this
+        // Runner inventing an answer the author did not give.
+        if self.checker.is_some() && self.interactor.is_some() {
+            return Err(Error::invalid(
+                "a package declares a checker or an interactor, never both: they                  decide the same question and nothing here says which of them judges",
+            ));
         }
 
         Ok(self)
@@ -1005,6 +1043,47 @@ calibration:
         );
         let error = Config::parse(&yaml).unwrap_err();
         assert!(matches!(error, Error::Invalid(_)), "got {error}");
+    }
+
+    /// An interactive problem parses, and says so in one field.
+    #[test]
+    fn an_interactor_is_read_where_a_checker_would_be() {
+        let yaml = FROM_THE_SPECIFICATION.replace("checker:", "interactor:");
+        let config = Config::parse(&yaml).expect("an interactive package");
+
+        assert!(config.checker.is_none());
+        let interactor = config.interactor.expect("the interactor");
+        assert_eq!(interactor.source, "checker/checker.cpp");
+        assert_eq!(interactor.language, "cpp");
+    }
+
+    /// **Both is not a richer package, it is an unanswered question**, and the
+    /// refusal is what stops this Runner answering it on the author's behalf.
+    #[test]
+    fn a_package_declaring_both_a_checker_and_an_interactor_is_refused() {
+        let yaml = FROM_THE_SPECIFICATION.replace(
+            "checker:",
+            "interactor:\n  source: checker/checker.cpp\n  language: cpp\nchecker:",
+        );
+        let said = Config::parse(&yaml)
+            .expect_err("a package cannot declare both")
+            .to_string();
+
+        assert!(said.contains("never both"), "got {said}");
+    }
+
+    /// The path rule holds for the new field, which is the whole reason to have
+    /// written it into the same loop rather than beside it.
+    #[test]
+    fn an_interactor_outside_the_package_is_refused() {
+        let yaml = FROM_THE_SPECIFICATION.replace(
+            "checker:\n  source: checker/checker.cpp",
+            "interactor:\n  source: /var/lib/algojudge-runner/identity.key",
+        );
+        assert!(
+            Config::parse(&yaml).is_err(),
+            "an absolute path names a file the Runner reads and quotes back",
+        );
     }
 
     /// **A path in this document is a path inside the package.** It is joined

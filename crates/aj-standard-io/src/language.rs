@@ -119,6 +119,33 @@ pub const SOURCE: &str = "/src";
 pub const BUILD_OUTPUT: &str = "/out";
 pub const PROGRAM: &str = "/program";
 pub const INPUT: &str = "/in";
+/// Where the directory holding the run's own channels is mounted.
+///
+/// One directory per run and root's: the submission runs as `nobody` and cannot
+/// create, rename or read anything in it. What it gets is the descriptors the
+/// shim opened before dropping privileges.
+pub const OUTPUT: &str = "/aj-out";
+
+/// Where the directory holding what a **checker** is given is mounted.
+///
+/// **A second directory, and the separation is the security argument.** Both
+/// containers run as the same unprivileged user, so anything they shared would
+/// be a place each could reach the other's — and what is in here is the
+/// participant's answer as it arrives, which their own program must not be able
+/// to rewrite behind the checker's back.
+pub const ANSWER: &str = "/answers";
+
+/// What an interactor reads: everything the submission wrote.
+pub const TO_THE_JUDGE: &str = "to-the-judge";
+/// What an interactor writes: everything the submission reads.
+pub const FROM_THE_JUDGE: &str = "from-the-judge";
+/// Where an interactor says what it decided.
+///
+/// **A channel and not its standard output**, because its standard output is
+/// already spoken for: it is one half of the conversation. A file would want a
+/// writable mount and a directory somebody owns; a pipe is the same machinery as
+/// everything else here and needs neither.
+pub const VERDICT: &str = "verdict";
 
 // ── the images, by key ──────────────────────────────────────────────────────
 
@@ -505,30 +532,42 @@ fn quoted(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
 }
 
-/// Wraps a start command so the test's input arrives on standard input, through
-/// the measuring shim where the image has one.
+/// Where a batch problem's input comes from: the file the package brought.
+pub fn test_input(test: &str) -> String {
+    format!("{INPUT}/{test}.in")
+}
+
+/// Wraps a start command so the submission reads one channel and writes another,
+/// through the measuring shim.
 ///
-/// **`exec` in both arms, and that is what makes the test free.** The shell
-/// replaces itself either way, so it is not a second process in the accounting
-/// and not a second entry against the process limit; what it spends deciding is
-/// inside the cgroup's total and outside the shim's report, which is the right
-/// side of each. Without a shim this is exactly what it has always been: the
-/// program as PID 1 with its input redirected.
+/// **Two paths and no knowledge of what is behind them**, which is what lets one
+/// function serve both kinds of problem. For a batch problem the input is a file
+/// the package brought; for an interactive one it is a pipe with an interactor
+/// on the far end. The shim opens what it is given either way.
 ///
-/// The shim is not probed for. An image may be an operator's own -- the
-/// catalogue lets a toolchain name one -- so the absence has to be handled where
-/// the command is built rather than by a capability the Runner remembers.
-pub fn with_input(start: &[String], test: &str) -> Vec<String> {
+/// **`exec`, and that is what makes the shell free.** It replaces itself, so it
+/// is not a second process in the accounting and not a second entry against the
+/// process limit; what it spends deciding is inside the cgroup's total and
+/// outside the shim's report, which is the right side of each.
+pub fn with_channels(start: &[String], input: &str, output: &str) -> Vec<String> {
     let program = start
         .iter()
         .map(|part| quoted(part))
         .collect::<Vec<_>>()
         .join(" ");
-    let input = quoted(&format!("{INPUT}/{test}.in"));
-    shell(&format!(
-        "if [ -x {SHIM} ]; then exec {SHIM} {input} {program}; \
-         else exec {program} < {input}; fi"
-    ))
+    let input = quoted(input);
+    let output = quoted(output);
+    // **There is no branch any more, and that is the change of 2026-09-05.**
+    // It used to fall back to running the program directly when the image had
+    // no shim, with stdout left on the container's stream for the collector to
+    // count. That stream now goes nowhere — a judged container is started with
+    // no log driver — so the fallback would have handed the comparison an empty
+    // answer for every test, and blamed the participant for it.
+    //
+    // An image with no shim cannot judge. The sandbox refuses such a run before
+    // it starts, which is a sentence an operator can act on; this line is only
+    // what makes the refusal reachable.
+    shell(&format!("exec {SHIM} {input} {output} {program}"))
 }
 
 #[cfg(test)]
@@ -671,44 +710,57 @@ mod tests {
     }
 
     #[test]
-    fn the_shim_is_given_the_input_and_the_fallback_redirects_it() {
-        let wrapped = with_input(&["python3".into(), "/program/program.py".into()], "1a");
-        let script = wrapped.last().unwrap();
+    fn the_shim_is_given_the_input_and_the_output_in_that_order() {
+        let script = with_channels(
+            &["python3".into(), "/program/program.py".into()],
+            &test_input("1a"),
+            "/aj-out/stdout",
+        )
+        .pop()
+        .unwrap();
 
-        // Through the shim the input is an argument, because the shim opens it.
-        assert!(
-            script.contains(
-                "exec /usr/local/bin/aj-shim '/in/1a.in' 'python3' '/program/program.py'"
+        // Both files are arguments, because the shim opens both — the input to
+        // read and the output to write. **Their order is the assertion**:
+        // swapped, the shim would truncate the test's input and feed the
+        // submission its own empty output, which is a wrong answer rather than
+        // an error anybody would see.
+        assert_eq!(
+            script,
+            concat!(
+                "exec /usr/local/bin/aj-shim ",
+                "'/in/1a.in' '/aj-out/stdout' 'python3' '/program/program.py'",
             ),
-            "got {script}"
-        );
-        // Without one it is a redirect, which is what it has always been.
-        assert!(
-            script.contains("exec 'python3' '/program/program.py' < '/in/1a.in'"),
-            "got {script}"
+            "got {script}",
         );
     }
 
-    /// **Both arms, or the shell is a process in the accounting.** It would also
-    /// be a second entry against a process limit set at sixteen, and a signal
-    /// aimed at the submission would reach the shell instead.
+    /// **There is no arm without an `exec`, and now there is only one arm.**
+    ///
+    /// A shell left behind would be a process in the accounting, a second entry
+    /// against a process limit set at sixteen, and something for a signal aimed
+    /// at the submission to reach instead of it.
+    ///
+    /// The other arm was the fallback for an image with no shim, deleted on
+    /// 2026-09-05: a judged container's own streams go nowhere, so a program
+    /// run without the shim would have produced an answer that reached nobody.
+    /// This asserts the fallback has not grown back — an `if` here is a silent
+    /// wrong answer for every test in the package.
     #[test]
-    fn neither_arm_leaves_a_shell_behind() {
-        let script = with_input(&["/program/program".into()], "0a")
-            .pop()
-            .unwrap();
+    fn nothing_but_the_shim_and_no_shell_behind_it() {
+        let script = with_channels(
+            &["/program/program".into()],
+            &test_input("0a"),
+            "/aj-out/stdout",
+        )
+        .pop()
+        .unwrap();
 
-        assert_eq!(script.matches("exec ").count(), 2, "got {script}");
-        for arm in script.split("; ") {
-            let arm = arm
-                .trim()
-                .trim_start_matches("then ")
-                .trim_start_matches("else ");
-            if arm.starts_with("if ") || arm == "fi" {
-                continue;
-            }
-            assert!(arm.starts_with("exec "), "an arm that does not exec: {arm}");
-        }
+        assert!(script.starts_with("exec "), "got {script}");
+        assert_eq!(script.matches("exec ").count(), 1, "got {script}");
+        assert!(
+            !script.contains("if ") && !script.contains(';'),
+            "the fallback is back, and it judges nobody: {script}",
+        );
     }
 
     /// A quote in a path would otherwise end the quoting and hand the rest of

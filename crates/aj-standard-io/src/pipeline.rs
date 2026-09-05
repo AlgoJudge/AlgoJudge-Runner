@@ -12,12 +12,16 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aj_package::{Config, TestSet};
-use aj_sandbox::{Mount, Profile, Sandbox, Stopped};
+use aj_sandbox::pipes::{open_for_writing, release, release_writer, Fifo};
+use aj_sandbox::{Beside, Enough, Mount, Pipes, Profile, Sandbox, Stopped};
 
 use crate::checker::{checker_said, Broken};
-use crate::compare::compare;
+use crate::compare::{Comparing, Comparison};
 use crate::details::{compiled, failed_to_compile, Compilation, Details, Limits};
-use crate::language::{self, Images, BUILD_OUTPUT, INPUT, PROGRAM, SOURCE};
+use crate::language::{
+    self, Images, ANSWER, BUILD_OUTPUT, FROM_THE_JUDGE, INPUT, OUTPUT, PROGRAM, SOURCE,
+    TO_THE_JUDGE, VERDICT,
+};
 use crate::score::{judge, Judgement, Reason, Status, TestOutcome};
 
 /// The scratch a compiler is given, for **every** build.
@@ -59,6 +63,27 @@ const BUILD_ARTEFACT_BYTES: u64 = 64 * 1024 * 1024;
 /// that would not stop talking put 64 MiB — the profile's default — into an
 /// infrastructure-failure message and into the uploaded log.
 const BUILD_LOG_BYTES: u64 = 256 * 1024;
+
+/// What a judged submission may print before it is stopped.
+///
+/// **Counted here and nowhere else, which is the point of the number.** It used
+/// to be `RLIMIT_FSIZE` on a file, and before that a count of what the daemon
+/// had already written to its log — 76 MB of it, measured, for one flooding
+/// submission against a 64 MiB cap. Now the only reader is the relay, so the
+/// bytes are counted as they cross and the program is stopped on the chunk that
+/// crosses the line.
+///
+/// Generous on purpose: it is a runaway `while (1) printf` this stops, not a
+/// verbose solution. A problem whose answer genuinely approaches it wants a
+/// checker, because nothing this size is compared token by token usefully.
+const OUTPUT_CAP: u64 = 64 * 1024 * 1024;
+
+/// How long a checker may run, and how long the Runner waits for it to open.
+///
+/// One constant for both because they are the same wait seen from two sides: a
+/// checker that has not opened its answer within its own wall clock is a
+/// checker that is never going to.
+const CHECKER_WALL_CLOCK: Duration = Duration::from_secs(30);
 
 /// The largest submission this problem type will look at — **the outer wall,
 /// and not a rule of anybody's activity.**
@@ -169,6 +194,19 @@ pub struct Job<'a> {
     pub package: Places,
     /// Scratch for this job alone, and empty. Removed by the caller afterwards.
     pub work: Places,
+    /// Where this job's per-test stdout files go, when that is not the scratch.
+    ///
+    /// **A tmpfs of the host's, where an operator has one.** The file is
+    /// written by the submission and read once by the Runner, and nothing about
+    /// it needs to survive the test — so it is the one thing in the loop that
+    /// can be kept out of a disk entirely. `None` puts it in the job's own
+    /// scratch, which is where it was before anybody could choose.
+    ///
+    /// It has to be the **host's** tmpfs and not the Runner's own: the daemon
+    /// resolves the bind mount, and a path only the Runner's mount namespace
+    /// knows produces an empty directory rather than an error — every test
+    /// would then be compared against nothing.
+    pub pipes: Option<Places>,
 }
 
 /// The package's checker, built and ready to be run over a test.
@@ -177,10 +215,22 @@ pub struct Job<'a> {
 /// assumption held while `cpp` was the only compiled language there was; it
 /// stopped holding the moment a package could name `cpp17-clang` — or `python3`,
 /// where starting `/program/program` would try to execute a `.py` file.
-struct Checker {
+struct Built {
     at: Places,
     image: String,
     start: Vec<String>,
+}
+
+/// The program beside the submission, and which of the two things it is.
+///
+/// **One build and two wirings.** A checker and an interactor are the same
+/// artefact — a program the package author wrote, compiled in a language image,
+/// run in its own container — and they differ only in what is connected to it.
+/// A checker is handed the answer and asked about it; an interactor is handed
+/// the submission's questions and produces the answers to them.
+enum Aside {
+    Checker(Built),
+    Interactor(Built),
 }
 
 /// A submission that was actually judged.
@@ -334,8 +384,7 @@ impl<S: Sandbox> Pipeline<S> {
         let source = job.work.join("src");
         let built_into = job.work.join("build");
         let artefacts = built_into.join("out");
-        let answers = job.work.join("answers");
-        for place in [&source, &built_into, &answers] {
+        for place in [&source, &built_into] {
             std::fs::create_dir_all(&place.here).map_err(|e| e.to_string())?;
         }
         std::fs::write(source.here.join(language.source_name), job.source)
@@ -407,9 +456,13 @@ impl<S: Sandbox> Pipeline<S> {
         }
 
         // ── the checker, which is also untrusted-adjacent ───────────────────
-        let checker = match &job.config.checker {
-            None => None,
-            Some(declared) => Some(self.build_checker(job, declared).await?),
+        // Refused together in `Config::validated`, so at most one arm is taken.
+        let aside = match (&job.config.checker, &job.config.interactor) {
+            (Some(declared), _) => Some(Aside::Checker(self.build_checker(job, declared).await?)),
+            (_, Some(declared)) => {
+                Some(Aside::Interactor(self.build_checker(job, declared).await?))
+            }
+            (None, None) => None,
         };
 
         // ── each test, in its own container ─────────────────────────────────
@@ -417,31 +470,191 @@ impl<S: Sandbox> Pipeline<S> {
         for test in job.tests.iter() {
             let limits = job.config.effective(test.group, &language.keys());
 
-            let run = self
-                .sandbox
-                .run(
-                    &self.pinned(
-                        Profile::new(
-                            &language.image,
-                            language::with_input(&language.start, &test.name),
-                        )
-                        .memory_bytes(limits.memory_bytes)
-                        .pids(16)
-                        // The one step a participant is judged on the time of, and
-                        // so the one that goes through the shim.
-                        .measured()
-                        .max_output_bytes(64 * 1024 * 1024)
-                        .wall_clock(reaping_deadline(limits.time_ms))
-                        // What the deadline above measures progress against,
-                        // and what "plainly past its budget" is measured from.
-                        .cpu_limit(Duration::from_millis(limits.time_ms))
-                        .mount(Mount::read_only(&artefacts.on_host, PROGRAM))
-                        .mount(input_mount(&job.package.on_host, &test.name)),
+            // **Where this test's stdout goes, instead of the daemon's log.**
+            // One directory per test, made by the Runner and root's, so the
+            // submission — which runs as `nobody` — cannot create, rename or
+            // read anything in it. The shim opens the file inside it before it
+            // drops privileges and hands over the descriptor alone.
+            let per_test = job
+                .pipes
+                .clone()
+                .unwrap_or_else(|| job.work.join("out"))
+                .join(&test.name);
+
+            // **Two directories and not one, because two containers.** The
+            // submission's own channels are in `run/`; anything a checker is
+            // given is in `beside/`. Both run as the same unprivileged user, so
+            // a single directory would be a place each could reach the other's
+            // — and the submission could then read the answer it is being
+            // compared against, or write into it.
+            let channels = per_test.join("run");
+            let beside_them = per_test.join("beside");
+            for at in [&channels.here, &beside_them.here] {
+                std::fs::create_dir_all(at).map_err(|e| {
+                    format!(
+                        "test {}: the channel directory could not be made: {e}",
+                        test.name
+                    )
+                })?;
+            }
+            // **A pipe, and the whole change is in that word.** The bytes go
+            // from the program to this process and stop there: nothing is
+            // written down, nothing is collected, and the answer is known while
+            // the program is still running rather than after it has finished
+            // producing an answer that was wrong at its first token.
+            //
+            // Made here, because the shim creates nothing — it opens what it is
+            // given, so a channel that is not there is the Runner's failure to
+            // prepare rather than something for the far end to invent.
+            let output = Fifo::make(channels.here.join(Pipes::OUTPUT), 0o600).map_err(|e| {
+                format!(
+                    "test {}: the output channel could not be made: {e}",
+                    test.name
+                )
+            })?;
+
+            // **Who compares decides what the relay does with the bytes**, and
+            // in both arms nothing is stored. With no checker the Runner
+            // tokenises them itself; with one it passes them straight on to a
+            // second pipe the checker is reading.
+            //
+            // 0666, where the submission's own channels are 0600: whatever is
+            // beside it runs unprivileged and has to open these, and there is
+            // nothing in them to hide from the program on the other end.
+            let channel = |at: &std::path::Path| {
+                Fifo::make(at, 0o666)
+                    .map_err(|e| format!("test {}: a channel could not be made: {e}", test.name))
+            };
+
+            // What the far side is given, by role. A checker reads one channel
+            // and is done; an interactor reads one, writes another, and says
+            // what it decided on a third.
+            let beside_channels = match &aside {
+                Some(Aside::Checker(_)) => vec![channel(
+                    &beside_them.here.join(format!("{}.out", test.name)),
+                )?],
+                Some(Aside::Interactor(_)) => vec![
+                    channel(&beside_them.here.join(TO_THE_JUDGE))?,
+                    channel(&beside_them.here.join(FROM_THE_JUDGE))?,
+                    channel(&beside_them.here.join(VERDICT))?,
+                ],
+                None => Vec::new(),
+            };
+
+            let watching = match &aside {
+                Some(_) => Watching::Relay(beside_channels[0].path().to_path_buf()),
+                None => Watching::Against(
+                    String::from_utf8_lossy(
+                        &std::fs::read(&test.expected).map_err(|e| e.to_string())?,
+                    )
+                    .into_owned(),
+                ),
+            };
+
+            // **The submission's own standard input**, and it exists only for an
+            // interactive problem. Everywhere else the input is a file the
+            // package brought, mounted read-only — which is what makes a batch
+            // problem reproducible and is not being changed.
+            let feeding = match &aside {
+                Some(Aside::Interactor(_)) => Some(channel(&channels.here.join(Pipes::INPUT))?),
+                _ => None,
+            };
+            let beside = Beside::new();
+            let reading = relay(
+                output.path().to_path_buf(),
+                watching,
+                OUTPUT_CAP,
+                beside.clone(),
+            );
+            let feeding = feeding.map(|stdin| {
+                (
+                    feed(
+                        beside_them.here.join(FROM_THE_JUDGE),
+                        stdin.path().to_path_buf(),
+                        beside.clone(),
+                    ),
+                    stdin,
+                )
+            });
+
+            // Bound rather than passed as a temporary: the future below holds
+            // a reference to it for as long as it runs.
+            let judged = self.pinned(
+                Profile::new(
+                    &language.image,
+                    language::with_channels(
+                        &language.start,
+                        &match &feeding {
+                            Some(_) => format!("{OUTPUT}/{}", Pipes::INPUT),
+                            None => language::test_input(&test.name),
+                        },
+                        &format!("{OUTPUT}/{}", Pipes::OUTPUT),
                     ),
                 )
-                .await
-                .map_err(|e| format!("a test could not be run: {e}"))?;
+                .memory_bytes(limits.memory_bytes)
+                .pids(16)
+                // The one step a participant is judged on the time of, and
+                // so the one that goes through the shim.
+                .measured()
+                // **Nothing leaves this container on its stdio.** The
+                // output travels on the pipe and the shim's report on
+                // its own, so the daemon has nothing to write down and
+                // no log driver to write it with.
+                .silent()
+                .wall_clock(reaping_deadline(limits.time_ms))
+                // What the deadline above measures progress against,
+                // and what "plainly past its budget" is measured from.
+                .cpu_limit(Duration::from_millis(limits.time_ms))
+                .pipes(&channels.here, &channels.on_host, OUTPUT)
+                .mount(Mount::read_only(&artefacts.on_host, PROGRAM))
+                .mount(input_mount(&job.package.on_host, &test.name)),
+            );
 
+            // **The checker runs beside the submission, not after it.** It is
+            // reading the answer as the program writes it, which is what makes
+            // the pipe worth having: the checker's exit is the only thing a
+            // separate program can say *while* it is running, and the closed
+            // pipe that exit produces is what stops the submission.
+            //
+            // The pair is `join`ed rather than raced. Both have their own wall
+            // clock, both are removed by the sandbox on every path out, and a
+            // failure in either has to be reported rather than abandoned.
+            let running = self.sandbox.run_beside(&judged, &beside);
+            let (run, said) = match &aside {
+                Some(Aside::Checker(built)) => {
+                    let checking = self.check(job, built, &beside_them, &test.name);
+                    let (run, said) = tokio::join!(running, checking);
+                    (run, Some(said))
+                }
+                Some(Aside::Interactor(built)) => {
+                    let interacting = self.interact(job, built, &beside_them, &test.name);
+                    let (run, said) = tokio::join!(running, interacting);
+                    (run, Some(said))
+                }
+                None => (running.await, None),
+            };
+
+            // **Before either error, and that is not a preference.** The relay
+            // is a thread blocked on an open that a container which never
+            // started will never answer; leaving by a `?` would leak one per
+            // failed test for the life of the Runner.
+            release(output.path());
+            if let Some((feeding, stdin)) = feeding {
+                // Nothing is going to write the far end now, and nothing is
+                // going to read this one. Both halves of the thread's wait have
+                // to be ended, or it is a thread held for the life of the
+                // Runner.
+                release(&beside_them.here.join(FROM_THE_JUDGE));
+                release_writer(stdin.path());
+                let _ = feeding.await;
+            }
+            let produced = reading
+                .await
+                .map_err(|e| format!("test {}: the output was not read: {e}", test.name))?;
+            let run = run.map_err(|e| format!("a test could not be run: {e}"))?;
+
+            // The channels go with it; nothing in here outlives a test.
+            let _ = std::fs::remove_dir_all(&per_test.here);
             let measured = Measured::of(&run).map_err(|e| format!("test {}: {e}", test.name))?;
             let time_ms = measured.time_ms;
 
@@ -508,6 +721,12 @@ impl<S: Sandbox> Pipeline<S> {
                 // Refused above, before this match, because it is a statement
                 // about the host rather than a verdict about a submission.
                 Stopped::NeverStarted => unreachable!("a run that never started is not judged"),
+                // **Stopped because the answer was already known**, which is
+                // not a failure of anything and so has no note of its own. What
+                // it does change is the ordering below: a run stopped in the
+                // middle of a `write` has an exit code that says nothing about
+                // the program, so that check has to skip it.
+                Stopped::Decided => None,
 
                 Stopped::Memory => Some(("Memory limit exceeded".to_owned(), Reason::MemoryLimit)),
                 Stopped::Output => Some(("Output limit exceeded".to_owned(), Reason::OutputLimit)),
@@ -532,7 +751,30 @@ impl<S: Sandbox> Pipeline<S> {
                 outcomes.push(failed(test, Some(measured), &note, reason));
                 continue;
             }
-            if run.exit_code != 0 {
+
+            // **After the sandbox's own findings and before the exit code.** A
+            // memory limit outranks this — the program was stopped by the kernel
+            // for a reason the participant can act on — but flooding then
+            // exiting non-zero is flooding, and the non-zero is a consequence of
+            // being cut off.
+            if produced.capped {
+                outcomes.push(failed(
+                    test,
+                    Some(measured),
+                    "Output limit exceeded",
+                    Reason::OutputLimit,
+                ));
+                continue;
+            }
+
+            // **A decided run's exit code is not evidence.** It was stopped
+            // mid-write, so it died of a signal it was given rather than one it
+            // earned, and reading that as a runtime error would turn every early
+            // wrong answer into a crash. A run that finished **on its own** and
+            // then reported a failure is a different matter, and still outranks
+            // whatever the comparison found: wrong output followed by a segfault
+            // is a segfault.
+            if run.stopped != Stopped::Decided && run.exit_code != 0 {
                 outcomes.push(failed(
                     test,
                     Some(measured),
@@ -542,12 +784,9 @@ impl<S: Sandbox> Pipeline<S> {
                 continue;
             }
 
-            let answer = answers.here.join(format!("{}.out", test.name));
-            std::fs::write(&answer, &run.stdout).map_err(|e| e.to_string())?;
-
-            let (status, percentage, note) = match &checker {
-                Some(built) => {
-                    match self.check(job, built, &answers, &test.name).await? {
+            let (status, percentage, note) = match said {
+                Some(said) => {
+                    match said? {
                         Ok(said) => (
                             if said.accepted {
                                 Status::Ok
@@ -565,10 +804,11 @@ impl<S: Sandbox> Pipeline<S> {
                     }
                 }
                 None => {
-                    let found = compare(
-                        &std::fs::read(&test.expected).map_err(|e| e.to_string())?,
-                        &run.stdout,
-                    );
+                    // Settled while the program was running, and possibly long
+                    // before it stopped. Nothing is compared here.
+                    let found = produced
+                        .found
+                        .expect("with no checker the relay is the one comparing");
                     if found.equal() {
                         (Status::Ok, 100, String::new())
                     } else {
@@ -621,7 +861,7 @@ impl<S: Sandbox> Pipeline<S> {
         &self,
         job: &Job<'_>,
         declared: &aj_package::config::Source,
-    ) -> Result<Checker, String> {
+    ) -> Result<Built, String> {
         let language = language::for_id(&declared.language, &self.images).ok_or_else(|| {
             format!(
                 "the checker is in {}, which this Runner does not build",
@@ -669,7 +909,7 @@ impl<S: Sandbox> Pipeline<S> {
             ));
         }
         unpack(&built.collected, &built_into.here)?;
-        Ok(Checker {
+        Ok(Built {
             at: output,
             image: language.image.clone(),
             start: language.start.clone(),
@@ -681,17 +921,97 @@ impl<S: Sandbox> Pipeline<S> {
     /// It comes from a package a manager authored, not from the platform, so it
     /// is untrusted-adjacent: it gets limits and no network like anything else,
     /// and it never runs in the Runner's process.
+    /// Runs an interactor beside the submission and reads what it decided.
+    ///
+    /// **The same contract as a checker, seen from the other side.** `argv[1]`
+    /// is still the test's input and `argv[3]` still the reference answer; what
+    /// changes is `argv[2]`, which a checker *reads* — the participant's output
+    /// — and an interactor *writes*: the `OK`/`WRONG` document. So
+    /// [`checker_said`] and [`Broken`] are reused unchanged, and the rule that a
+    /// non-zero exit is a broken package rather than a wrong answer covers an
+    /// interactor for free.
+    ///
+    /// The conversation itself is this program's own standard input and output,
+    /// redirected by the shell onto two channels the Runner made. It never has
+    /// the submission's own descriptors: everything is copied by [`relay`] one
+    /// way and [`feed`] the other, which is what keeps the byte counter, the
+    /// output cap and the early kill in trusted code.
+    async fn interact(
+        &self,
+        job: &Job<'_>,
+        interactor: &Built,
+        beside_them: &Places,
+        test: &str,
+    ) -> Result<Result<crate::checker::Checked, Broken>, String> {
+        let mut command = interactor.start.clone();
+        command.extend([
+            format!("{INPUT}/{test}.in"),
+            format!("{ANSWER}/{VERDICT}"),
+            format!("{INPUT}/{test}.out"),
+        ]);
+        let spoken = command
+            .iter()
+            .map(|part| format!("'{}'", part.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Read before the run is awaited, because the interactor may write its
+        // verdict and exit while the submission is still being stopped.
+        let reading = read_channel(beside_them.here.join(VERDICT));
+
+        let run = self
+            .sandbox
+            .run(
+                &Profile::new(
+                    &interactor.image,
+                    vec![
+                        "/bin/sh".to_owned(),
+                        "-c".to_owned(),
+                        format!(
+                            "exec {spoken} < '{ANSWER}/{TO_THE_JUDGE}' > '{ANSWER}/{FROM_THE_JUDGE}'"
+                        ),
+                    ],
+                )
+                .memory_bytes(256 * 1024 * 1024)
+                .pids(16)
+                .wall_clock(CHECKER_WALL_CLOCK)
+                .max_output_bytes(64 * 1024)
+                // See `check`: this is what keeps the systemd cgroup driver's
+                // gate from deadlocking two runs against each other.
+                .alongside()
+                // **Writable, where a checker's is read-only.** An interactor
+                // opens two of these for writing, and a read-only bind refuses
+                // that even for a pipe. What is in the directory is three
+                // channels the Runner made and nothing else.
+                .mount(Mount::writable(&beside_them.on_host, ANSWER))
+                .mount(Mount::read_only(&interactor.at.on_host, PROGRAM))
+                .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT)),
+            )
+            .await
+            .map_err(|e| format!("the interactor could not be run: {e}"))?;
+
+        release(&beside_them.here.join(VERDICT));
+        let verdict = reading
+            .await
+            .map_err(|e| format!("the interactor's verdict was not read: {e}"))?;
+
+        if run.stopped != Stopped::OnItsOwn {
+            return Err(format!("the interactor was stopped: {:?}", run.stopped));
+        }
+        Ok(checker_said(run.exit_code, &verdict))
+    }
+
     async fn check(
         &self,
         job: &Job<'_>,
-        checker: &Checker,
-        answers: &Places,
+        checker: &Built,
+        beside_them: &Places,
         test: &str,
     ) -> Result<Result<crate::checker::Checked, Broken>, String> {
         let mut command = checker.start.clone();
         command.extend([
             format!("{INPUT}/{test}.in"),
-            format!("/answers/{test}.out"),
+            format!("{ANSWER}/{test}.out"),
             format!("{INPUT}/{test}.out"),
         ]);
 
@@ -701,11 +1021,19 @@ impl<S: Sandbox> Pipeline<S> {
                 &Profile::new(&checker.image, command)
                     .memory_bytes(256 * 1024 * 1024)
                     .pids(16)
-                    .wall_clock(Duration::from_secs(30))
+                    .wall_clock(CHECKER_WALL_CLOCK)
                     .max_output_bytes(64 * 1024)
                     .mount(Mount::read_only(&checker.at.on_host, PROGRAM))
                     .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT))
-                    .mount(Mount::read_only(&answers.on_host, "/answers")),
+                    // **Alongside, and this is the flag that stops a hard
+                    // deadlock.** The judged run holds the measurement gate for
+                    // its whole length, and on the systemd cgroup driver that
+                    // gate is an owned mutex — a checker asking for one of its
+                    // own would wait for a run that is waiting for it.
+                    .alongside()
+                    // Read-only, and a pipe opened for reading is a read: what
+                    // the mount refuses is creating or replacing the name.
+                    .mount(Mount::read_only(&beside_them.on_host, ANSWER)),
             )
             .await
             .map_err(|e| format!("the checker could not be run: {e}"))?;
@@ -716,6 +1044,194 @@ impl<S: Sandbox> Pipeline<S> {
         }
         Ok(checker_said(run.exit_code, &run.stdout))
     }
+}
+
+/// What the Runner does with a submission's output while it is being produced.
+///
+/// **The Runner is the only reader of it, always.** Where there is no checker it
+/// tokenises the bytes itself; where there is one it keeps them for it. The
+/// program is never wired to anything the package brought with it.
+enum Watching {
+    /// Compare against the reference answer, token by token, as it arrives.
+    Against(String),
+    /// Pass it straight to a checker, which is reading the far end as it goes.
+    ///
+    /// **The checker never touches the program's own pipe.** It is handed a
+    /// second one the Runner writes into, which is what keeps the byte counter,
+    /// the cap and the early kill in trusted code, and what lets the two
+    /// containers run as the same unprivileged user without sharing a
+    /// directory.
+    Relay(PathBuf),
+}
+
+/// What came out of one test, and what was made of it on the way.
+struct Produced {
+    /// The comparison, where the Runner was the one comparing.
+    ///
+    /// **Absent means a checker had it**, and a checker's answer is its exit
+    /// code rather than anything this could carry. There is no third case:
+    /// somebody is always reading, which is why nothing here holds the bytes.
+    found: Option<Comparison>,
+    /// It printed more than it was allowed to.
+    ///
+    /// **Kept here rather than read off `Stopped::Output`**, because the two
+    /// disagree in one direction: a program that floods and exits in the same
+    /// breath can cross the cap after the sandbox has already stopped watching,
+    /// and it still printed more than it was allowed to.
+    capped: bool,
+}
+
+/// Reads one run's output as it is written, and decides what can be decided.
+///
+/// **Blocking, on a thread of its own, and the blocking is the point.** Opening
+/// a pipe for reading waits for a writer, so the reader cannot mistake *nothing
+/// has been written yet* for *nothing will be* — which is what a non-blocking
+/// open reports, as an immediate end of file, and it would arrive here as a
+/// program that printed nothing.
+///
+/// **It goes on draining after it has decided.** The verdict is settled and the
+/// bytes are thrown away, but a reader that stops reading is a full pipe, and a
+/// full pipe is a program blocked in `write` rather than a program being
+/// stopped — the participant would be charged for the judge's own tidiness.
+fn relay(
+    at: PathBuf,
+    watching: Watching,
+    cap: u64,
+    beside: Beside,
+) -> tokio::task::JoinHandle<Produced> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+
+        let mut comparing = match &watching {
+            Watching::Against(expected) => Some(Comparing::against(expected)),
+            _ => None,
+        };
+        // **Opened before a byte is read, and that ordering is the point.** The
+        // checker is already running and blocked on its own open; leaving this
+        // until the program has produced something would hold it there for as
+        // long as the program thinks.
+        let mut far = match &watching {
+            Watching::Relay(to) => match open_for_writing(to, CHECKER_WALL_CLOCK) {
+                Ok(open) => Some(open),
+                Err(e) => {
+                    tracing::warn!(path = %to.display(), %e, "the checker never opened its answer");
+                    return Produced {
+                        found: None,
+                        capped: false,
+                    };
+                }
+            },
+            _ => None,
+        };
+        let mut capped = false;
+        let mut total: u64 = 0;
+
+        if let Ok(mut channel) = std::fs::File::open(&at) {
+            let mut buffer = vec![0u8; 64 * 1024];
+            loop {
+                let read = match channel.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                let chunk = &buffer[..read];
+                // What the reaper watches: a run talking to its checker is
+                // working, however little processor time it is spending.
+                beside.moved(read);
+                total += read as u64;
+
+                // **The cap covers the comparing side too**, and not only the
+                // checker's. A program printing one enormous token with no
+                // whitespace in it is holding that token in *this* process
+                // until it ends, because a token is only whole once something
+                // follows it.
+                if !capped && total > cap {
+                    capped = true;
+                    // The checker is reading a stream that is not going to end
+                    // on its own. Closing this is what lets it finish rather
+                    // than wait out its own wall clock.
+                    far = None;
+                    beside.enough(Enough::Output);
+                }
+                if capped {
+                    continue;
+                }
+
+                match (&mut comparing, &mut far) {
+                    (Some(comparing), _) => {
+                        if comparing.feed(chunk).is_some() {
+                            beside.enough(Enough::Decided);
+                        }
+                    }
+                    // **A checker that has stopped reading has decided.** It is
+                    // the only signal there is: a checker says what it thinks
+                    // with an exit code, so the moment it exits its end of the
+                    // pipe closes and this write fails. That is the same early
+                    // kill the built-in comparison gets, reached by the only
+                    // road a separate program leaves open.
+                    (None, Some(open)) => {
+                        use std::io::Write as _;
+                        if open.write_all(chunk).is_err() {
+                            beside.enough(Enough::Decided);
+                            far = None;
+                        }
+                    }
+                    // Nothing is listening any more — the checker exited, or
+                    // the cap closed its end. Draining is still what keeps the
+                    // program out of a blocking `write` until it is stopped.
+                    (None, None) => {}
+                }
+            }
+        }
+
+        Produced {
+            found: comparing.map(|comparing| comparing.finish()),
+            capped,
+        }
+    })
+}
+
+/// Reads one channel to its end, on a thread of its own.
+fn read_channel(at: PathBuf) -> tokio::task::JoinHandle<Vec<u8>> {
+    tokio::task::spawn_blocking(move || std::fs::read(&at).unwrap_or_default())
+}
+
+/// Carries what the interactor says back to the submission.
+///
+/// **The mirror of [`relay`], and it exists for the same reason.** The
+/// submission is never wired to package-authored code in either direction: what
+/// reaches its standard input is copied here, by the Runner, out of a second
+/// pipe. That is what makes both halves of a conversation countable, and
+/// countable is what the reaper needs — an interactive run spends most of its
+/// time with neither side on a processor, and only a byte moving tells that
+/// apart from a run that has wedged.
+fn feed(from: PathBuf, to: PathBuf, beside: Beside) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read as _, Write as _};
+
+        // The far end first, exactly as the forward relay does: the submission
+        // is blocked opening its input, and it is the interactor's arrival that
+        // has to be waited for, not the submission's.
+        let Ok(mut said) = std::fs::File::open(&from) else {
+            return;
+        };
+        let Ok(mut onward) = open_for_writing(&to, CHECKER_WALL_CLOCK) else {
+            return;
+        };
+
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            let read = match said.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            beside.moved(read);
+            // The submission is gone, or has closed its input. Neither is this
+            // side's business to report.
+            if onward.write_all(&buffer[..read]).is_err() {
+                break;
+            }
+        }
+    })
 }
 
 /// Writes out what a build container produced.

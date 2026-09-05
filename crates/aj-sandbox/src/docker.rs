@@ -31,8 +31,10 @@ use bollard::query_parameters::{
 use futures_util::StreamExt as _;
 
 use crate::cgroups::{self, Cgroups};
-use crate::profile::{Outcome, Profile, Stopped};
-use crate::{Error, Result, Sandbox};
+use std::path::PathBuf;
+
+use crate::profile::{Outcome, Pipes, Profile, Stopped, SHIM};
+use crate::{pipes::release, Beside, Enough, Error, Result, Sandbox};
 
 pub struct Docker {
     client: bollard::Docker,
@@ -307,16 +309,39 @@ impl Docker {
                 profile
                     .mounts
                     .iter()
-                    .map(|m| {
+                    .map(|m| (m.from.clone(), m.to.clone(), m.writable))
+                    // **Added here rather than by the caller, so it cannot be
+                    // forgotten.** A profile that names a stdout directory and
+                    // does not mount it would have the shim fail to open the
+                    // file, which is a run that produced nothing rather than a
+                    // configuration mistake anybody could see.
+                    .chain(
+                        profile
+                            .pipes
+                            .iter()
+                            .map(|out| (out.on_host.clone(), out.at.clone(), true)),
+                    )
+                    .map(|(from, to, writable)| {
                         format!(
                             "{}:{}:{}",
-                            m.from.display(),
-                            m.to,
-                            if m.writable { "rw" } else { "ro" }
+                            from.display(),
+                            to,
+                            if writable { "rw" } else { "ro" }
                         )
                     })
                     .collect(),
             ),
+
+            // **Nothing is written about a silent container.** `none` is the
+            // one driver that stores nothing; it also refuses the endpoint
+            // `collect` reads, which is why only a run nobody reads that way
+            // may ask for it.
+            log_config: profile
+                .silent
+                .then(|| bollard::models::HostConfigLogConfig {
+                    typ: Some("none".to_owned()),
+                    config: None,
+                }),
 
             tmpfs: profile.tmpfs_bytes.map(|bytes| {
                 HashMap::from([(
@@ -418,11 +443,33 @@ impl Sandbox for Docker {
         decided.map(|_| ())
     }
 
-    async fn run(&self, profile: &Profile) -> Result<Outcome> {
+    async fn run_beside(&self, profile: &Profile, beside: &Beside) -> Result<Outcome> {
         // Asked before anything is created: the user a container starts as
         // cannot be changed afterwards, and an image with no shim must not be
         // handed a root one.
         let shim = profile.measured && self.image_has_shim(&profile.image).await;
+
+        // **A silent measured run without the shim would judge nobody's
+        // program**, so it is refused before anything starts.
+        //
+        // The two flags together say: the container's own streams carry nothing
+        // (the daemon has no log driver for them) and the numbers come from the
+        // report. Take the shim away and *both* halves are gone — the output
+        // went to a channel nothing opened and the report was never written —
+        // and what arrives at the pipeline is an empty answer from a program
+        // that ran. Every test would be wrong, and it would read as the
+        // participant's fault.
+        //
+        // This is a real loss and it belongs to an operator, not to us: an image
+        // of their own can no longer judge unless it carries the shim. Said here
+        // rather than found out there.
+        if profile.measured && profile.silent && !shim {
+            return Err(Error::Refused(format!(
+                "the image {} carries no {SHIM}, so a judged run in it would \
+                 produce neither output nor a measurement",
+                profile.image
+            )));
+        }
         let nonce = shim.then(|| format!("{:016x}{:016x}", rand_suffix(), rand_suffix()));
 
         let name = format!(
@@ -436,6 +483,11 @@ impl Sandbox for Docker {
         // that has to have a beginning. Failure here is not an error: the run
         // proceeds unmeasured.
         let cgroup = match self.cgroups() {
+            // **A run beside another one opens nothing.** Under `systemd` the
+            // gate `begin` takes is held for the whole of the run that owns it,
+            // so asking for one here is how a checker comes to wait for the
+            // submission that is waiting for the checker.
+            _ if profile.alongside => None,
             Some(cgroups) => cgroups.begin(&name).await,
             None => None,
         };
@@ -451,12 +503,23 @@ impl Sandbox for Docker {
             // The nonce reaches the shim and nothing else: it scrubs the bytes
             // before forking, and the submission runs as a different user that
             // cannot read `/proc/1/environ` in any case.
-            env: nonce
-                .as_ref()
-                .map(|nonce| vec![format!("AJ_SHIM_NONCE={nonce}")]),
+            //
+            // **The cap travels the same way, and only with the nonce.** It is
+            // the shim that applies it, as `RLIMIT_FSIZE` on the child before
+            // dropping privileges — so it is meaningless without one, and the
+            // shim scrubs both.
+            env: nonce.as_ref().map(|nonce| {
+                let mut env = vec![format!("AJ_SHIM_NONCE={nonce}")];
+                if let Some(pipes) = &profile.pipes {
+                    env.push(format!("AJ_SHIM_REPORT={}", pipes.inside(Pipes::REPORT)));
+                }
+                env
+            }),
             labels: Some(self.labels()),
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
+            // Asked for only where something reads them back. A silent
+            // container's stdio carries nothing and is attached by nobody.
+            attach_stdout: Some(!profile.silent),
+            attach_stderr: Some(!profile.silent),
             network_disabled: Some(true),
             host_config: Some(self.host_config(
                 profile,
@@ -482,12 +545,40 @@ impl Sandbox for Docker {
             return Err(e.into());
         }
 
+        // **The report's channel is the sandbox's own**, because the report is:
+        // this is the only place that knows what a nonce is or how a report is
+        // shaped. The directory around it belongs to the caller, which is why
+        // only the channel is made here.
+        let report = match (&profile.pipes, nonce.as_deref()) {
+            (Some(pipes), Some(_)) => {
+                // This process's own view: it is the one making and reading
+                // the channel, and where it is containerised that is neither
+                // the daemon's path nor the container's.
+                let at = pipes.here(Pipes::REPORT);
+                match crate::pipes::Fifo::make(&at, 0o600) {
+                    // The `Fifo` is held to the end of this function, so the
+                    // channel is taken away whatever happens after it.
+                    Ok(fifo) => Some((fifo, read_to_end(at))),
+                    Err(e) => {
+                        if let Some((measuring, _)) = cgroup {
+                            measuring.finish();
+                        }
+                        return Err(Error::Refused(format!(
+                            "the shim's report has nowhere to go: {e}"
+                        )));
+                    }
+                }
+            }
+            _ => None,
+        };
+
         // From here on the container exists, so every path out removes it.
         let mut outcome = self
             .supervise(
                 &name,
                 profile,
                 cgroup.as_ref().map(|(measuring, _)| measuring),
+                beside,
             )
             .await;
         self.remove(&name).await;
@@ -507,7 +598,46 @@ impl Sandbox for Docker {
         }
 
         if let (Some(nonce), Ok(outcome)) = (nonce.as_deref(), outcome.as_mut()) {
-            if let Some(said) = take_report(&mut outcome.stderr, nonce) {
+            // **Where it arrives from decides what has to be picked out of it.**
+            // On its own channel nothing else can be in there, so the whole of
+            // it is the report; on stderr it is mixed with whatever the
+            // submission printed, and every match has to be drained back out.
+            let mut said = match report {
+                Some((fifo, reading)) => {
+                    // Nothing wrote, and nothing ever will: the container is
+                    // gone. Without this the reader is a thread blocked for the
+                    // life of the Runner.
+                    release(fifo.path());
+                    reading.await.ok().and_then(|mut bytes| {
+                        let found = take_report(&mut bytes, nonce);
+                        if found.is_none() && !bytes.is_empty() {
+                            tracing::warn!(
+                            container = name,
+                            bytes = bytes.len(),
+                            "something was written to the report channel and it was not a report",
+                        );
+                        }
+                        found
+                    })
+                }
+                None => take_report(&mut outcome.stderr, nonce),
+            };
+            // **Present and silent is a failure, and it used to be a
+            // shrug.** A missing report fell back to the cgroup, which is a
+            // real measurement of a real container — so a shim that failed
+            // after `exec` was indistinguishable from an image that never had
+            // one, and the difference is a participant charged for a container
+            // start they did not cause.
+            //
+            // Only a run that finished **on its own** owes a report. Every other
+            // stop is the sandbox having killed the shim, which is exactly when
+            // there is nothing to report.
+            if said.is_none() && outcome.stopped == Stopped::OnItsOwn {
+                return Err(Error::Refused(format!(
+                    "the run finished on its own and the {SHIM} reported nothing"
+                )));
+            }
+            if let Some(said) = said.take() {
                 let whole = outcome.cpu_time;
                 let charged = measured_time(said.cpu, whole);
 
@@ -577,6 +707,7 @@ impl Docker {
         name: &str,
         profile: &Profile,
         measuring: Option<&crate::cgroups::Measuring>,
+        beside: &Beside,
     ) -> Stopped {
         let started = Instant::now();
         let mut reaper = Reaper::new(profile);
@@ -588,7 +719,9 @@ impl Docker {
             // readings taken at different moments would not describe one
             // interval.
             let stalled = measuring.and_then(|measuring| measuring.stalled());
-            if let Some(stopped) = reaper.tick(REAP_POLL, started.elapsed(), cpu, stalled) {
+            if let Some(stopped) =
+                reaper.tick(REAP_POLL, started.elapsed(), cpu, stalled, beside.so_far())
+            {
                 tracing::debug!(
                     container = name,
                     ?stopped,
@@ -617,6 +750,7 @@ impl Docker {
         name: &str,
         profile: &Profile,
         measuring: Option<&crate::cgroups::Measuring>,
+        beside: &Beside,
     ) -> Result<Outcome> {
         let started = Instant::now();
         self.client
@@ -642,12 +776,21 @@ impl Docker {
         // is read before it is raised — and the truncated log is then scored as
         // the participant's wrong answer instead of an output-limit verdict.
         let flooded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let collector = tokio::spawn(collect(
-            self.client.clone(),
-            name.to_owned(),
-            profile.max_output_bytes,
-            std::sync::Arc::clone(&flooded),
-        ));
+        // **Not spawned at all for a silent run**, because there is nothing for
+        // it to read: nothing is attached and the daemon keeps no log.
+        //
+        // Skipping it is an economy and not a correctness rule — measured, a
+        // collector left running against such a container comes back empty and
+        // harmless rather than failing. It is a task and a `logs` subscription
+        // per test, and 8409 of those a burst is worth not starting.
+        let collector = (!profile.silent).then(|| {
+            tokio::spawn(collect(
+                self.client.clone(),
+                name.to_owned(),
+                profile.max_output_bytes,
+                std::sync::Arc::clone(&flooded),
+            ))
+        });
 
         let mut waiter = self
             .client
@@ -657,9 +800,20 @@ impl Docker {
             _ = waiter.next() => Stopped::OnItsOwn,
             // Once this completes the branch is chosen and its block runs to the
             // end, so the kill cannot hand the decision back to the waiter.
-            stopped = self.reap(name, profile, measuring) => {
+            stopped = self.reap(name, profile, measuring, beside) => {
                 self.kill(name).await;
                 stopped
+            }
+            // **Somebody watching has decided.** The same shape as the reaper's
+            // branch and for the same reason: once this completes the block runs
+            // to the end, so the kill cannot hand the decision back to the
+            // waiter and have the run read as finished on its own.
+            why = beside.asked() => {
+                self.kill(name).await;
+                match why {
+                    Enough::Decided => Stopped::Decided,
+                    Enough::Output => Stopped::Output,
+                }
             }
         };
 
@@ -672,9 +826,12 @@ impl Docker {
             None => None,
             Some(path) => self.take(name, path, profile.max_collected_bytes).await?,
         };
-        let (stdout, stderr) = collector
-            .await
-            .map_err(|e| Error::Refused(format!("the output collector did not finish: {e}")))??;
+        let (stdout, stderr) = match collector {
+            None => (Vec::new(), Vec::new()),
+            Some(collector) => collector.await.map_err(|e| {
+                Error::Refused(format!("the output collector did not finish: {e}"))
+            })??,
+        };
 
         // Now that the collector is done, and not before: see above.
         let stopped = if flooded.load(std::sync::atomic::Ordering::SeqCst) {
@@ -836,6 +993,31 @@ fn memory_kill(stopped: Stopped, reading: &cgroups::Reading) -> Stopped {
     } else {
         stopped
     }
+}
+
+/// Reads one channel to its end, on a thread of its own.
+///
+/// **The open blocks, and that is what makes it right.** Opening a pipe for
+/// reading waits until somebody opens the writing end, so a reader cannot
+/// mistake *nobody has written yet* for *there is nothing to read* — which is
+/// exactly what a non-blocking open reports, as an immediate end of file, and
+/// it would arrive as a run that printed nothing.
+fn read_to_end(at: PathBuf) -> tokio::task::JoinHandle<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        match std::fs::File::open(&at) {
+            Ok(mut channel) => {
+                if let Err(e) = channel.read_to_end(&mut bytes) {
+                    tracing::debug!(path = %at.display(), %e, "a channel ended badly");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(path = %at.display(), %e, "a channel could not be opened")
+            }
+        }
+        bytes
+    })
 }
 
 async fn collect(
@@ -1055,6 +1237,13 @@ struct Reaper {
     /// The last pressure reading, to take a difference against. `None` until
     /// the first look, and on a kernel that carries no PSI.
     stalled: Option<Duration>,
+    /// The most that had crossed between this run and whatever is checking it.
+    ///
+    /// **The second half of "idle".** A program talking to an interactor spends
+    /// almost no processor time and raises no pressure — it is blocked on a
+    /// read, which looks exactly like a program that has given up. What tells
+    /// the two apart is whether anything is still passing between them.
+    moved: u64,
 }
 
 impl Reaper {
@@ -1066,6 +1255,7 @@ impl Reaper {
             best: Duration::ZERO,
             idle: Duration::ZERO,
             stalled: None,
+            moved: 0,
         }
     }
 
@@ -1091,8 +1281,15 @@ impl Reaper {
         elapsed: Duration,
         cpu: Option<Duration>,
         stalled: Option<Duration>,
+        moved: u64,
     ) -> Option<Stopped> {
         let waiting = self.waited_for_a_processor(stalled);
+        // **Talking is working.** Counted before the processor time, and on the
+        // same footing: a byte crossing between the two sides is progress by
+        // the only measure that means anything for a pair of programs waiting
+        // on each other.
+        let talked = moved > self.moved;
+        self.moved = moved;
 
         match cpu {
             // **Progress only counts against a limit.** A step nobody is timed
@@ -1109,8 +1306,8 @@ impl Reaper {
                 if self.ceiling.is_some_and(|ceiling| cpu > ceiling) {
                     return Some(Stopped::TimeLimit);
                 }
-                if cpu > self.best {
-                    self.best = cpu;
+                if cpu > self.best || talked {
+                    self.best = self.best.max(cpu);
                     self.idle = Duration::ZERO;
                 } else if !waiting {
                     // **Not scheduled is not idle**, so the window only runs
@@ -1138,6 +1335,7 @@ impl Reaper {
                     self.idle += since;
                 }
             }
+            _ if talked => self.idle = Duration::ZERO,
             _ => self.idle += since,
         }
 
@@ -1150,7 +1348,10 @@ impl Reaper {
         // slowly and did not wedge: it never began. Only a step that is timed
         // can say this — a build or a checker has no budget to be measured
         // against and keeps the answer it always had.
-        if self.ceiling.is_some() && self.best.is_zero() {
+        // A run that moved bytes plainly started, whatever the cgroup says —
+        // telling a participant "no processor time was ever recorded" about a
+        // program that was answering an interactor would be false.
+        if self.ceiling.is_some() && self.best.is_zero() && self.moved == 0 {
             return Some(Stopped::NeverStarted);
         }
 
@@ -1520,7 +1721,7 @@ mod tests {
         for tick in 1..=40u64 {
             cpu += ms(5);
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(cpu), None),
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu), None, 0),
                 None,
                 "tick {tick}, {cpu:?} of processor time"
             );
@@ -1543,13 +1744,13 @@ mod tests {
         // in its cgroup was runnable and waiting the whole time.
         let mut stalled = ms(0);
         assert_eq!(
-            reaper.tick(ms(250), ms(250), Some(ms(30)), Some(stalled)),
+            reaper.tick(ms(250), ms(250), Some(ms(30)), Some(stalled), 0),
             None
         );
         for tick in 2..=40u64 {
             stalled += ms(200);
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), Some(stalled)),
+                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), Some(stalled), 0),
                 None,
                 "tick {tick}: it was waiting for a core, not idle",
             );
@@ -1568,7 +1769,7 @@ mod tests {
         let mut verdict = None;
         for tick in 1..=300u64 {
             stalled += ms(200);
-            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), Some(stalled));
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), Some(stalled), 0);
             if verdict.is_some() {
                 // Five times the 2.2 s ceiling this test builds.
                 assert_eq!(ms(250 * tick), ms(11000), "it stopped at the cap");
@@ -1586,16 +1787,16 @@ mod tests {
         let mut reaper = timed();
         // A reading that is present and never moves: nothing was waiting.
         let quiet = Some(ms(7));
-        assert_eq!(reaper.tick(ms(250), ms(250), Some(ms(30)), quiet), None);
+        assert_eq!(reaper.tick(ms(250), ms(250), Some(ms(30)), quiet, 0), None);
         for tick in 2..=7u64 {
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), quiet),
+                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), quiet, 0),
                 None,
                 "tick {tick}",
             );
         }
         assert_eq!(
-            reaper.tick(ms(250), ms(2000), Some(ms(30)), quiet),
+            reaper.tick(ms(250), ms(2000), Some(ms(30)), quiet, 0),
             Some(Stopped::WallClock),
         );
     }
@@ -1614,7 +1815,7 @@ mod tests {
             cpu += ms(20);
             stalled += ms(100);
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(cpu), Some(stalled)),
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu), Some(stalled), 0),
                 None,
             );
         }
@@ -1622,13 +1823,13 @@ mod tests {
         // Six quiet looks are 1.5 s, just inside the 1.6 s window.
         for tick in 5..=10u64 {
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(cpu), Some(stalled)),
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu), Some(stalled), 0),
                 None,
                 "tick {tick}",
             );
         }
         assert_eq!(
-            reaper.tick(ms(250), ms(3000), Some(cpu), Some(stalled)),
+            reaper.tick(ms(250), ms(3000), Some(cpu), Some(stalled), 0),
             Some(Stopped::WallClock),
             "the window ran out on a program that was doing nothing",
         );
@@ -1640,17 +1841,17 @@ mod tests {
     fn a_program_that_stops_computing_is_reaped_after_the_window() {
         let mut reaper = timed();
         // It runs for a moment, and then spends nothing at all.
-        assert_eq!(reaper.tick(ms(250), ms(250), Some(ms(30)), None), None);
+        assert_eq!(reaper.tick(ms(250), ms(250), Some(ms(30)), None, 0), None);
         for tick in 2..=7u64 {
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), None),
+                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), None, 0),
                 None,
                 "tick {tick}",
             );
         }
         // The seventh quiet look puts the idle time past the 1.6 s window.
         assert_eq!(
-            reaper.tick(ms(250), ms(2000), Some(ms(30)), None),
+            reaper.tick(ms(250), ms(2000), Some(ms(30)), None, 0),
             Some(Stopped::WallClock),
         );
     }
@@ -1664,7 +1865,7 @@ mod tests {
             // Quiet for six ticks — 1.5 s, just inside the window.
             for tick in 0..6 {
                 assert_eq!(
-                    reaper.tick(ms(250), ms(250 * (round * 7 + tick)), Some(ms(10)), None),
+                    reaper.tick(ms(250), ms(250 * (round * 7 + tick)), Some(ms(10)), None, 0),
                     None,
                 );
             }
@@ -1674,7 +1875,8 @@ mod tests {
                     ms(250),
                     ms(250 * (round * 7 + 6)),
                     Some(ms(11 + round)),
-                    None
+                    None,
+                    0
                 ),
                 None,
             );
@@ -1691,11 +1893,14 @@ mod tests {
     #[test]
     fn a_runaway_is_stopped_well_past_its_limit() {
         assert_eq!(
-            timed().tick(ms(250), ms(250), Some(ms(2201)), None),
+            timed().tick(ms(250), ms(250), Some(ms(2201)), None, 0),
             Some(Stopped::TimeLimit)
         );
         // And a program at its ceiling is not.
-        assert_eq!(timed().tick(ms(250), ms(250), Some(ms(2200)), None), None);
+        assert_eq!(
+            timed().tick(ms(250), ms(250), Some(ms(2200)), None, 0),
+            None
+        );
     }
 
     /// **The cap may never be the first thing to fire**, or the window it is
@@ -1719,7 +1924,7 @@ mod tests {
     #[test]
     fn a_correct_program_in_an_expensive_container_is_not_stopped() {
         assert_eq!(
-            timed().tick(ms(250), ms(250), Some(ms(180 + 619)), None),
+            timed().tick(ms(250), ms(250), Some(ms(180 + 619)), None, 0),
             None
         );
     }
@@ -1732,7 +1937,7 @@ mod tests {
     fn a_program_at_its_limit_is_left_alone() {
         for cpu in [200u64, 250, 274, 320] {
             assert_eq!(
-                timed().tick(ms(250), ms(250), Some(ms(cpu)), None),
+                timed().tick(ms(250), ms(250), Some(ms(cpu)), None, 0),
                 None,
                 "{cpu} ms"
             );
@@ -1746,13 +1951,13 @@ mod tests {
             Reaper::new(&Profile::new("image", vec!["build".to_owned()]).wall_clock(ms(1000)));
         for tick in 1..4u64 {
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), None, None),
+                reaper.tick(ms(250), ms(250 * tick), None, None, 0),
                 None,
                 "tick {tick}"
             );
         }
         assert_eq!(
-            reaper.tick(ms(250), ms(1000), None, None),
+            reaper.tick(ms(250), ms(1000), None, None, 0),
             Some(Stopped::WallClock)
         );
     }
@@ -1771,14 +1976,14 @@ mod tests {
         for tick in 1..4u64 {
             cpu += ms(250);
             assert_eq!(
-                reaper.tick(ms(250), ms(250 * tick), Some(cpu), None),
+                reaper.tick(ms(250), ms(250 * tick), Some(cpu), None, 0),
                 None,
                 "tick {tick}",
             );
         }
         cpu += ms(250);
         assert_eq!(
-            reaper.tick(ms(250), ms(1000), Some(cpu), None),
+            reaper.tick(ms(250), ms(1000), Some(cpu), None, 0),
             Some(Stopped::WallClock),
             "a build that spins is stopped at its own deadline",
         );
@@ -1794,7 +1999,7 @@ mod tests {
         let mut reaper = timed();
         let mut verdict = None;
         for tick in 1..=40u64 {
-            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(0)), None);
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(0)), None, 0);
             if verdict.is_some() {
                 break;
             }
@@ -1810,12 +2015,69 @@ mod tests {
         let mut verdict = None;
         for tick in 1..=40u64 {
             // One microsecond, once, and never again.
-            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(1)), None);
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(1)), None, 0);
             if verdict.is_some() {
                 break;
             }
         }
         assert_eq!(verdict, Some(Stopped::WallClock));
+    }
+
+    /// **Talking is working, and this is the whole of the rule.**
+    ///
+    /// A program in conversation with an interactor spends almost no processor
+    /// time: it writes a line and blocks on a read, which to a cgroup looks
+    /// exactly like a program that has given up. Reaping it would fail every
+    /// interactive submission that thinks for longer than the window, and the
+    /// participant would be told their program stopped computing while it was
+    /// waiting for an answer to a question it had asked.
+    ///
+    /// Nothing else in the reaper can tell the two apart. The pressure reading
+    /// cannot: a task blocked on a read is not runnable, so it raises none.
+    #[test]
+    fn a_program_that_only_talks_to_its_interactor_is_not_reaped() {
+        let mut reaper = timed();
+        let mut moved = 0u64;
+        for tick in 1..=40u64 {
+            // A few bytes each way, and the processor time never moves.
+            moved += 12;
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), None, moved),
+                None,
+                "tick {tick}: it was answering, not idle",
+            );
+        }
+    }
+
+    /// **And when the conversation stops, both sides are reaped together.**
+    ///
+    /// Two programs deadlocked against each other — each blocked on a read the
+    /// other will never satisfy — are the case the window exists for, and the
+    /// rule above must not exempt them. What separates this from the test
+    /// before it is a single fact: nothing is crossing any more.
+    #[test]
+    fn a_seam_that_stops_moving_is_reaped_like_a_silent_program() {
+        let mut reaper = timed();
+        let mut moved = 0u64;
+        for tick in 1..=4u64 {
+            moved += 12;
+            assert_eq!(
+                reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), None, moved),
+                None,
+                "tick {tick}: still talking",
+            );
+        }
+
+        // The window is 1.6 s here, so seven quiet ticks reach it.
+        let mut verdict = None;
+        for tick in 5..=11u64 {
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(ms(30)), None, moved);
+        }
+        assert_eq!(
+            verdict,
+            Some(Stopped::WallClock),
+            "a deadlocked pair is still a pair that stopped making progress",
+        );
     }
 
     /// The end of it, however busy the program looks. Without this a program
@@ -1828,7 +2090,7 @@ mod tests {
         let mut verdict = None;
         for tick in 1..=300u64 {
             cpu += ms(1);
-            verdict = reaper.tick(ms(250), ms(250 * tick), Some(cpu), None);
+            verdict = reaper.tick(ms(250), ms(250 * tick), Some(cpu), None, 0);
             if verdict.is_some() {
                 assert!(
                     ms(250 * tick) >= ms(11_000),
