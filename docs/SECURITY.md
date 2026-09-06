@@ -49,9 +49,9 @@ trusted code.
 | `--security-opt=no-new-privileges` | and none may be gained |
 | read-only root filesystem | writes go nowhere it covers — see `/dev/shm` below |
 | `--user 65534:65534` | never root, even inside |
-| `memory.max` **with `memory.swap.max` zero**, on a cgroup holding the submission and nothing else | without the second the limit means nothing: the program swaps instead of being killed. The cgroup is a sibling of the container's, so what it counts is the submission, everything it forks and every tmpfs page it writes — and not the container's own start. The container keeps a `--memory` of its own, for the shim. **Two sources say a kill happened** and either is enough — see below |
+| `memory.max` **with `memory.swap.max` zero**, on a cgroup holding the submission and nothing else | without the second the limit means nothing: the program swaps instead of being killed. The cgroup is a **child** of the container's, made by the shim: it counts the submission, everything it forks and every tmpfs page it writes, and not the container's own start. The container keeps a `--memory` of its own, above the problem's because it is above it in the tree. **Two sources say a kill happened** and either is enough — see below |
 | `--pids-limit` | a fork bomb hits a wall |
-| **the host's cgroup namespace**, on a judged run alone | the cgroup a submission is judged in is a **sibling** of its container's, and cgroup2 mounted with `nsdelegate` — how systemd mounts it — refuses to move a task outside its own namespace. Without this the shim cannot put the submission where its memory limit is. It grants no write: the only cgroup file the container can reach is the one bound for it, which is root's. What it costs is that `/proc/self/cgroup` names the host's path rather than `/` |
+| **the host's cgroup namespace**, on a judged run alone | the shim has to name its container's own cgroup to make the submission's underneath it, and `/proc/self/cgroup` reads `/` in a private namespace. Without this the shim cannot make the cgroup its memory limit goes on, and refuses to start the submission rather than run it unlimited. It grants no write: the only cgroup file the container can reach is the one bound for it, which is root's. What it costs is that `/proc/self/cgroup` names the host's path rather than `/` |
 | `--cpus` | one processor's worth per second. The threading hole is closed by the accounting as well — `cpu.stat` sums the subtree, so threads spend the budget faster rather than escaping it |
 | `--cpuset-cpus`, **only where the Runner was given a set** | an operator's division of the host, carried to the job containers, which inherit no affinity of their own. Given the whole machine the Runner pins nothing: several Runners choosing processors with nothing coordinating them is worse than letting the host place the work |
 | wall clock = **four times the limit plus four seconds without progress** | not a limit anybody is judged against: a time limit is processor time, so this reaps what is *not* spending any — one stuck in an uninterruptible syscall, or one that waits for input that never comes. It counts **consecutive** time: any processor time at all resets it, so a program descheduled on a busy host is never reaped for it. Four times the limit is roughly a host loaded four times past what it can carry, and the four seconds are what make this the guard against a hang at a limit small enough that four times it would not be |
@@ -68,11 +68,12 @@ A running submission's only writable path is `/dev/shm`, which the contract belo
 describes as a surface nobody declared and rule 3's test names explicitly.
 
 **A memory kill is told from two places.** The container runtime reports
-`OOMKilled` on the container, and the kernel counts in the cgroup the limit was
-written on — `memory.events`, read beside `memory.peak`. For a judged submission
-that is the submission's own cgroup, so the counts are its outright; for every
-other container it is the run's. Either source is enough, and neither is checked
-against the other.
+`OOMKilled` on the container, and the kernel counts it in `memory.events` — read
+beside `memory.peak`, and read by the Runner from a cgroup of its own that
+outlives the container. That file is **hierarchical**, so a kill inside the
+submission's own cgroup is counted there without anything in the container being
+able to reach it. Either source is enough, and neither is checked against the
+other.
 
 **The kernel's half is two fields and needs both**, because each alone says the
 wrong thing — the definitions are the kernel's own:

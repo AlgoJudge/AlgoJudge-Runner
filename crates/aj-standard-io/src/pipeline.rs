@@ -897,14 +897,15 @@ impl<S: Sandbox> Pipeline<S> {
                 status,
                 percentage,
                 time_ms,
-                // From the run's own cgroup, and **absent when the host gave
-                // the Runner nowhere to measure from** — which is the answer
-                // `PACKAGE_FORMAT.md` asks for rather than a number that is
-                // sometimes wrong. It carries about 2 MiB of container floor
-                // that does not scale, and it is not corrected for: a
-                // participant's run has the same floor, so subtracting it would
-                // make every calibrated limit too tight for the sake of a
-                // number nobody meets.
+                // From the cgroup holding the submission alone, and **absent
+                // when the host gave the Runner nowhere to measure from** —
+                // which is the answer `PACKAGE_FORMAT.md` asks for rather than
+                // a number that is sometimes wrong. **No container floor is in
+                // it since 2026-09-06**; what is left is the image's own
+                // resident pages — about 1 MiB for a compiled binary, 4 MiB for
+                // CPython, 24 MiB for PyPy — and that is not corrected for
+                // either, because a model solution's measurement carries the
+                // same floor and it cancels.
                 memory_bytes: measured.memory_bytes,
                 note,
                 // Everything the machinery could do to it was handled above, so

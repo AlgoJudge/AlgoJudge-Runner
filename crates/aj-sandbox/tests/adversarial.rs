@@ -56,12 +56,14 @@ async fn sandbox() -> Docker {
     // exactly when they may skip.
     // **Say when this host cannot exercise the namespace boundary.**
     //
-    // A submission is judged in a cgroup beside its container, and moving it
-    // there is refused on a cgroup2 mounted with `nsdelegate` unless the
-    // container shares the host's cgroup namespace. **Docker Desktop mounts it
-    // without `nsdelegate` and systemd mounts it with**, so a workstation
-    // passes this suite whatever the code does about namespaces and an ordinary
-    // server does not. That cost a red CI run on 2026-09-06, and a green local
+    // A submission is judged in a cgroup the shim makes inside its container's
+    // own, and the shim can only name that cgroup where the container shares
+    // the host's cgroup namespace: `/proc/self/cgroup` reads `/` in a private
+    // one. It was a cgroup *beside* the container's until 2026-09-06, and there
+    // a cgroup2 mounted with `nsdelegate` refused the migration outright.
+    // **Docker Desktop mounts it without `nsdelegate` and systemd mounts it
+    // with**, so a workstation passes this suite whatever the code does about
+    // namespaces and an ordinary server does not. That cost a red CI run on 2026-09-06, and a green local
     // run is not evidence about it — which is worth printing rather than
     // leaving somebody to find out the same way.
     //
