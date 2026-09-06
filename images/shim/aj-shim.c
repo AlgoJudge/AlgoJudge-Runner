@@ -334,14 +334,20 @@ static void join_the_cgroup(void) {
 static long long what_it_held(const struct rusage *used) {
     if (submissions_box[0] == '\0') return (long long)used->ru_maxrss * 1024;
 
+    /* **Zero rather than `ru_maxrss` where the cgroup was made and cannot be
+     * read.** They are different quantities -- one is the submission's whole
+     * subtree, the other one process's resident set -- and quietly answering
+     * the second would put a smaller number beside a verdict with nothing
+     * saying it came from somewhere else. Zero is read as *absent*, which the
+     * format has a rule for and a screen has a word for. */
     char path[512];
     snprintf(path, sizeof path, "%s/memory.peak", submissions_box);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return (long long)used->ru_maxrss * 1024;
+    if (fd < 0) return 0;
     char held[64];
     ssize_t read_in = read(fd, held, sizeof held - 1);
     close(fd);
-    if (read_in <= 0) return (long long)used->ru_maxrss * 1024;
+    if (read_in <= 0) return 0;
     held[read_in] = '\0';
     return atoll(held);
 }

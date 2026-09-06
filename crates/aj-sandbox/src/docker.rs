@@ -832,7 +832,14 @@ impl Sandbox for Docker {
                 // the *kill* is counted above, out of reach. Forging this buys a
                 // submission a prettier number beside a verdict it does not
                 // change.
-                outcome.peak_memory_bytes = Some(said.peak_memory_bytes);
+                // **Zero is absent, not a measurement.** The shim answers zero
+                // where it made the cgroup and could not read its peak, because
+                // the alternative — falling back to a resident set — would put
+                // a different quantity beside the verdict with nothing saying
+                // so. `PACKAGE_FORMAT.md` has the rule: absent rather than
+                // zero, and the editor shows it as *not measured*.
+                outcome.peak_memory_bytes =
+                    (said.peak_memory_bytes > 0).then_some(said.peak_memory_bytes);
             }
         }
         outcome
