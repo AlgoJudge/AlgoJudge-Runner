@@ -278,8 +278,14 @@ impl Cgroups {
     /// directory a previous Runner had left passed preflight and then failed
     /// every job it claimed.
     ///
-    /// Under `systemd` the Runner creates nothing, so there is nothing left to
-    /// prove beyond a readable hierarchy, which [`Self::resolve`] proved.
+    /// **Under `systemd` too, and that is not what it used to be.** That backend
+    /// let systemd make the one cgroup it needed and only read it, so a readable
+    /// hierarchy was the whole requirement. A memory limit is enforced on a
+    /// cgroup made per judged run, and that one is the Runner's to make under
+    /// either backend — so a host that cannot make it would start, register, and
+    /// refuse every job it claimed, which is the failure this exists to stop.
+    /// The slice is created here where systemd has not made it yet; systemd uses
+    /// the directory it finds.
     ///
     /// **Named for the Runner and not fixed**, because several of them share one
     /// host and one `algojudge` directory, and `docker compose up` starts them
@@ -288,10 +294,7 @@ impl Cgroups {
     /// `remove_dir` and refused to start blaming the host. Reproduced on the
     /// first attempt by `two_runners_preparing_at_once_do_not_collide`.
     pub(crate) fn prepare(&self, instance: &str) -> Result<()> {
-        let Self::Cgroupfs { root } = self else {
-            return Ok(());
-        };
-        let home = root.join(OURS);
+        let home = self.home();
         let probe = home.join(probe_name(instance));
         std::fs::create_dir_all(&home)
             .and_then(|()| match std::fs::create_dir(&probe) {
@@ -301,10 +304,9 @@ impl Cgroups {
             .map_err(|e| {
                 Error::Refused(format!(
                     "this Runner cannot make, limit and remove a cgroup under {}: {e}. A time \
-                     limit is decided on processor time read from cpu.stat in a cgroup this \
-                     Runner makes for each run, and a memory limit is enforced on a second one \
-                     inside it holding the submission alone, so without them it would register \
-                     and then fail every job it claimed. Mount the host's cgroup tree writable and share its namespace — \
+                     limit is decided on processor time read from cpu.stat, and a memory limit \
+                     is enforced on a cgroup this Runner makes for the submission itself — so \
+                     without them it would register and then fail every job it claimed. Mount the host's cgroup tree writable and share its namespace — \
                      --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup, or in Compose `cgroup: \
                      host` on the service plus the same volume — and run the container as root, \
                      because the tree's directories are root's. It costs write permission, not a \
@@ -1166,6 +1168,48 @@ mod tests {
                 );
             }
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **`systemd` proves what `cgroupfs` proves**, and until a memory limit was
+    /// enforced on a cgroup of the submission's own it had nothing to prove: it
+    /// let systemd make its one slice and only read it. That cgroup is this
+    /// Runner's to make under either backend, so a host that cannot make one
+    /// would start, register, and then refuse every job it claimed — which is
+    /// the failure `prepare` exists to turn into a refusal at start.
+    #[test]
+    fn a_systemd_host_that_cannot_be_written_to_is_refused_at_start() {
+        let root = std::env::temp_dir().join(format!("aj-prepare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a scratch root");
+
+        let backend = |root: &PathBuf| Cgroups::Systemd {
+            root: root.clone(),
+            slice: "algojudge-ours.slice".to_owned(),
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+        };
+
+        // Writable: it makes what it needs, and leaves none of it behind.
+        backend(&root).prepare("ours").expect("a writable tree");
+        assert!(
+            !root
+                .join("algojudge.slice/algojudge-ours.slice")
+                .join(probe_name("ours"))
+                .exists(),
+            "the probe was left in the tree",
+        );
+
+        // A file where the hierarchy should be, which is what a tree this Runner
+        // cannot write into looks like from here.
+        let _ = std::fs::remove_dir_all(root.join("algojudge.slice"));
+        std::fs::write(root.join("algojudge.slice"), "not a directory").unwrap();
+        let refusal = backend(&root)
+            .prepare("ours")
+            .expect_err("a refusal")
+            .to_string();
+        assert!(refusal.contains("memory limit"), "{refusal}");
+        assert!(refusal.contains("processor time"), "{refusal}");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
