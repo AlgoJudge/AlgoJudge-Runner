@@ -298,11 +298,11 @@ docker info --format '{{.CgroupDriver}}'    # cgroupfs or systemd; both are supp
 | Who creates the cgroup | the Runner, `mkdir` | systemd, when the daemon asks it |
 | How many | **one per run**, removed afterwards | **one per Runner**, for its whole life |
 | A run's processor time | `cpu.stat`'s `usage_usec`, read | the same, as the **difference** across the run |
-| A **judged** run's peak memory | `memory.peak` of the submission's own cgroup, made per run | the same, and made per run inside the slice |
+| A **judged** run's peak memory | `memory.peak` of the submission's own cgroup, made per run by the shim inside the container | the same — this is the one row the driver does not reach |
 | Any other run's peak memory | `memory.peak`, read | `memory.peak` **reset** at the start of the run, **minus what the slice already held** |
-| To start and judge | a writable mount **and** root, to `mkdir` | a readable mount; nothing else |
-| To report a peak as well | the same | a writable mount and root — and **Linux 6.12** for the runs that are not judged submissions, whose peak still comes from a reset |
-| Without those | **refuses to start** | starts, judges, and says at `ERROR` that peak memory is absent |
+| To start and judge | a writable mount **and** root, to `mkdir` | the same, since 2026-09-07: the shim's `mkdir` goes through this tree |
+| To report a peak as well | the same | the same, and **Linux 6.12** for the runs that are not judged submissions, whose peak still comes from a reset |
+| Without those | **refuses to start** | the same. It started and judged nothing until 2026-09-07, because `prepare` proved the write under `cgroupfs` alone; a kernel below 6.12 still only warns, at `ERROR`, that the unjudged runs have no peak |
 
 **Why one slice and not one per run.** Measured 2026-09-03 on WSL2, kernel 6.18:
 a slice systemd created for a container is **never collected**. It stays `loaded
