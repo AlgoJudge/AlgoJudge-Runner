@@ -157,7 +157,7 @@ property of the machine's memory pressure rather than of the program.
 
 **A judged run has two cgroups, and which one a number comes from is the whole
 of this section.** One holds the container; one holds the submission and nothing
-else, as a sibling of the first. The memory limit is written on the second and
+else, as a child of the first. The memory limit is written on the second and
 the peak a participant is shown is read from it, so the number they are judged
 on and the number they read are one number. Processor time comes off the first,
 which covers both.
@@ -177,16 +177,44 @@ own stated minimum for `--memory`, near enough exactly. That is why the runtime'
 minimum is no longer the smallest limit a problem can state: `memory.max` on a
 cgroup has no minimum, and a two-mebibyte limit is written and enforced.
 
-**A judged container shares the host's cgroup namespace, and has to.** The
-cgroup a submission is judged in sits beside its container's rather than inside
-it, and cgroup2 mounted with `nsdelegate` — which is how systemd mounts it, so
-on virtually every Linux server — lets a process move a task only into a
-descendant of its own namespace root. From a private namespace that sibling is
-not a descendant of anything, and `cgroup.procs` refuses the write. **Docker
-Desktop mounts cgroup2 without `nsdelegate`**, so a workstation cannot tell the
-two arrangements apart; `mount -o remount,nsdelegate /sys/fs/cgroup` makes it
-able to. Nothing else about the container changes — it holds no cgroup mount but
-the one made for it, and that one is root's.
+**The shim makes both of them, and it makes two rather than one.** A cgroup may
+hold processes or hand controllers to its children, never both, so `+memory` on
+the container's own cgroup is refused while the shim is sitting in it. The shim
+therefore makes `shim/` and moves itself there, enables `memory` on the
+container's cgroup, and makes `box/` under it carrying `memory.max`, a
+`memory.swap.max` of zero and `memory.oom.group`. The child's pid is written into
+`box/cgroup.procs` between `fork` and `exec`, while the shim is still root.
+
+**A judged container shares the host's cgroup namespace, and has to** — not for
+delegation, but so that the shim can *find* the directory. The box is a
+descendant of the container's own cgroup, which `nsdelegate` permits; what a
+private cgroup namespace takes away is the name. `/proc/self/cgroup` reads `/`
+there, and the shim needs the last component of that line to join to the one
+directory it is handed — the container's cgroup's parent, bind-mounted at
+`/aj/cgroup`. With no name to join it refuses to start the submission rather than
+run it unlimited. Nothing else about the container changes: it holds no cgroup
+mount but that one, and that one is root's.
+
+**A cgroup beside the container's was the first arrangement and cannot work.**
+Two separate reasons, both found by CI on 2026-09-06. `nsdelegate` — which is how
+systemd mounts cgroup2, so on virtually every Linux server — lets a process
+migrate a task only into a descendant of its own namespace root, and a sibling is
+not one, so `cgroup.procs` refuses the write. And under the systemd driver a box
+made under the slice from the host loses its `memory` controller anyway: systemd
+rewrites the `cgroup.subtree_control` of a slice it owns, and there is nothing a
+Runner can do about that from outside. **Docker Desktop mounts cgroup2 without
+`nsdelegate`**, so a workstation cannot tell the two arrangements apart;
+`mount -o remount,nsdelegate /sys/fs/cgroup` makes it able to.
+
+**The peak is read from inside, by the shim.** That cgroup is destroyed with the
+container, so there is no window afterwards in which the Runner could read it:
+the figure travels in the shim's report, on the same untrusted channel as the
+processor time, and it needs no floor of the kind time has because **nothing is
+decided on it** — the limit is the kernel's and the kill is counted elsewhere.
+Where the shim made a box and could not read its peak it answers **zero**, which
+the Runner reads as *absent*. `ru_maxrss` is a different quantity, and
+substituting it quietly would put a smaller number beside a verdict with nothing
+saying where it came from.
 
 **Page cache is charged to whoever faults it in first, so the reading is warm or
 cold.** The same solution read **10.0 MiB** on the first run after its image was
@@ -402,11 +430,15 @@ under garbage collection, and the answer is that a reboot clears them.
 ### A third thing read from the same cgroup
 
 `memory.events` carries two counters the Runner reads beside `memory.peak`, and
-they are what decides `Memory limit exceeded`. For a judged submission they come
-off the cgroup the submission was in — made for it, holding it alone, and
-carrying the limit — so the counts are that submission's outright. For everything
-else they are the container's: under `cgroupfs` from the run's own directory, and
-under `systemd` as differences across the slice, exactly as processor time is.
+they are what decides `Memory limit exceeded`. **The Runner reads them from a
+cgroup of its own** — under `cgroupfs` the run's own directory, under `systemd`
+as differences across the slice, exactly as processor time is.
+
+It has to, and that is the arrangement rather than a compromise. The cgroup a
+submission is judged in is inside its container and gone by the time there is
+anything to read; this one outlives the container, and `memory.events` is
+**hierarchical**, so a kill down in the submission's own cgroup is counted here.
+What it costs is nothing: this is a file the container cannot reach.
 
 **Both are needed, and the kernel's own definitions are why.** `oom_kill` is
 *"the number of processes belonging to this cgroup killed by **any kind of OOM
@@ -423,8 +455,8 @@ hierarchical"*.
 
 Verified against `Documentation/admin-guide/cgroup-v2` and on both drivers: a
 cgroup killed by its own limit reports `oom 1, oom_kill 1`. Measured 2026-09-06
-on the arrangement a judged run uses — a submission moved into a two-mebibyte
-cgroup beside its container, the container itself at 64 MiB — the submission was
+on the arrangement a judged run uses — a submission in a two-mebibyte cgroup
+under a container held to 64 MiB — the submission was
 killed and the shim that forked it was not, the container exited 0, and the
 submission's cgroup reported `oom 1, oom_kill 3`, three because
 `memory.oom.group` takes the whole cgroup together.

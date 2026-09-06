@@ -288,20 +288,26 @@ impl Docker {
             // **The host's cgroup namespace, and only where a submission has a
             // cgroup of its own.**
             //
-            // cgroup v2 mounted with `nsdelegate` — which is how **systemd
-            // mounts it**, so on virtually every Linux server — makes a cgroup
-            // namespace a delegation boundary: a process may migrate a task
-            // only into a cgroup that is a descendant of its own namespace
-            // root. The cgroup this run is judged in is a *sibling* of the
-            // container's, so from inside a private namespace it is not a
-            // descendant of anything visible, and `cgroup.procs` refuses the
-            // write with `ENOENT`.
+            // **Not for delegation — for the name.** The cgroup this run is
+            // judged in is a *child* of the container's own, which
+            // `nsdelegate` permits; what a private cgroup namespace takes away
+            // is the shim's ability to say which cgroup that is.
+            // `/proc/self/cgroup` reads `/` in one, and the shim needs the last
+            // component of that line to join to the directory bound at
+            // `BOUND_AT`, which is the container's cgroup's parent.
             //
-            // Found by CI on 2026-09-06 and reproduced here by remounting
+            // It was a sibling until 2026-09-06 and then this flag *was* about
+            // delegation: `nsdelegate` — which is how **systemd mounts it**, so
+            // on virtually every Linux server — lets a process migrate a task
+            // only into a descendant of its own namespace root, and a sibling
+            // is not one. Found by CI and reproduced here by remounting
             // `/sys/fs/cgroup` with `nsdelegate`: every shimmed run failed with
             // the shim's own 125. **Docker Desktop's virtual machine mounts it
             // without `nsdelegate`**, which is why the whole suite passed on a
-            // workstation while failing on an ordinary host.
+            // workstation while failing on an ordinary host. The arrangement
+            // moved inside for a second reason the flag cannot help with —
+            // systemd rewrites the `cgroup.subtree_control` of a slice it owns
+            // — and the flag stayed, for the reason above.
             //
             // What it costs is one thing and it is not a capability: the
             // container sees the host's cgroup path in `/proc/self/cgroup`
