@@ -177,6 +177,17 @@ own stated minimum for `--memory`, near enough exactly. That is why the runtime'
 minimum is no longer the smallest limit a problem can state: `memory.max` on a
 cgroup has no minimum, and a two-mebibyte limit is written and enforced.
 
+**A judged container shares the host's cgroup namespace, and has to.** The
+cgroup a submission is judged in sits beside its container's rather than inside
+it, and cgroup2 mounted with `nsdelegate` — which is how systemd mounts it, so
+on virtually every Linux server — lets a process move a task only into a
+descendant of its own namespace root. From a private namespace that sibling is
+not a descendant of anything, and `cgroup.procs` refuses the write. **Docker
+Desktop mounts cgroup2 without `nsdelegate`**, so a workstation cannot tell the
+two arrangements apart; `mount -o remount,nsdelegate /sys/fs/cgroup` makes it
+able to. Nothing else about the container changes — it holds no cgroup mount but
+the one made for it, and that one is root's.
+
 **Page cache is charged to whoever faults it in first, so the reading is warm or
 cold.** The same solution read **10.0 MiB** on the first run after its image was
 built and 1.75 MiB on every run after, because the image's own files were then

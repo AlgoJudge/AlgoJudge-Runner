@@ -292,6 +292,33 @@ impl Docker {
             // to place the container wherever it normally would.
             cgroup_parent: cgroup_parent.map(str::to_owned),
 
+            // **The host's cgroup namespace, and only where a submission has a
+            // cgroup of its own.**
+            //
+            // cgroup v2 mounted with `nsdelegate` — which is how **systemd
+            // mounts it**, so on virtually every Linux server — makes a cgroup
+            // namespace a delegation boundary: a process may migrate a task
+            // only into a cgroup that is a descendant of its own namespace
+            // root. The cgroup this run is judged in is a *sibling* of the
+            // container's, so from inside a private namespace it is not a
+            // descendant of anything visible, and `cgroup.procs` refuses the
+            // write with `ENOENT`.
+            //
+            // Found by CI on 2026-09-06 and reproduced here by remounting
+            // `/sys/fs/cgroup` with `nsdelegate`: every shimmed run failed with
+            // the shim's own 125. **Docker Desktop's virtual machine mounts it
+            // without `nsdelegate`**, which is why the whole suite passed on a
+            // workstation while failing on an ordinary host.
+            //
+            // What it costs is one thing and it is not a capability: the
+            // container sees the host's cgroup path in `/proc/self/cgroup`
+            // rather than `/`. It gains no write it did not have — the only
+            // cgroup file it can reach is the one bound at `BOUND_AT`, which is
+            // root's, and the submission is uid 65534 by the time it runs.
+            cgroupns_mode: bound
+                .is_some()
+                .then_some(bollard::models::HostConfigCgroupnsModeEnum::HOST),
+
             // No route anywhere. The first line of the adversarial suite.
             network_mode: Some("none".to_owned()),
             cap_drop: Some(vec!["ALL".to_owned()]),

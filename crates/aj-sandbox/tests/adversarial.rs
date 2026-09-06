@@ -54,6 +54,31 @@ async fn sandbox() -> Docker {
     // run outside CI. **Every case here passes on v1**, memory included — what
     // v1 lacks is honest measurement, and the cases that assert one say below
     // exactly when they may skip.
+    // **Say when this host cannot exercise the namespace boundary.**
+    //
+    // A submission is judged in a cgroup beside its container, and moving it
+    // there is refused on a cgroup2 mounted with `nsdelegate` unless the
+    // container shares the host's cgroup namespace. **Docker Desktop mounts it
+    // without `nsdelegate` and systemd mounts it with**, so a workstation
+    // passes this suite whatever the code does about namespaces and an ordinary
+    // server does not. That cost a red CI run on 2026-09-06, and a green local
+    // run is not evidence about it — which is worth printing rather than
+    // leaving somebody to find out the same way.
+    //
+    //     mount -o remount,nsdelegate /sys/fs/cgroup
+    //
+    // in a privileged container makes a workstation behave like a server, and
+    // is how the fix was verified before it was believed.
+    if !std::fs::read_to_string("/proc/mounts")
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line.contains(" cgroup2 ") && line.contains("nsdelegate"))
+    {
+        eprintln!(
+            "note: this host mounts cgroup2 without `nsdelegate`, so nothing here proves a              submission can be moved into its own cgroup on a host that has it. CI does.",
+        );
+    }
+
     if let Err(e) = docker.preflight().await {
         assert!(
             std::env::var("AJ_SANDBOX_ALLOW_CGROUP_V1").is_ok(),
