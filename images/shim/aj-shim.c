@@ -397,7 +397,6 @@ int main(int argc, char **argv) {
 
     take_nonce();
     take_cgroup();
-    make_the_submissions_cgroup();
 
     /* **Output, then the report, then the input, and the order is the point.**
      *
@@ -412,6 +411,12 @@ int main(int argc, char **argv) {
     if (output < 0) fatal("cannot open the output");
 
     take_report_channel();
+
+    /* **After the report channel and not before it.** Failing to make
+     * this is fatal, and a fatal before the channel exists is a message
+     * written to a stderr the Runner does not read -- which arrives as
+     * `the shim reported nothing` and says nothing about why. */
+    make_the_submissions_cgroup();
 
     int input = open(argv[1], O_RDONLY | O_CLOEXEC);
     if (input < 0) fatal("cannot open the input file");
