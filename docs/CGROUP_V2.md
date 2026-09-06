@@ -155,13 +155,50 @@ property of the machine's memory pressure rather than of the program.
 
 ## 5. What the number actually covers
 
-The limit and the reading are the **container's cgroup**, not the process. So
-the question "is this the program, or is there overhead?" has a measured answer,
-and it matters because calibration turns these numbers into limits somebody's
-submission has to meet.
+**A judged run has two cgroups, and which one a number comes from is the whole
+of this section.** One holds the container; one holds the submission and nothing
+else, as a sibling of the first. The memory limit is written on the second and
+the peak a participant is shown is read from it, so the number they are judged
+on and the number they read are one number. Processor time comes off the first,
+which covers both.
 
-Measured with a static binary that allocates a stated amount and then reads its
-own `memory.peak`, under the full sandbox profile:
+The difference between them is the container, and it is most of the reading for
+a small program. Measured 2026-09-06 on WSL2, kernel 6.18, cgroupfs, on the same
+trivial C++ solution:
+
+| | |
+|---|---|
+| its **own** cgroup — what the limit is written on, and what is shown | **1.75 MiB** |
+| `ru_maxrss` from the shim: one process's resident set | 1.34 MiB |
+| the **container's** cgroup, which is what carries a run with no shim | 6.68 MiB |
+
+A container running the shim and nothing else peaks at **6.02 MiB** — Docker's
+own stated minimum for `--memory`, near enough exactly. That is why the runtime's
+minimum is no longer the smallest limit a problem can state: `memory.max` on a
+cgroup has no minimum, and a two-mebibyte limit is written and enforced.
+
+**A judged container shares the host's cgroup namespace, and has to.** The
+cgroup a submission is judged in sits beside its container's rather than inside
+it, and cgroup2 mounted with `nsdelegate` — which is how systemd mounts it, so
+on virtually every Linux server — lets a process move a task only into a
+descendant of its own namespace root. From a private namespace that sibling is
+not a descendant of anything, and `cgroup.procs` refuses the write. **Docker
+Desktop mounts cgroup2 without `nsdelegate`**, so a workstation cannot tell the
+two arrangements apart; `mount -o remount,nsdelegate /sys/fs/cgroup` makes it
+able to. Nothing else about the container changes — it holds no cgroup mount but
+the one made for it, and that one is root's.
+
+**Page cache is charged to whoever faults it in first, so the reading is warm or
+cold.** The same solution read **10.0 MiB** on the first run after its image was
+built and 1.75 MiB on every run after, because the image's own files were then
+already in cache and charged elsewhere. Nothing about that is new — a container's
+cgroup behaves the same way — but a trial run immediately after a deployment
+derives a limit from the cold figure.
+
+The rest of this section is the **container's** cgroup, which is what a build, a
+checker and an interactor are still held by. Measured 2026-08-09 with a static
+binary that allocates a stated amount and then reads its own `memory.peak`, under
+the full sandbox profile:
 
 | allocated | peak | over |
 |---|---|---|
@@ -233,9 +270,10 @@ docker info --format '{{.CgroupDriver}}'    # cgroupfs or systemd; both are supp
 | Who creates the cgroup | the Runner, `mkdir` | systemd, when the daemon asks it |
 | How many | **one per run**, removed afterwards | **one per Runner**, for its whole life |
 | A run's processor time | `cpu.stat`'s `usage_usec`, read | the same, as the **difference** across the run |
-| A run's peak memory | `memory.peak`, read | `memory.peak` **reset** at the start of the run, **minus what the slice already held** |
+| A **judged** run's peak memory | `memory.peak` of the submission's own cgroup, made per run | the same, and made per run inside the slice |
+| Any other run's peak memory | `memory.peak`, read | `memory.peak` **reset** at the start of the run, **minus what the slice already held** |
 | To start and judge | a writable mount **and** root, to `mkdir` | a readable mount; nothing else |
-| To report a peak as well | the same | a writable mount, root, and **Linux 6.12** |
+| To report a peak as well | the same | a writable mount and root — and **Linux 6.12** for the runs that are not judged submissions, whose peak still comes from a reset |
 | Without those | **refuses to start** | starts, judges, and says at `ERROR` that peak memory is absent |
 
 **Why one slice and not one per run.** Measured 2026-09-03 on WSL2, kernel 6.18:
@@ -363,10 +401,12 @@ under garbage collection, and the answer is that a reboot clears them.
 
 ### A third thing read from the same cgroup
 
-`memory.events` carries two counters the Runner reads beside `memory.peak` and
-`cpu.stat`, as a second source for the `Memory limit exceeded` verdict — under
-`cgroupfs` from the run's own directory, so the counts are the run's; under
-`systemd` as differences across the slice, exactly as processor time is.
+`memory.events` carries two counters the Runner reads beside `memory.peak`, and
+they are what decides `Memory limit exceeded`. For a judged submission they come
+off the cgroup the submission was in — made for it, holding it alone, and
+carrying the limit — so the counts are that submission's outright. For everything
+else they are the container's: under `cgroupfs` from the run's own directory, and
+under `systemd` as differences across the slice, exactly as processor time is.
 
 **Both are needed, and the kernel's own definitions are why.** `oom_kill` is
 *"the number of processes belonging to this cgroup killed by **any kind of OOM
@@ -382,9 +422,12 @@ this file are hierarchical"*, against `.local`, *"local to the cgroup i.e. not
 hierarchical"*.
 
 Verified against `Documentation/admin-guide/cgroup-v2` and on both drivers: a
-container killed by its own limit reports `oom 1, oom_kill 1`, and the cgroup
-the Runner reads carries no limit of its own (`memory.max` is `max`), so nothing
-it sees is an ancestor's doing.
+cgroup killed by its own limit reports `oom 1, oom_kill 1`. Measured 2026-09-06
+on the arrangement a judged run uses — a submission moved into a two-mebibyte
+cgroup beside its container, the container itself at 64 MiB — the submission was
+killed and the shim that forked it was not, the container exited 0, and the
+submission's cgroup reported `oom 1, oom_kill 3`, three because
+`memory.oom.group` takes the whole cgroup together.
 
 **Two sources because the runtime's `OOMKilled` is not reliable on its own.**
 It has been observed reporting a container as not OOM-killed that exited 137
@@ -394,15 +437,14 @@ wrong verdict rather than a missing number. Either source saying so is enough.
 
 ### The rule this implies for calibration
 
-**Do not subtract the overhead.** A participant's submission runs in a container
-of the same shape as the model solution's, so the floor is present in both
-measurements and cancels. Correcting for it would make every limit about 2 MiB
-too tight, for the sake of a number nobody meets.
+**Do not subtract this overhead either.** It is not in a judged run's number at
+all — that comes off the submission's own cgroup — and where it is, it is present
+in the model solution's measurement and the participant's alike, so it cancels.
 
 `PACKAGE_FORMAT.md` defaults memory to `measured + 16 MiB` rather than a
-multiple. Against a 2 MiB floor, a ±0.5 MiB spread and a 0.3 MiB gap between
-languages, that headroom is comfortable — which is now a measurement rather than
-a guess.
+multiple. Against a ±0.5 MiB spread, a 0.3 MiB gap between languages and a cold
+first reading several times the warm one, that headroom is comfortable — which is
+a measurement rather than a guess.
 
 ## 6. What v1 does and does not do
 

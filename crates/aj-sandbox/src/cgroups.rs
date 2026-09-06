@@ -48,6 +48,10 @@ const OURS: &str = "algojudge";
 /// The mount point of the unified hierarchy, where nothing says otherwise.
 const DEFAULT_ROOT: &str = "/sys/fs/cgroup";
 
+/// Where the **daemon** finds the same tree. This process may see it
+/// elsewhere; a bind mount is resolved by the daemon, so it needs this one.
+const DAEMON_ROOT: &str = "/sys/fs/cgroup";
+
 /// How this Runner measures on this host.
 ///
 /// Decided once, from what the daemon reports: a daemon does not change its
@@ -141,6 +145,42 @@ impl Cgroups {
             Self::Cgroupfs { .. } => format!("/{OURS}/{name}"),
             Self::Systemd { slice, .. } => slice.clone(),
         }
+    }
+
+    /// The directory the container's own cgroup will sit in, as the **daemon**
+    /// names it — the source of the mount the shim reaches its own cgroup
+    /// through.
+    ///
+    /// **Not [`Self::home`], which is this process's view** and may be wherever
+    /// a `-v` put it. That the two name one tree is already assumed — `parent`
+    /// hands the daemon a path relative to its root and says nothing about
+    /// where the root is — and this is the one place the assumption has to
+    /// become an absolute path, because a bind mount is resolved by the daemon.
+    ///
+    /// Created where it is missing, and under `systemd` that is the first run of
+    /// a Runner's life: the slice is systemd's to realise, but a mount needs its
+    /// source to exist before the container starts. **Nothing is put in it and
+    /// nothing depends on what it holds** — the cgroup the submission is judged
+    /// in is made by the shim, inside the container's own, which is a child of
+    /// this. Measured 2026-09-06: a directory made here keeps its inode when
+    /// the runtime then asks systemd for the slice.
+    pub(crate) fn mount_point(&self, name: &str) -> Option<String> {
+        let here = match self {
+            Self::Cgroupfs { root } => root.join(OURS).join(name),
+            Self::Systemd { .. } => self.home(),
+        };
+        std::fs::create_dir_all(&here).ok()?;
+
+        let root = match self {
+            Self::Cgroupfs { root } | Self::Systemd { root, .. } => root,
+        };
+        let under: Vec<String> = here
+            .strip_prefix(root)
+            .ok()?
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        Some(format!("{DAEMON_ROOT}/{}", under.join("/")))
     }
 
     /// Opens a measurement for one run, and says what the daemon should be told.

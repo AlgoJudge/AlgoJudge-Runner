@@ -93,6 +93,79 @@ int main(int argc, char** argv) {
 }
 "#;
 
+/// Memory taken a mebibyte at a time and **touched**, so the kernel has to give
+/// the pages rather than promise them.
+fn greedy(mebibytes: usize) -> String {
+    format!(
+        "#include <cstdlib>
+#include <cstring>
+#include <iostream>
+int main() {{
+    long long a, b;
+    std::cin >> a >> b;
+    const size_t block = 1u << 20;
+    for (size_t i = 0; i < {mebibytes}; i++) {{
+        char *at = (char *)std::malloc(block);
+        if (at == nullptr) return 1;
+        std::memset(at, (int)i, block);
+    }}
+    std::cout << a + b << std::endl;
+}}
+"
+    )
+}
+
+/// Sixty-four mebibytes into the tmpfs every container is given at `/dev/shm`,
+/// and the allocation happens in a **child** in the second case.
+///
+/// **Both declare what they call instead of including a header**, because the
+/// policy dictionary denies `<unistd.h>`, `<fcntl.h>`, `<sys/wait.h>` and
+/// `ifstream` alike — and a submission refused by the dictionary never reaches
+/// the sandbox, which is the thing under test here. The dictionary is advice
+/// spelt as a refusal; the cgroup is the enforcement, and these two cases are
+/// exactly what it enforces that a report of one process's resident set cannot.
+const SCRATCH_CPP: &str = r#"
+#include <iostream>
+extern "C" int open(const char *, int, ...);
+extern "C" long write(int, const void *, unsigned long);
+static char block[1 << 20];
+int main() {
+    long long a, b;
+    std::cin >> a >> b;
+    int at = open("/dev/shm/scratch", 1 | 64, 0600);
+    if (at < 0) return 2;
+    for (int i = 0; i < 64; i++) {
+        if (write(at, block, sizeof block) != (long)sizeof block) return 3;
+    }
+    std::cout << a + b << std::endl;
+}
+"#;
+
+const FORKING_CPP: &str = r#"
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+extern "C" int fork();
+extern "C" int wait(int *);
+extern "C" void _exit(int);
+int main() {
+    long long a, b;
+    std::cin >> a >> b;
+    if (fork() == 0) {
+        const size_t block = 1u << 20;
+        for (int i = 0; i < 256; i++) {
+            char *at = (char *)std::malloc(block);
+            if (at == nullptr) _exit(1);
+            std::memset(at, i, block);
+        }
+        _exit(0);
+    }
+    int status = 0;
+    wait(&status);
+    std::cout << a + b << std::endl;
+}
+"#;
+
 const CORRECT_CPP: &str = r#"
 #include <iostream>
 int main() { long long a, b; std::cin >> a >> b; std::cout << a + b << "\n"; }
@@ -513,12 +586,149 @@ async fn a_judged_solution_reports_what_memory_it_used() {
         .as_u64()
         .unwrap_or_else(|| panic!("preflight passed, so the cgroup is readable: {document}"));
 
-    // A container floor of roughly 2 MiB, plus whatever the program did. Bounds
-    // rather than a value, because the point is that it is a real measurement
-    // and not a plausible-looking constant.
+    // **Bounds rather than a value**, because the point is that this is a real
+    // measurement and not a plausible-looking constant — and the bounds are wide
+    // on purpose, because what is inside this number depends on the host.
+    //
+    // It is the submission's own cgroup, so the container's floor is not in it.
+    // What is left is the program's anonymous memory plus whatever *file* pages
+    // it is the first to fault in — and a page already resident is charged to
+    // whoever brought it in, which may be the build container, an earlier run,
+    // or nobody on this host at all. Measured on the same adding program: 1.75
+    // MiB on a workstation whose bind mounts re-read per container, and 0.5 MiB
+    // on CI where the binary was already cached. Both are honest.
     assert!(
-        (1024 * 1024..256 * 1024 * 1024).contains(&memory),
-        "an adding program should use a few MiB, not bytes and not gigabytes: {memory} bytes",
+        (128 * 1024..256 * 1024 * 1024).contains(&memory),
+        "an adding program uses hundreds of kilobytes to a few MiB, not bytes and not          gigabytes: {memory} bytes",
+    );
+}
+
+/// One submission judged under a memory limit of its own.
+async fn held_to(name: &str, memory_bytes: u64, source: &str) -> serde_json::Value {
+    let config_yml = format!(
+        "type: \"standard-io@1\"\nlimits:\n  timeMs: 2000\n  memoryBytes: {memory_bytes}\n\
+         groups:\n  - group: 1\n    points: 100\n"
+    );
+
+    let pipeline = pipeline().await;
+    let (here, on_host) = fixture(name);
+    std::fs::create_dir_all(here.join("tests")).unwrap();
+    std::fs::write(here.join("config.yml"), &config_yml).unwrap();
+    std::fs::write(here.join("tests/1a.in"), "1 2\n").unwrap();
+    std::fs::write(here.join("tests/1a.out"), "3\n").unwrap();
+
+    let config = Config::parse(&config_yml).unwrap();
+    let tests = TestSet::read(&here, &config).unwrap();
+
+    let judged = verdict(
+        pipeline
+            .evaluate(&Job {
+                config: &config,
+                tests: &tests,
+                language: "cpp",
+                file_name: "main.cpp",
+                source: source.as_bytes(),
+                package: Places { here, on_host },
+                work: work(name),
+                pipes: None,
+            })
+            .await,
+    );
+
+    serde_json::from_slice(&judged.details.to_bytes()).unwrap()
+}
+
+/// **A submission over its memory limit is told so** — and until this case there
+/// was nothing anywhere that said it was.
+///
+/// `Reason::MemoryLimit` is produced at one place in the whole Runner and no
+/// suite reached it: every failing case in this file is a time limit, an output
+/// limit, a runtime error, a policy violation or a compilation error. The memory
+/// verdict was carried by the adversarial suite alone, on a container's limit
+/// and a `dd` into a tmpfs, which is not a submission being judged.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_solution_over_its_memory_limit_is_told_so() {
+    let document = held_to("over-memory", 32 * 1024 * 1024, &greedy(256)).await;
+
+    assert_eq!(document["score"], 0.0, "{document}");
+    assert_eq!(document["tests"][0]["reason"], "memoryLimit", "{document}");
+    assert!(
+        document["tests"][0]["note"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Memory limit exceeded"),
+        "{document}",
+    );
+}
+
+/// **A limit smaller than the container runtime's own minimum, enforced.**
+///
+/// The runtime refuses a container limit below six megabytes, so while the limit
+/// was the container's, six megabytes was the smallest a problem could state —
+/// and the container's own floor of a few more sat inside whatever was stated.
+/// Four mebibytes is under both. The pair is the point: one limit accepts a
+/// program that needs two numbers and refuses one that takes sixty-four
+/// mebibytes, and neither answer is reachable at all while the container is what
+/// carries the limit.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_memory_limit_below_what_the_runtime_would_accept_still_decides() {
+    let limit = 4 * 1024 * 1024;
+
+    let passed = held_to("tiny-memory-ok", limit, CORRECT_CPP).await;
+    assert_eq!(
+        passed["tests"][0]["status"], "OK",
+        "the container's own floor is being charged to the program: {passed}",
+    );
+
+    let refused = held_to("tiny-memory-over", limit, &greedy(64)).await;
+    assert_eq!(refused["tests"][0]["reason"], "memoryLimit", "{refused}");
+    // **And the figure beside the verdict is the figure it was judged on.**
+    // The cgroup cannot climb past the limit written on it, so a refused run
+    // reports the limit and never more -- where a container's peak would report
+    // the container's floor and the page cache with it, above a limit the
+    // participant never reached.
+    assert!(
+        refused["tests"][0]["memoryBytes"]
+            .as_u64()
+            .unwrap_or(u64::MAX)
+            <= limit,
+        "the number shown is not the number judged: {refused}",
+    );
+}
+
+/// **A tmpfs is the submission's own memory, and `ru_maxrss` cannot see it.**
+///
+/// Every container is given a writable `/dev/shm`; tmpfs pages are charged to
+/// the cgroup that writes them and are not reclaimable, so scratch space there
+/// is memory. A report of one process's resident set contains none of it, which
+/// is why the limit is a cgroup's rather than a number in a report.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn memory_a_submission_spends_on_a_tmpfs_is_its_own() {
+    let document = held_to("tmpfs-memory", 32 * 1024 * 1024, SCRATCH_CPP).await;
+
+    assert_eq!(
+        document["tests"][0]["reason"], "memoryLimit",
+        "a tmpfs write past the limit came back as something else: {document}",
+    );
+}
+
+/// **What a submission's children spend is the submission's.**
+///
+/// `wait4` accounts for one child, and what that child's own children spent
+/// without being reaped is in no report at all — so a program that forks and
+/// allocates there would come back having used almost nothing. A cgroup counts
+/// the subtree.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn memory_a_forked_child_spends_counts_against_the_submission() {
+    let document = held_to("forked-memory", 32 * 1024 * 1024, FORKING_CPP).await;
+
+    assert_eq!(
+        document["tests"][0]["reason"], "memoryLimit",
+        "a child's allocation was charged to nobody: {document}",
     );
 }
 

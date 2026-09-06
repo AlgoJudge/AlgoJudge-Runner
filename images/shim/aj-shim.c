@@ -8,6 +8,17 @@
  * instead, forks the submission, and reports `wait4`'s accounting for that one
  * child -- which is the program and nothing else, at microsecond resolution.
  *
+ * **And a memory limit is enforced here, for the same reason.** That cgroup
+ * holds this process too, and the container's start, and the page cache of
+ * everything it read -- so a limit set on it is a limit on the container: the
+ * container's own floor sits inside the participant's budget, and the runtime's
+ * minimum, six megabytes, becomes the smallest limit a problem can state. The
+ * Runner makes a cgroup that holds nothing and writes `memory.max` on it from
+ * the host; the child puts itself in between `fork` and `exec`. What the kernel
+ * then counts and stops is the submission, everything it forks and every tmpfs
+ * page it writes -- and `ru_maxrss`, being one process's resident set, sees
+ * neither of the last two.
+ *
  * **It is the precise instrument, and it is what a participant is charged.**
  * The report goes out on a channel of its own that nothing else in the
  * container can name, and it still carries the nonce, this process still kills
@@ -60,6 +71,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -162,6 +174,184 @@ static void take_report_channel(void) {
     }
 }
 
+/* Where this container's own cgroup is mounted, and what the submission is
+ * held to inside it. Both taken from the environment and then removed from it.
+ *
+ * **The submission is judged in a cgroup *inside* the container's own**, and
+ * three measurements on a host with systemd say why it cannot be one beside it.
+ * A sibling is outside the container's cgroup namespace, and a cgroup2 mounted
+ * with `nsdelegate` -- how systemd mounts it -- refuses to move a task out of
+ * its own namespace. A sibling made by hand inherits no controllers, because a
+ * cgroup passes on only what it was passed. And the slice a sibling would live
+ * in belongs to systemd, which rewrites its `cgroup.subtree_control` whenever it
+ * realises a unit there: measured 2026-09-06, a box made with `memory.max` had
+ * that file *gone* after the next container started in the same slice, so the
+ * submission ran with no limit at all and was killed by the container's.
+ *
+ * Inside the container's own cgroup none of that applies. The runtime asks
+ * systemd for that scope with `Delegate=yes`, so systemd stays out of it; its
+ * controllers are already delegated, because the runtime set a memory limit on
+ * it; and everything stays within one namespace.
+ *
+ * **Only memory has to be written.** A child of the container's cgroup is bound
+ * by every limit the container has -- processes, processor, the pinned core --
+ * because those are hierarchical. That is the whole of what nesting buys over
+ * copying four controls into a sibling and keeping them in step for ever. */
+static char cgroup_at[256];
+static long long memory_bytes;
+static char submissions_procs[512];
+static char submissions_box[384];
+
+static void take_cgroup(void) {
+    static const char where[] = "AJ_SHIM_CGROUP=";
+    static const char how_much[] = "AJ_SHIM_MEMORY_BYTES=";
+    for (char **entry = environ; *entry != NULL; entry++) {
+        if (strncmp(*entry, where, sizeof where - 1) == 0) {
+            snprintf(cgroup_at, sizeof cgroup_at, "%s", *entry + sizeof where - 1);
+        } else if (strncmp(*entry, how_much, sizeof how_much - 1) == 0) {
+            memory_bytes = atoll(*entry + sizeof how_much - 1);
+        }
+    }
+    unsetenv("AJ_SHIM_CGROUP");
+    unsetenv("AJ_SHIM_MEMORY_BYTES");
+}
+
+/* One number into one cgroup file, and it is fatal not to land. */
+static void tell_the_kernel(const char *dir, const char *file, const char *value, int required) {
+    char path[576];
+    snprintf(path, sizeof path, "%s/%s", dir, file);
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        /* A kernel without swap accounting has no `memory.swap.max` and one
+         * without `memory.oom.group` kills a single process rather than the
+         * group. Neither is this host failing to apply what it promised. */
+        if (!required) return;
+        fatal(file);
+    }
+    ssize_t wrote = write(fd, value, strlen(value));
+    close(fd);
+    if (wrote != (ssize_t)strlen(value) && required) fatal(file);
+}
+
+/* This process's own cgroup, as the last component of `/proc/self/cgroup`.
+ *
+ * The container is started sharing the host's cgroup namespace, so that line
+ * carries the whole path rather than `/`; the Runner mounts the directory the
+ * container's cgroup sits in, so the basename is all that is needed to find it
+ * again through that mount. */
+static void own_cgroup(char *into, size_t room) {
+    int fd = open("/proc/self/cgroup", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) fatal("cannot read /proc/self/cgroup");
+    char line[1024];
+    ssize_t read_in = read(fd, line, sizeof line - 1);
+    close(fd);
+    if (read_in <= 0) fatal("cannot read /proc/self/cgroup");
+    line[read_in] = '\0';
+
+    char *end = strchr(line, '\n');
+    if (end != NULL) *end = '\0';
+    char *last = strrchr(line, '/');
+    if (last == NULL || last[1] == '\0') {
+        errno = ENOENT;
+        fatal("this container's cgroup has no name of its own");
+    }
+    snprintf(into, room, "%s/%s", cgroup_at, last + 1);
+}
+
+/* Makes the cgroup the submission is judged in, and states its memory limit.
+ *
+ * **This process moves itself out of the way first**, and the kernel is why: a
+ * cgroup may hold processes or hand controllers to its children, never both, so
+ * `+memory` on a cgroup this shim is sitting in is refused. It goes to a
+ * sibling of the submission's, where it is still inside the container and still
+ * out of the submission's reach. */
+static void make_the_submissions_cgroup(void) {
+    if (cgroup_at[0] == '\0' || memory_bytes <= 0) return;
+
+    char here[320];
+    own_cgroup(here, sizeof here);
+
+    char mine[384], theirs[384];
+    snprintf(mine, sizeof mine, "%s/shim", here);
+    snprintf(theirs, sizeof theirs, "%s/box", here);
+
+    if (mkdir(mine, 0700) != 0 && errno != EEXIST) fatal("cannot make the shim's own cgroup");
+    char pid[32];
+    snprintf(pid, sizeof pid, "%d", (int)getpid());
+    tell_the_kernel(mine, "cgroup.procs", pid, 1);
+
+    tell_the_kernel(here, "cgroup.subtree_control", "+memory", 1);
+
+    if (mkdir(theirs, 0700) != 0 && errno != EEXIST) fatal("cannot make the submission's cgroup");
+    char limit[32];
+    snprintf(limit, sizeof limit, "%lld", memory_bytes);
+    tell_the_kernel(theirs, "memory.max", limit, 1);
+    tell_the_kernel(theirs, "memory.swap.max", "0", 0);
+    /* The whole cgroup dies together: one process of a submission killed while
+     * the others carry on is a program whose answer came out of a run the
+     * kernel had already stopped. */
+    tell_the_kernel(theirs, "memory.oom.group", "1", 0);
+
+    snprintf(submissions_box, sizeof submissions_box, "%s", theirs);
+    snprintf(submissions_procs, sizeof submissions_procs, "%s/cgroup.procs", theirs);
+}
+
+/* **Failing to join is fatal, and it has to be.** A submission outside its
+ * cgroup is a submission with no memory limit, and judging it would be judging
+ * it under a rule it was never held to -- an `Accepted` nobody could tell from
+ * an honest one.
+ *
+ * Written while this is still root, because the file is root's and the
+ * submission is uid 65534 four lines later. One write of one pid: the whole
+ * thread group moves with it, and `exec` keeps the cgroup. */
+static void join_the_cgroup(void) {
+    if (submissions_procs[0] == '\0') return;
+
+    int fd = open(submissions_procs, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) fatal("cannot open the submission's cgroup");
+
+    char pid[32];
+    int wrote = snprintf(pid, sizeof pid, "%d", (int)getpid());
+    if (write(fd, pid, (size_t)wrote) != wrote) fatal("cannot join the submission's cgroup");
+    close(fd);
+}
+
+/* What the submission's cgroup held at its widest, or `ru_maxrss` where there
+ * is no such cgroup.
+ *
+ * **Read here rather than by the Runner, and the container's lifetime is why.**
+ * The cgroup is inside the container's own, so it is destroyed with it and
+ * there is no window afterwards in which to read it. That makes this figure the
+ * report's, which is to say untrusted -- and forging it buys a submission
+ * nothing, because it is not what decides anything: the kernel enforces the
+ * limit, and the *kill* is counted in `memory.events`, which the Runner reads
+ * from a cgroup of its own that outlives the container and that nothing in here
+ * can reach.
+ *
+ * `ru_maxrss` remains the answer for a run with no cgroup of its own. It is one
+ * process's resident set, so it counts neither a forked child nor a tmpfs page,
+ * and it is a fallback rather than a second opinion. */
+static long long what_it_held(const struct rusage *used) {
+    if (submissions_box[0] == '\0') return (long long)used->ru_maxrss * 1024;
+
+    /* **Zero rather than `ru_maxrss` where the cgroup was made and cannot be
+     * read.** They are different quantities -- one is the submission's whole
+     * subtree, the other one process's resident set -- and quietly answering
+     * the second would put a smaller number beside a verdict with nothing
+     * saying it came from somewhere else. Zero is read as *absent*, which the
+     * format has a rule for and a screen has a word for. */
+    char path[512];
+    snprintf(path, sizeof path, "%s/memory.peak", submissions_box);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char held[64];
+    ssize_t read_in = read(fd, held, sizeof held - 1);
+    close(fd);
+    if (read_in <= 0) return 0;
+    held[read_in] = '\0';
+    return atoll(held);
+}
+
 static void become_the_submission(void) {
     if (getuid() == 0) {
         if (setgroups(0, NULL) != 0) fatal("setgroups");
@@ -212,6 +402,7 @@ int main(int argc, char **argv) {
     }
 
     take_nonce();
+    take_cgroup();
 
     /* **Output, then the report, then the input, and the order is the point.**
      *
@@ -226,6 +417,12 @@ int main(int argc, char **argv) {
     if (output < 0) fatal("cannot open the output");
 
     take_report_channel();
+
+    /* **After the report channel and not before it.** Failing to make
+     * this is fatal, and a fatal before the channel exists is a message
+     * written to a stderr the Runner does not read -- which arrives as
+     * `the shim reported nothing` and says nothing about why. */
+    make_the_submissions_cgroup();
 
     int input = open(argv[1], O_RDONLY | O_CLOEXEC);
     if (input < 0) fatal("cannot open the input file");
@@ -271,6 +468,9 @@ int main(int argc, char **argv) {
         if (nowhere < 0) fatal("cannot open /dev/null for the submission's stderr");
         if (dup2(nowhere, STDERR_FILENO) < 0) fatal("dup2 /dev/null onto stderr");
 
+        /* **Into its own cgroup before it becomes the submission**, because the
+         * write needs root and the next line gives root up. */
+        join_the_cgroup();
         become_the_submission();
         /* **`execvp`, because the catalogue names `python3` and not a path.**
          * The shell this replaces searched `PATH`; `execve` does not, and every
@@ -332,7 +532,7 @@ int main(int argc, char **argv) {
              nonce,
              WIFEXITED(status) ? WEXITSTATUS(status) : 0,
              WIFSIGNALED(status) ? WTERMSIG(status) : 0,
-             cpu_us, (long long)used.ru_maxrss * 1024, wall_us,
+             cpu_us, what_it_held(&used), wall_us,
              user_us, system_us);
     say(line);
 

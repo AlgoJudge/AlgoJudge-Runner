@@ -50,6 +50,12 @@ pub struct Profile {
     pub command: Vec<String>,
     pub working_directory: String,
 
+    /// **What the submission is held to, which is not what the container is.**
+    /// A judged run puts the submission in a cgroup of its own and this is the
+    /// `memory.max` written on it, so it holds the program, everything it forks
+    /// and every tmpfs page it writes -- and nothing the container spent
+    /// existing. Everywhere else, and on a host that could not make that cgroup,
+    /// it is the container's own limit as it always was.
     pub memory_bytes: u64,
     pub pids: i64,
     /// Whole cores: how much processor time a run may spend per second,
@@ -455,7 +461,10 @@ pub enum Stopped {
     /// time limit: a program reaching it has stopped spending processor time
     /// altogether, which means waiting, or wedged in an uninterruptible call.
     WallClock,
-    /// The kernel killed it at the memory limit.
+    /// The kernel killed it at the memory limit -- **the submission's own**,
+    /// written on the cgroup that holds the submission and nothing else, so
+    /// neither the container's floor nor the page cache of what the container
+    /// read is inside what it was compared against.
     Memory,
     /// It produced more than it was allowed to.
     Output,
@@ -497,16 +506,23 @@ pub struct Outcome {
     pub wall_time: Duration,
     pub stopped: Stopped,
 
-    /// Read from the run's own cgroup on a cgroup v2 host, and **absent rather
-    /// than guessed** where the Runner was given nowhere to measure from.
+    /// Read from a cgroup on a cgroup v2 host, and **absent rather than
+    /// guessed** where the Runner was given nowhere to measure from.
     ///
     /// A number that is sometimes wrong is worse than no number, because it is
     /// shown to a participant beside a verdict — so absence is a real answer
     /// here and `PACKAGE_FORMAT.md` treats it as one.
     ///
+    /// **Which cgroup decides what this contains.** A judged run has one holding
+    /// the submission alone, and this is that one: the same number the limit was
+    /// enforced against, so what a participant reads and what they were judged
+    /// on cannot differ. Anywhere else it is the whole run's, and where a shim
+    /// reported and there was no such cgroup it is the shim's `ru_maxrss` --
+    /// one process's resident set, which counts neither a forked child nor a
+    /// tmpfs page.
+    ///
     /// The runtime API is not the source: it reports no peak on cgroup v2, and
-    /// a container's own cgroup does not outlive it. See `Docker::cgroup_root`
-    /// for how the measurement is actually taken.
+    /// a container's own cgroup does not outlive it.
     pub peak_memory_bytes: Option<u64>,
 
     /// From `cpu.stat` in the same cgroup: user plus system, for the whole
