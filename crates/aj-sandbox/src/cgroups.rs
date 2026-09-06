@@ -1144,7 +1144,7 @@ mod tests {
     /// at the same moment.
     #[test]
     fn two_runners_preparing_at_once_do_not_collide() {
-        let root = std::env::temp_dir().join(format!("aj-prepare-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("aj-prepare-systemd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("a scratch root");
 
