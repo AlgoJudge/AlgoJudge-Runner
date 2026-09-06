@@ -586,12 +586,20 @@ async fn a_judged_solution_reports_what_memory_it_used() {
         .as_u64()
         .unwrap_or_else(|| panic!("preflight passed, so the cgroup is readable: {document}"));
 
-    // A container floor of roughly 2 MiB, plus whatever the program did. Bounds
-    // rather than a value, because the point is that it is a real measurement
-    // and not a plausible-looking constant.
+    // **Bounds rather than a value**, because the point is that this is a real
+    // measurement and not a plausible-looking constant — and the bounds are wide
+    // on purpose, because what is inside this number depends on the host.
+    //
+    // It is the submission's own cgroup, so the container's floor is not in it.
+    // What is left is the program's anonymous memory plus whatever *file* pages
+    // it is the first to fault in — and a page already resident is charged to
+    // whoever brought it in, which may be the build container, an earlier run,
+    // or nobody on this host at all. Measured on the same adding program: 1.75
+    // MiB on a workstation whose bind mounts re-read per container, and 0.5 MiB
+    // on CI where the binary was already cached. Both are honest.
     assert!(
-        (1024 * 1024..256 * 1024 * 1024).contains(&memory),
-        "an adding program should use a few MiB, not bytes and not gigabytes: {memory} bytes",
+        (128 * 1024..256 * 1024 * 1024).contains(&memory),
+        "an adding program uses hundreds of kilobytes to a few MiB, not bytes and not          gigabytes: {memory} bytes",
     );
 }
 
