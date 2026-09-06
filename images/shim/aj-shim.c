@@ -8,6 +8,17 @@
  * instead, forks the submission, and reports `wait4`'s accounting for that one
  * child -- which is the program and nothing else, at microsecond resolution.
  *
+ * **And a memory limit is enforced here, for the same reason.** That cgroup
+ * holds this process too, and the container's start, and the page cache of
+ * everything it read -- so a limit set on it is a limit on the container: the
+ * container's own floor sits inside the participant's budget, and the runtime's
+ * minimum, six megabytes, becomes the smallest limit a problem can state. The
+ * Runner makes a cgroup that holds nothing and writes `memory.max` on it from
+ * the host; the child puts itself in between `fork` and `exec`. What the kernel
+ * then counts and stops is the submission, everything it forks and every tmpfs
+ * page it writes -- and `ru_maxrss`, being one process's resident set, sees
+ * neither of the last two.
+ *
  * **It is the precise instrument, and it is what a participant is charged.**
  * The report goes out on a channel of its own that nothing else in the
  * container can name, and it still carries the nonce, this process still kills
@@ -162,6 +173,59 @@ static void take_report_channel(void) {
     }
 }
 
+/* The cgroup the submission is judged in, taken from the environment and then
+ * removed from it.
+ *
+ * **This is where a memory limit is enforced, and this is the only place it can
+ * be.** The container's own cgroup holds this process as well, and the container's
+ * start, and the page cache of everything it read -- so a limit set there is a
+ * limit on the container rather than on the program: its floor sits inside the
+ * participant's budget, and the runtime's own minimum becomes the smallest limit
+ * a problem can state. The Runner makes a cgroup that holds nothing, writes
+ * `memory.max` on it from the host where nothing here can reach it, and names it
+ * here. The child puts itself in between `fork` and `exec`, so what the kernel
+ * counts and stops is the submission, every process it starts and every tmpfs
+ * page it writes, and nothing else.
+ *
+ * Absent means the container's own limit is doing the work, which is the case
+ * for every container that carries no shim and for a host that gave the Runner
+ * nowhere to make one. */
+static char cgroup_procs[512];
+
+static void take_cgroup(void) {
+    static const char key[] = "AJ_SHIM_CGROUP=";
+    for (char **entry = environ; *entry != NULL; entry++) {
+        if (strncmp(*entry, key, sizeof key - 1) != 0) continue;
+
+        char *value = *entry + sizeof key - 1;
+        snprintf(cgroup_procs, sizeof cgroup_procs, "%s/cgroup.procs", value);
+        memset(value, 'x', strlen(value));
+        unsetenv("AJ_SHIM_CGROUP");
+        return;
+    }
+}
+
+/* **Failing to join is fatal, and it has to be.** A submission outside its
+ * cgroup is a submission with no memory limit, and judging it would be judging
+ * it under a rule it was never held to -- an `Accepted` nobody could tell from
+ * an honest one. The Runner reports a shim failure as an infrastructure failure,
+ * which is the right shape for a host that cannot enforce what it promised.
+ *
+ * Written while this is still root, because the file is root's and the
+ * submission is uid 65534 four lines later. One write of one pid: the whole
+ * thread group moves with it, and `exec` keeps the cgroup. */
+static void join_the_cgroup(void) {
+    if (cgroup_procs[0] == '\0') return;
+
+    int fd = open(cgroup_procs, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) fatal("cannot open the submission's cgroup");
+
+    char pid[32];
+    int wrote = snprintf(pid, sizeof pid, "%d", (int)getpid());
+    if (write(fd, pid, (size_t)wrote) != wrote) fatal("cannot join the submission's cgroup");
+    close(fd);
+}
+
 static void become_the_submission(void) {
     if (getuid() == 0) {
         if (setgroups(0, NULL) != 0) fatal("setgroups");
@@ -212,6 +276,7 @@ int main(int argc, char **argv) {
     }
 
     take_nonce();
+    take_cgroup();
 
     /* **Output, then the report, then the input, and the order is the point.**
      *
@@ -271,6 +336,9 @@ int main(int argc, char **argv) {
         if (nowhere < 0) fatal("cannot open /dev/null for the submission's stderr");
         if (dup2(nowhere, STDERR_FILENO) < 0) fatal("dup2 /dev/null onto stderr");
 
+        /* **Into its own cgroup before it becomes the submission**, because the
+         * write needs root and the next line gives root up. */
+        join_the_cgroup();
         become_the_submission();
         /* **`execvp`, because the catalogue names `python3` and not a path.**
          * The shell this replaces searched `PATH`; `execve` does not, and every

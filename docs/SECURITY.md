@@ -49,7 +49,7 @@ trusted code.
 | `--security-opt=no-new-privileges` | and none may be gained |
 | read-only root filesystem | writes go nowhere it covers — see `/dev/shm` below |
 | `--user 65534:65534` | never root, even inside |
-| `--memory` **with `--memory-swap` equal** | without the second the limit means nothing: the process swaps instead of being killed. **Two sources say a kill happened** and either is enough — see below |
+| `memory.max` **with `memory.swap.max` zero**, on a cgroup holding the submission and nothing else | without the second the limit means nothing: the program swaps instead of being killed. The cgroup is a sibling of the container's, so what it counts is the submission, everything it forks and every tmpfs page it writes — and not the container's own start. The container keeps a `--memory` of its own, for the shim. **Two sources say a kill happened** and either is enough — see below |
 | `--pids-limit` | a fork bomb hits a wall |
 | `--cpus` | one processor's worth per second. The threading hole is closed by the accounting as well — `cpu.stat` sums the subtree, so threads spend the budget faster rather than escaping it |
 | `--cpuset-cpus`, **only where the Runner was given a set** | an operator's division of the host, carried to the job containers, which inherit no affinity of their own. Given the whole machine the Runner pins nothing: several Runners choosing processors with nothing coordinating them is worse than letting the host place the work |
@@ -66,10 +66,12 @@ across the pipeline.
 A running submission's only writable path is `/dev/shm`, which the contract below
 describes as a surface nobody declared and rule 3's test names explicitly.
 
-**A memory kill is told from two places.** The
-container runtime reports `OOMKilled` on the container, and the kernel counts in
-the run's own cgroup — `memory.events`, read beside `memory.peak` and
-`cpu.stat`. Either source is enough, and neither is checked against the other.
+**A memory kill is told from two places.** The container runtime reports
+`OOMKilled` on the container, and the kernel counts in the cgroup the limit was
+written on — `memory.events`, read beside `memory.peak`. For a judged submission
+that is the submission's own cgroup, so the counts are its outright; for every
+other container it is the run's. Either source is enough, and neither is checked
+against the other.
 
 **The kernel's half is two fields and needs both**, because each alone says the
 wrong thing — the definitions are the kernel's own:
@@ -95,6 +97,13 @@ Every row has a test in `crates/aj-sandbox/tests/adversarial.rs`, and each
 asserts two things: the program was stopped correctly, **and the host is
 unchanged afterwards**. A sandbox that contains a program by leaking a process
 has not contained it.
+
+**The memory row is proved in two places, because it holds two things.** That a
+container over its limit is killed is `adversarial.rs`; that a *submission* over
+the limit its problem stated is `Memory limit exceeded` — at a limit smaller than
+the runtime would accept on a container, for a tmpfs write, and for what a forked
+child spent — is `aj-standard-io/tests/judging.rs`, where a submission is what is
+being judged.
 
 **One of those four taught something that outlives it.** The obvious capability
 test — assert the effective set is empty — is no test at all here. Measured with
@@ -158,9 +167,12 @@ Two things that follow, and are easy to get wrong in the opposite direction:
 - **`/dev/shm` is writable and the profile does not ask for it.** The runtime
   mounts a 64 MiB tmpfs there in every container and a read-only root filesystem
   does not cover it. It breaks none of the four — it is new with the container,
-  and tmpfs pages are charged to the memory limit, so a program spending it is
-  spending its own budget — but it is a surface nobody declared, which is why
-  rule 3's test names it explicitly.
+  and tmpfs pages are charged to the cgroup that writes them, which for a
+  submission is the cgroup carrying its memory limit, so a program spending it is
+  spending its own budget and is killed for spending too much. Measured: a
+  submission writing 64 MiB there under a 32 MiB limit is `Memory limit
+  exceeded`. It is still a surface nobody declared, which is why rule 3's test
+  names it explicitly.
 - **The input is a mounted file, not a pipe — for a batch problem.** A pipe
   would be marginally stricter and is deliberately not used: it is **not
   seekable**, so a solution that reads its input twice would work on the author's

@@ -256,8 +256,35 @@ impl Docker {
         Ok(swept)
     }
 
-    fn host_config(profile: &Profile, cgroup_parent: Option<&str>, shim: bool) -> HostConfig {
-        let memory = profile.memory_bytes as i64;
+    fn host_config(
+        profile: &Profile,
+        bounds: &cgroups::Bounds,
+        cgroup_parent: Option<&str>,
+        shim: bool,
+        bound: Option<&str>,
+    ) -> HostConfig {
+        // **Destructured without `..` on purpose.** Every field of `Bounds` is a
+        // cgroup control, and where the submission has a cgroup of its own each
+        // one has to be applied twice: here, and there. A fifth control cannot
+        // be added to that struct without the compiler stopping at both places.
+        let cgroups::Bounds {
+            memory_bytes,
+            pids,
+            cpus,
+            cpuset,
+        } = bounds;
+
+        // **What the container is held to, which is not what the submission is
+        // held to.** Where `bound` names a cgroup, the submission is in it and
+        // this holds the shim and the container's own start and nothing else, so
+        // it is a constant rather than the problem's limit. That is what takes
+        // the runtime's six-megabyte minimum out of the participant's way: a
+        // problem may state one mebibyte and the kernel enforces exactly that,
+        // on the cgroup where it applies.
+        let memory = match bound {
+            Some(_) => CONTAINER_MEMORY as i64,
+            None => *memory_bytes as i64,
+        };
 
         HostConfig {
             // Under the Runner's own cgroup when there is one, so that a peak
@@ -281,9 +308,9 @@ impl Docker {
             // nothing: the process swaps instead of being killed, and a memory
             // limit that can be evaded is not a limit.
             memory_swap: Some(memory),
-            pids_limit: Some(profile.pids),
-            nano_cpus: Some((profile.cpus * 1_000_000_000.0) as i64),
-            cpuset_cpus: profile.cpuset.clone(),
+            pids_limit: Some(*pids),
+            nano_cpus: Some((cpus * 1_000_000_000.0) as i64),
+            cpuset_cpus: cpuset.clone(),
 
             // Soft and hard set to the same number: a program that raises its
             // own soft limit to the hard one has raised nothing.
@@ -326,6 +353,22 @@ impl Docker {
                     })
                     .collect(),
             ),
+
+            // **A mount and not a bind, and the difference is the safety.**
+            // The legacy bind creates a missing source as a directory, and a
+            // directory made under the cgroup tree *is a cgroup* -- an unlimited
+            // one, which the shim would join and be held to nothing by. A mount
+            // refuses a source that is not there, so a path this Runner and the
+            // daemon disagree about is a container that does not start.
+            mounts: bound.map(|from| {
+                vec![bollard::models::Mount {
+                    typ: Some(bollard::models::MountTypeEnum::BIND),
+                    source: Some(from.to_owned()),
+                    target: Some(BOUND_AT.to_owned()),
+                    read_only: Some(false),
+                    ..Default::default()
+                }]
+            }),
 
             // **Every container this Runner starts states its driver**, and
             // never inherits the daemon's. The default on a stock host is an
@@ -508,15 +551,43 @@ impl Sandbox for Docker {
         // it and because under the systemd backend the reading is a difference
         // that has to have a beginning. Failure here is not an error: the run
         // proceeds unmeasured.
+        // **The submission is given a cgroup of its own where it is somebody's
+        // submission.** A build, a checker and an interactor are programs of
+        // ours or of the problem author's, and stay held by the container's own
+        // limits exactly as they were.
+        let bounds = cgroups::Bounds::of(profile);
+        let wanted = shim.then(|| bounds.clone());
+
         let cgroup = match self.cgroups() {
             // **A run beside another one opens nothing.** Under `systemd` the
             // gate `begin` takes is held for the whole of the run that owns it,
             // so asking for one here is how a checker comes to wait for the
             // submission that is waiting for the checker.
             _ if profile.alongside => None,
-            Some(cgroups) => cgroups.begin(&name).await,
+            Some(cgroups) => cgroups.begin(&name, wanted.as_ref()).await,
             None => None,
         };
+
+        // **A judged run whose limits were not applied must not be judged.** It
+        // would be a submission held to no memory limit at all, reported as an
+        // ordinary verdict, with nothing anywhere saying the rule went
+        // unapplied. Preflight proves this host can do it, so arriving here
+        // means the tree changed underneath a running Runner.
+        let bound = match &cgroup {
+            Some((measuring, _)) if wanted.is_some() && measuring.bounded() => self
+                .cgroups()
+                .and_then(|cgroups| cgroups.bound_for_daemon(&name)),
+            _ => None,
+        };
+        if wanted.is_some() && bound.is_none() {
+            if let Some((measuring, _)) = cgroup {
+                measuring.finish();
+            }
+            return Err(Error::Refused(
+                "this host could not make the cgroup a submission is judged in, so the memory                  limit could not be applied to it. The cgroup tree has to be mounted writable in                  a container running as root: --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup,                  or `cgroup: host` on the service plus the same volume in Compose"
+                    .to_owned(),
+            ));
+        }
 
         let config = ContainerCreateBody {
             image: Some(profile.image.clone()),
@@ -530,10 +601,10 @@ impl Sandbox for Docker {
             // before forking, and the submission runs as a different user that
             // cannot read `/proc/1/environ` in any case.
             //
-            // **The cap travels the same way, and only with the nonce.** It is
-            // the shim that applies it, as `RLIMIT_FSIZE` on the child before
-            // dropping privileges — so it is meaningless without one, and the
-            // shim scrubs both.
+            // **The cgroup travels the same way, and only with the nonce.**
+            // It is the shim that puts the child in it, before dropping
+            // privileges, so it is meaningless without one -- and the shim
+            // scrubs both.
             // **The shim's own, and then the caller's.** The two never meet:
             // a nonce is issued only for a measured run, which is a submission,
             // and a caller states variables only for a program the package
@@ -545,6 +616,12 @@ impl Sandbox for Docker {
                     env.push(format!("AJ_SHIM_NONCE={nonce}"));
                     if let Some(pipes) = &profile.pipes {
                         env.push(format!("AJ_SHIM_REPORT={}", pipes.inside(Pipes::REPORT)));
+                    }
+                    // Where the child puts itself between `fork` and `exec`.
+                    // Absent leaves the container's own limit doing the work,
+                    // which is what every unshimmed container still gets.
+                    if bound.is_some() {
+                        env.push(format!("AJ_SHIM_CGROUP={BOUND_AT}"));
                     }
                 }
                 env.extend(profile.env.iter().cloned());
@@ -558,8 +635,10 @@ impl Sandbox for Docker {
             network_disabled: Some(true),
             host_config: Some(Self::host_config(
                 profile,
+                &bounds,
                 cgroup.as_ref().map(|(_, parent)| parent.as_str()),
                 shim,
+                bound.as_deref(),
             )),
             ..Default::default()
         };
@@ -620,14 +699,17 @@ impl Sandbox for Docker {
 
         // Read after the container is gone: the child's own cgroup goes with it,
         // and the numbers are final the moment the child stops.
+        let bounded = cgroup.as_ref().is_some_and(|(m, _)| m.bounded());
         if let Some((measuring, _)) = cgroup {
             let reading = measuring.finish();
             if let Ok(outcome) = outcome.as_mut() {
                 outcome.peak_memory_bytes = reading.peak_memory_bytes;
                 outcome.cpu_time = reading.cpu_time;
-                // **The verdict for memory stays the cgroup's.** A limit is
-                // enforced by the kernel, so what the report claims about memory
-                // changes nothing about whether the kernel killed it.
+                // **The verdict for memory stays the kernel's**, and where the
+                // submission has a cgroup of its own it is that cgroup's: the
+                // limit was written on it, and `oom` counts a cgroup reaching
+                // *its own* limit. What a report claims about memory changes
+                // nothing either way.
                 outcome.stopped = memory_kill(outcome.stopped, &reading);
             }
         }
@@ -717,12 +799,22 @@ impl Sandbox for Docker {
                     );
                 }
                 outcome.cpu_time = Some(charged);
-                // Memory needs no floor: understating it buys nothing, because
-                // the kernel and not this number decides the memory verdict. The
-                // shim's figure is the better one -- the program's own resident
-                // peak, where the cgroup also carries the page cache of whatever
-                // the container read.
-                outcome.peak_memory_bytes = Some(said.peak_memory_bytes);
+                // **Only where the submission had no cgroup of its own.** Where
+                // it had one, the kernel counted the same program on the host,
+                // out of reach of anything inside the container, and counted
+                // more of it: every process the submission forked and every
+                // tmpfs page it wrote, neither of which `ru_maxrss` can see.
+                // That number is also the one the limit was enforced against,
+                // and preferring it is what makes the figure a participant reads
+                // and the figure they were judged on the same figure.
+                //
+                // Memory still needs no floor of the kind processor time has.
+                // Where this figure is used at all, the container's own limit is
+                // what is enforcing, so understating it buys a submission
+                // nothing.
+                if !bounded {
+                    outcome.peak_memory_bytes = Some(said.peak_memory_bytes);
+                }
             }
         }
         outcome
@@ -1213,6 +1305,30 @@ fn measured_time(reported: Duration, whole: Option<Duration>) -> Duration {
 /// catches the cheating worth doing -- a program spending seconds past its
 /// limit, which is what a limit of 100 to 600 ms makes worth attempting.
 const UNEXPLAINED_GAP: Duration = Duration::from_secs(1);
+
+/// Where the cgroup a submission is judged in is mounted inside its container.
+///
+/// The shim is told this path and writes the child's pid into `cgroup.procs`
+/// there. Root's, like everything else the shim is handed: the submission is
+/// uid 65534 by the time it runs and can read these files without being able to
+/// write one.
+const BOUND_AT: &str = "/aj/cgroup";
+
+/// What the container itself is allowed, where the submission is not in it.
+///
+/// **Not the problem's limit, and deliberately a constant.** With the submission
+/// in a cgroup of its own -- a *sibling* of the container's, so nothing here
+/// bounds it -- this holds the shim and whatever the container spends existing,
+/// and nothing anybody is judged on.
+///
+/// Measured 2026-09-06 on WSL2, kernel 6.18, across the gcc, python and pypy
+/// images: a container running the shim over `/bin/echo` peaks at **6.02 MiB**,
+/// which is Docker's own stated minimum for `--memory` almost exactly. Ten times
+/// that, because this is a backstop against a container of ours going wrong
+/// rather than a budget anybody has to fit in -- and because being above the
+/// runtime's minimum at every problem limit is what keeps that minimum out of
+/// the participant's way.
+const CONTAINER_MEMORY: u64 = 64 * 1024 * 1024;
 
 /// How often a run's processor time is looked at while it runs.
 ///
@@ -1751,7 +1867,8 @@ mod tests {
             Profile::new("image", vec!["true".to_owned()]).measured(),
             Profile::new("image", vec!["true".to_owned()]).alongside(),
         ] {
-            let config = Docker::host_config(&profile, None, false);
+            let config =
+                Docker::host_config(&profile, &cgroups::Bounds::of(&profile), None, false, None);
             assert!(
                 config.log_config.is_some(),
                 "a profile fell through to the daemon's default",
@@ -1762,15 +1879,12 @@ mod tests {
     /// Silence is the whole of what `none` is for: a run nobody reads.
     #[test]
     fn a_silent_run_keeps_no_log_and_a_read_one_keeps_a_bounded_one() {
-        let silent = Docker::host_config(
-            &Profile::new("image", vec!["true".to_owned()]).silent(),
-            None,
-            false,
-        );
+        let quiet = Profile::new("image", vec!["true".to_owned()]).silent();
+        let silent = Docker::host_config(&quiet, &cgroups::Bounds::of(&quiet), None, false, None);
         assert_eq!(silent.log_config.unwrap().typ.as_deref(), Some("none"));
 
-        let read =
-            Docker::host_config(&Profile::new("image", vec!["true".to_owned()]), None, false);
+        let plain = Profile::new("image", vec!["true".to_owned()]);
+        let read = Docker::host_config(&plain, &cgroups::Bounds::of(&plain), None, false, None);
         let log = read.log_config.expect("a driver");
         assert_eq!(
             log.typ.as_deref(),
