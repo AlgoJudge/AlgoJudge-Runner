@@ -220,14 +220,22 @@ impl Cgroups {
 
     /// Makes what this backend needs up front, and proves the Runner can use it.
     ///
-    /// Under `cgroupfs` that is creation **and removal**. The check this
-    /// replaced was `create_dir_all`, which succeeds without proving anything
-    /// once the directory exists — so a tree remounted read-only under a
-    /// directory a previous Runner had left passed preflight and then failed
-    /// every job it claimed.
+    /// Creation **and removal**, under both drivers. The check this replaced was
+    /// `create_dir_all`, which succeeds without proving anything once the
+    /// directory exists — so a tree remounted read-only under a directory a
+    /// previous Runner had left passed preflight and then failed every job it
+    /// claimed.
     ///
-    /// Under `systemd` the Runner creates nothing, so there is nothing left to
-    /// prove beyond a readable hierarchy, which [`Self::resolve`] proved.
+    /// **`systemd` was exempt until 2026-09-07**, and the exemption was right
+    /// for as long as the Runner created nothing there. It stopped being right
+    /// when a memory limit moved onto a cgroup the **shim** makes inside each
+    /// judged container: the mount the shim reaches that through has this
+    /// directory as its source, and [`Self::mount_point`] only ever calls
+    /// `create_dir_all` on it — which proves nothing once a slice exists. So a
+    /// `systemd` host with a read-only tree started, warned about peak memory,
+    /// and then failed every job it claimed, one at a time. What is written
+    /// here is the same write the shim will make, made one level above it and
+    /// taken straight back.
     ///
     /// **Named for the Runner and not fixed**, because several of them share one
     /// host and one `algojudge` directory, and `docker compose up` starts them
@@ -236,10 +244,7 @@ impl Cgroups {
     /// `remove_dir` and refused to start blaming the host. Reproduced on the
     /// first attempt by `two_runners_preparing_at_once_do_not_collide`.
     pub(crate) fn prepare(&self, instance: &str) -> Result<()> {
-        let Self::Cgroupfs { root } = self else {
-            return Ok(());
-        };
-        let home = root.join(OURS);
+        let home = self.home();
         let probe = home.join(probe_name(instance));
         std::fs::create_dir_all(&home)
             .and_then(|()| match std::fs::create_dir(&probe) {
@@ -248,17 +253,35 @@ impl Cgroups {
             })
             .map_err(|e| {
                 Error::Refused(format!(
-                    "this Runner cannot make and remove a cgroup under {}: {e}. A time limit is \
-                     decided on processor time, read from cpu.stat in a cgroup this Runner makes \
-                     for each run, so without one it would register and then fail every job it \
-                     claimed. Mount the host's cgroup tree writable and share its namespace — \
-                     --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup, or in Compose `cgroup: \
-                     host` on the service plus the same volume — and run the container as root, \
-                     because the tree's directories are root's. It costs write permission, not a \
-                     capability",
-                    home.display()
+                    "this Runner cannot make and remove a cgroup under {}: {e}. {}. Mount the \
+                     host's cgroup tree writable and share its namespace — --cgroupns=host -v \
+                     /sys/fs/cgroup:/sys/fs/cgroup, or in Compose `cgroup: host` on the service \
+                     plus the same volume — and run the container as root, because the tree's \
+                     directories are root's. It costs write permission, not a capability",
+                    home.display(),
+                    self.what_this_write_buys(),
                 ))
             })
+    }
+
+    /// What a Runner that cannot write here loses — which is **not** the same
+    /// thing under the two drivers, and a refusal naming only one of them would
+    /// send an operator looking in the wrong place.
+    fn what_this_write_buys(&self) -> &'static str {
+        match self {
+            Self::Cgroupfs { .. } => {
+                "A time limit is decided on processor time, read from cpu.stat in a cgroup this \
+                 Runner makes for each run, and a memory limit is enforced on one the shim makes \
+                 inside each judged container — both of them under this directory, so without the \
+                 write this Runner would register and then fail every job it claimed"
+            }
+            Self::Systemd { .. } => {
+                "A memory limit is enforced on a cgroup the shim makes inside each judged \
+                 container, and the mount it reaches that through has this slice as its source — \
+                 so without the write this Runner would register and then fail every job it \
+                 claimed. The processor time is only read here, and reading is not what is missing"
+            }
+        }
     }
 
     /// Removes the cgroups of runs that ended without anything removing theirs,
@@ -925,6 +948,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **A tree this Runner cannot write is a refusal to start, under either
+    /// driver** — and it was `cgroupfs` alone until 2026-09-07.
+    ///
+    /// `systemd` was exempt while the Runner made nothing there. It stopped
+    /// being exempt when the memory limit moved onto a cgroup the shim makes
+    /// inside each judged container: the mount that reaches it has the slice as
+    /// its source, so a read-only tree fails every judged run — after a start
+    /// that said nothing was wrong.
+    #[test]
+    fn a_tree_that_cannot_be_written_is_refused_under_either_driver() {
+        let blocked = std::env::temp_dir().join(format!("aj-unwritable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&blocked);
+        let _ = std::fs::remove_file(&blocked);
+        // A file where the tree should be. Every `create_dir_all` beneath it
+        // fails on every platform, and it needs neither a mount nor a uid.
+        std::fs::write(&blocked, b"not a cgroup tree").expect("a scratch file");
+
+        for driver in ["cgroupfs", "systemd"] {
+            let backend = Cgroups::choose(driver, blocked.clone(), "abc").expect("a backend");
+            let refusal = backend
+                .prepare("abc")
+                .expect_err("started on a tree it cannot write")
+                .to_string();
+
+            let home = backend.home().display().to_string();
+            assert!(refusal.contains(&home), "{driver}: {refusal}");
+            assert!(
+                refusal.contains("the shim makes inside each judged container"),
+                "{driver} does not say what the write is for: {refusal}",
+            );
+            assert!(refusal.contains("--cgroupns=host"), "{driver}: {refusal}");
+        }
+
+        let _ = std::fs::remove_file(&blocked);
+    }
+
+    /// **Preflight leaves nothing in the tree**, under either driver.
+    ///
+    /// Anything it left would be counted: by the sweep, and by CI's own *No
+    /// per-run cgroup was left behind* step. The second call is the case a
+    /// crash between the two writes leaves behind — the same Runner's next
+    /// start has to clear its own probe rather than refuse over it.
+    #[test]
+    fn preparing_proves_the_write_and_leaves_nothing_behind() {
+        for driver in ["cgroupfs", "systemd"] {
+            let root =
+                std::env::temp_dir().join(format!("aj-prepared-{driver}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("a scratch root");
+
+            let backend = Cgroups::choose(driver, root.clone(), "abc").expect("a backend");
+            backend.prepare("abc").expect("a writable tree");
+
+            let home = backend.home();
+            assert!(home.is_dir(), "{driver}: {} was not made", home.display());
+            let left: Vec<_> = std::fs::read_dir(&home)
+                .expect("the home")
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect();
+            assert!(left.is_empty(), "{driver}: preflight left {left:?}");
+
+            // A probe a crashed start left behind is this Runner's own to take
+            // away, not a reason to refuse.
+            std::fs::create_dir(home.join(probe_name("abc"))).expect("a leftover probe");
+            backend.prepare("abc").expect("a leftover probe of its own");
+            assert_eq!(std::fs::read_dir(&home).expect("the home").count(), 0);
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
     /// **A Runner stopped mid-job leaves its run's cgroup**, and clears it at
     /// the next sweep — its own, and nobody else's.
     ///
@@ -1089,6 +1184,22 @@ oom_kill 0
 
     /// One consequence, so one standard: every refusal says what it costs, and
     /// none of them still tells an operator to reconfigure the daemon.
+    /// One backend's `prepare` refusal, taken over a root that is a file — so
+    /// the write fails for a reason no host can accidentally satisfy.
+    fn prepare_refusal(driver: &str) -> String {
+        let blocked =
+            std::env::temp_dir().join(format!("aj-refusal-{driver}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&blocked);
+        std::fs::write(&blocked, b"not a cgroup tree").expect("a scratch file");
+        let refusal = Cgroups::choose(driver, blocked.clone(), "abc")
+            .expect("a backend")
+            .prepare("abc")
+            .expect_err("a refusal")
+            .to_string();
+        let _ = std::fs::remove_file(&blocked);
+        refusal
+    }
+
     #[test]
     fn every_refusal_says_what_it_costs_and_none_asks_for_a_driver() {
         let refusals = [
@@ -1102,6 +1213,16 @@ oom_kill 0
             readable_hierarchy(Path::new("/nowhere/at/all"))
                 .expect_err("a refusal")
                 .to_string(),
+            // Both drivers, because `prepare` gives them different reasons and
+            // a refusal that stopped saying what it costs would otherwise be
+            // caught in only one of them.
+            //
+            // **Over a scratch file rather than the real tree**: on a host
+            // where this suite runs as root with the hierarchy mounted, a
+            // `prepare` against `/sys/fs/cgroup` would succeed and this would
+            // assert nothing.
+            prepare_refusal("cgroupfs"),
+            prepare_refusal("systemd"),
         ];
         for refusal in refusals {
             assert!(refusal.contains("processor time"), "{refusal}");
