@@ -99,6 +99,13 @@ impl Cgroups {
         }
     }
 
+    /// Where this process sees the unified hierarchy mounted.
+    pub(crate) fn root(&self) -> &Path {
+        match self {
+            Self::Cgroupfs { root } | Self::Systemd { root, .. } => root,
+        }
+    }
+
     /// What to call this in a log, and what a test asserts it chose.
     pub fn driver(&self) -> &'static str {
         match self {
@@ -206,8 +213,7 @@ impl Cgroups {
         // life has nowhere to put the box and every later one is fine, which is
         // the worst shape a defect can have.
         std::fs::create_dir_all(parent).ok()?;
-        delegate(&self.home());
-        delegate(parent);
+        delegate_chain(self.root(), parent);
 
         match std::fs::create_dir(&at).and_then(|()| bounds.applied_to(&at)) {
             Ok(()) => Some(at),
@@ -503,6 +509,40 @@ fn write_if_present(at: &Path, value: &str) -> std::io::Result<()> {
 /// without `cpuset` would leave a run with none. Each is asked for separately
 /// and only where the cgroup says it has it; whether it took is answered by
 /// [`Bounds::applied_to`], which writes the files themselves.
+/// Hands the controllers down **every** cgroup from the tree's root to `down_to`.
+///
+/// **A cgroup can only pass on what it was passed**, so enabling `cpu` on the
+/// directory a box sits in does nothing if the directory above it never had
+/// `cpu` to give. That is not hypothetical: measured 2026-09-06 in WSL under the
+/// systemd driver, `algojudge.slice` carried `memory hugetlb pids rdma` and no
+/// `cpu` or `cpuset`, so a slice made under it inherited the same four, `+cpu`
+/// on it was refused, and the box came out with no `cpu.max` and no
+/// `cpuset.cpus` — which failed the run, because a control that cannot be
+/// applied is not a control that may be skipped.
+///
+/// A slice **systemd** made carries all of them, because the runtime asked for
+/// them when it set `--cpus` on a container. So this only ever matters for the
+/// first run of a Runner's life, which is the run that has to make the slice
+/// itself — and that is exactly the run that used to fail on every host with
+/// systemd.
+///
+/// Top down, because that is the only order in which each write can succeed.
+fn delegate_chain(root: &Path, down_to: &Path) {
+    let mut chain = vec![down_to];
+    while let Some(up) = chain.last().and_then(|at| at.parent()) {
+        if !up.starts_with(root) {
+            break;
+        }
+        chain.push(up);
+        if up == root {
+            break;
+        }
+    }
+    for dir in chain.into_iter().rev() {
+        delegate(dir);
+    }
+}
+
 fn delegate(dir: &Path) {
     let Ok(available) = std::fs::read_to_string(dir.join("cgroup.controllers")) else {
         return;
@@ -1346,6 +1386,45 @@ oom_group_kill 0
         // not on this imitation. `a_measured_run_leaves_no_cgroup_behind` is
         // where that is checked, against a cgroup.
         let _ = std::fs::remove_dir_all(&here);
+    }
+
+    /// **Top down, and every cgroup on the way.**
+    ///
+    /// A cgroup passes on only what it was passed, so enabling a controller on
+    /// the directory a box sits in does nothing if the one above never had it.
+    /// Measured 2026-09-06 in WSL under the systemd driver: `algojudge.slice`
+    /// carried no `cpu`, a slice made under it inherited none, and the box came
+    /// out with no `cpu.max` — which failed every first run of a Runner's life
+    /// on every host with systemd.
+    #[test]
+    fn every_cgroup_between_the_root_and_the_box_is_handed_the_controllers() {
+        let root = std::env::temp_dir().join(format!("aj-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let deep = root.join("algojudge.slice").join("algojudge-x.slice");
+        std::fs::create_dir_all(&deep).expect("a scratch chain");
+
+        // A real tree answers `cgroup.controllers`; `delegate` reads it to
+        // decide what to ask for, so every level has to have one.
+        for dir in [root.as_path(), &root.join("algojudge.slice"), &deep] {
+            std::fs::write(dir.join("cgroup.controllers"), "cpuset cpu memory pids").unwrap();
+            std::fs::write(dir.join("cgroup.subtree_control"), "").unwrap();
+        }
+
+        delegate_chain(&root, &deep);
+
+        for dir in [root.as_path(), &root.join("algojudge.slice"), &deep] {
+            let asked = std::fs::read_to_string(dir.join("cgroup.subtree_control")).unwrap();
+            assert_eq!(
+                asked,
+                "+cpuset",
+                "{} was not handed the controllers: a real cgroup takes one write per \
+                 controller and keeps the union, and this scratch file keeps only the last — \
+                 what matters is that every level was written to at all",
+                dir.display(),
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **Every control the container gets, the submission's own cgroup gets.**
