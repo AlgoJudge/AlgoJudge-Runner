@@ -45,11 +45,12 @@ use crate::{Error, Result};
 /// The one name this Runner puts in a host's cgroup tree, under both drivers.
 const OURS: &str = "algojudge";
 
-/// The cgroup a submission is judged in, under the run it belongs to.
-const BOX: &str = "box";
-
 /// The mount point of the unified hierarchy, where nothing says otherwise.
 const DEFAULT_ROOT: &str = "/sys/fs/cgroup";
+
+/// Where the **daemon** finds the same tree. This process may see it
+/// elsewhere; a bind mount is resolved by the daemon, so it needs this one.
+const DAEMON_ROOT: &str = "/sys/fs/cgroup";
 
 /// How this Runner measures on this host.
 ///
@@ -96,13 +97,6 @@ impl Cgroups {
                  the protocol and then fail every job it claimed. `docker info` reports the \
                  driver as CgroupDriver"
             ))),
-        }
-    }
-
-    /// Where this process sees the unified hierarchy mounted.
-    pub(crate) fn root(&self) -> &Path {
-        match self {
-            Self::Cgroupfs { root } | Self::Systemd { root, .. } => root,
         }
     }
 
@@ -153,41 +147,34 @@ impl Cgroups {
         }
     }
 
-    /// The cgroup the submission itself is judged in, in this process's view.
+    /// The directory the container's own cgroup will sit in, as the **daemon**
+    /// names it — the source of the mount the shim reaches its own cgroup
+    /// through.
     ///
-    /// **A sibling of the container's own cgroup, not a child of it**, and both
-    /// sit under what this Runner reads. So the processor time a run is charged
-    /// still comes off one file covering everything the run did, while memory
-    /// comes off a cgroup that holds the submission and nothing else — no shim,
-    /// no container start, no page cache of anything the container read.
+    /// **Not [`Self::home`], which is this process's view** and may be wherever
+    /// a `-v` put it. That the two name one tree is already assumed — `parent`
+    /// hands the daemon a path relative to its root and says nothing about
+    /// where the root is — and this is the one place the assumption has to
+    /// become an absolute path, because a bind mount is resolved by the daemon.
     ///
-    /// A child of the container's would have inherited every control instead of
-    /// copying four of them, which is the one thing to be said for it. It also
-    /// needs the cgroup found from inside the container and this process
-    /// migrated out of its own before `memory` can be handed to children at all
-    /// — cgroup v2 refuses a cgroup that has both processes and controlled
-    /// children. More shim, the same directory bound writable either way.
-    pub(crate) fn bound_at(&self, name: &str) -> PathBuf {
-        match self {
-            // The run's own directory, beside the container the daemon puts
-            // there.
-            Self::Cgroupfs { root } => root.join(OURS).join(name).join(BOX),
-            // Inside the slice, beside the container's scope. The run's name
-            // carries this Runner's prefix, so a leftover says whose it is.
-            Self::Systemd { .. } => self.home().join(name),
-        }
-    }
+    /// Created where it is missing, and under `systemd` that is the first run of
+    /// a Runner's life: the slice is systemd's to realise, but a mount needs its
+    /// source to exist before the container starts. **Nothing is put in it and
+    /// nothing depends on what it holds** — the cgroup the submission is judged
+    /// in is made by the shim, inside the container's own, which is a child of
+    /// this. Measured 2026-09-06: a directory made here keeps its inode when
+    /// the runtime then asks systemd for the slice.
+    pub(crate) fn mount_point(&self, name: &str) -> Option<String> {
+        let here = match self {
+            Self::Cgroupfs { root } => root.join(OURS).join(name),
+            Self::Systemd { .. } => self.home(),
+        };
+        std::fs::create_dir_all(&here).ok()?;
 
-    /// The same directory as the **daemon** would name it, for the bind mount.
-    pub(crate) fn bound_for_daemon(&self, name: &str) -> Option<String> {
-        let at = self.bound_at(name);
         let root = match self {
             Self::Cgroupfs { root } | Self::Systemd { root, .. } => root,
         };
-        // Joined from components rather than printed: a path prints with the
-        // separator of the machine this runs on, and the daemon's is always the
-        // one below.
-        let under: Vec<String> = at
+        let under: Vec<String> = here
             .strip_prefix(root)
             .ok()?
             .components()
@@ -196,58 +183,18 @@ impl Cgroups {
         Some(format!("{DAEMON_ROOT}/{}", under.join("/")))
     }
 
-    /// Makes that cgroup and states its limits, or answers `None`.
-    ///
-    /// `None` where none was asked for, and where one was and could not be made
-    /// — the caller tells those apart by whether it asked, and refuses the run
-    /// in the second case. **A judged run whose limits were not applied must not
-    /// be judged**: it would be a submission held to no memory limit at all,
-    /// reported as an ordinary verdict, with nothing on the screen to say so.
-    fn make_the_box(&self, name: &str, bounds: Option<&Bounds>) -> Option<PathBuf> {
-        let bounds = bounds?;
-        let at = self.bound_at(name);
-        let parent = at.parent()?;
-
-        // **systemd makes the slice when it is first asked for a container in
-        // it**, which is after this. Without this the first run of a Runner's
-        // life has nowhere to put the box and every later one is fine, which is
-        // the worst shape a defect can have.
-        std::fs::create_dir_all(parent).ok()?;
-        delegate_chain(self.root(), parent);
-
-        match std::fs::create_dir(&at).and_then(|()| bounds.applied_to(&at)) {
-            Ok(()) => Some(at),
-            Err(e) => {
-                tracing::warn!(
-                    at = %at.display(),
-                    error = %e,
-                    "could not make the cgroup a submission is judged in",
-                );
-                // Half a cgroup is worse than none: it would hold the submission
-                // under whatever limits did get written.
-                let _ = std::fs::remove_dir(&at);
-                None
-            }
-        }
-    }
-
     /// Opens a measurement for one run, and says what the daemon should be told.
     ///
     /// `None` means this run goes unmeasured, which is not an error here: the
     /// limits are the runtime's and hold either way. It is `aj-standard-io` that
     /// refuses to reach a verdict without a reading.
-    pub(crate) async fn begin(
-        &self,
-        name: &str,
-        bounds: Option<&Bounds>,
-    ) -> Option<(Measuring, String)> {
+    pub(crate) async fn begin(&self, name: &str) -> Option<(Measuring, String)> {
         let parent = self.parent(name);
         let measuring = match self {
             Self::Cgroupfs { root } => {
                 let here = root.join(OURS).join(name);
                 std::fs::create_dir(&here).ok()?;
-                let bound = self.make_the_box(name, bounds);
-                Measuring::Own { here, bound }
+                Measuring::Own { here }
             }
             Self::Systemd { gate, .. } => {
                 let gate = gate.clone().lock_owned().await;
@@ -256,13 +203,8 @@ impl Cgroups {
                 // the first run of a Runner's life finds nothing here — and is
                 // also the only run whose peak is the slice's own history.
                 let fresh = !here.is_dir();
-                // After `fresh` and before `reset_peak`: this may be what
-                // creates the slice, and a Runner's first run must not read
-                // its own creation as the slice's history.
-                let bound = self.make_the_box(name, bounds);
                 let opened = if fresh { None } else { reset_peak(&here) };
                 Measuring::Shared {
-                    bound,
                     cpu_before: usage_usec(&here).unwrap_or(0),
                     oom_before: memory_kills(&here).unwrap_or((0, 0)),
                     memory_before: opened.as_ref().map_or(0, |(_, at_reset)| *at_reset),
@@ -284,14 +226,8 @@ impl Cgroups {
     /// directory a previous Runner had left passed preflight and then failed
     /// every job it claimed.
     ///
-    /// **Under `systemd` too, and that is not what it used to be.** That backend
-    /// let systemd make the one cgroup it needed and only read it, so a readable
-    /// hierarchy was the whole requirement. A memory limit is enforced on a
-    /// cgroup made per judged run, and that one is the Runner's to make under
-    /// either backend — so a host that cannot make it would start, register, and
-    /// refuse every job it claimed, which is the failure this exists to stop.
-    /// The slice is created here where systemd has not made it yet; systemd uses
-    /// the directory it finds.
+    /// Under `systemd` the Runner creates nothing, so there is nothing left to
+    /// prove beyond a readable hierarchy, which [`Self::resolve`] proved.
     ///
     /// **Named for the Runner and not fixed**, because several of them share one
     /// host and one `algojudge` directory, and `docker compose up` starts them
@@ -300,7 +236,10 @@ impl Cgroups {
     /// `remove_dir` and refused to start blaming the host. Reproduced on the
     /// first attempt by `two_runners_preparing_at_once_do_not_collide`.
     pub(crate) fn prepare(&self, instance: &str) -> Result<()> {
-        let home = self.home();
+        let Self::Cgroupfs { root } = self else {
+            return Ok(());
+        };
+        let home = root.join(OURS);
         let probe = home.join(probe_name(instance));
         std::fs::create_dir_all(&home)
             .and_then(|()| match std::fs::create_dir(&probe) {
@@ -309,10 +248,10 @@ impl Cgroups {
             })
             .map_err(|e| {
                 Error::Refused(format!(
-                    "this Runner cannot make, limit and remove a cgroup under {}: {e}. A time \
-                     limit is decided on processor time read from cpu.stat, and a memory limit \
-                     is enforced on a cgroup this Runner makes for the submission itself — so \
-                     without them it would register and then fail every job it claimed. Mount the host's cgroup tree writable and share its namespace — \
+                    "this Runner cannot make and remove a cgroup under {}: {e}. A time limit is \
+                     decided on processor time, read from cpu.stat in a cgroup this Runner makes \
+                     for each run, so without one it would register and then fail every job it \
+                     claimed. Mount the host's cgroup tree writable and share its namespace — \
                      --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup, or in Compose `cgroup: \
                      host` on the service plus the same volume — and run the container as root, \
                      because the tree's directories are root's. It costs write permission, not a \
@@ -337,15 +276,14 @@ impl Cgroups {
     /// of them is pid 1 — so the name is the only thing that says whose a
     /// leftover is.
     ///
-    /// **Under `systemd` there is now something to sweep and there was not
-    /// before.** The slice itself is the Runner's for its whole life and is
-    /// never any one run's — but the cgroup a submission is judged in is made
-    /// per run, inside that slice, and a run cancelled where it stands leaves
-    /// one exactly as `cgroupfs` does. A scope the daemon made is not touched:
-    /// it carries the daemon's name and not this Runner's prefix.
+    /// Nothing to do under `systemd`: one slice serves every run, and it is the
+    /// Runner's for its whole life rather than any one run's.
     pub(crate) fn abandoned(&self, instance: &str) -> usize {
+        let Self::Cgroupfs { root } = self else {
+            return 0;
+        };
         let prefix = run_prefix(instance);
-        let Ok(entries) = std::fs::read_dir(self.home()) else {
+        let Ok(entries) = std::fs::read_dir(root.join(OURS)) else {
             return 0;
         };
 
@@ -355,13 +293,7 @@ impl Cgroups {
             // `rmdir` refuses a cgroup that still holds a process or a child,
             // and that refusal is the safety rather than a race to be avoided:
             // what goes is what nothing was using.
-            .filter(|entry| {
-                // The submission's own cgroup is *inside* the run's under
-                // `cgroupfs`, and `rmdir` refuses a cgroup that has a child — so
-                // a sweep that did not take it first would leave both for ever.
-                let _ = std::fs::remove_dir(entry.path().join(BOX));
-                std::fs::remove_dir(entry.path()).is_ok()
-            })
+            .filter(|entry| std::fs::remove_dir(entry.path()).is_ok())
             .count()
     }
 
@@ -369,17 +301,11 @@ impl Cgroups {
     /// `None` means it can.
     ///
     /// Only the `systemd` backend can lose it: one slice serves every run, so a
-    /// peak taken from the slice needs `memory.peak` reset — a write to a
-    /// root-owned file, and a kernel interface that arrived in **Linux 6.12**,
-    /// commit `c6f53ed8f213`.
-    ///
-    /// **A judged submission's peak does not come from there**, so it is not
-    /// what this is about: that one is read from a cgroup made for the
-    /// submission and holding it alone, which is fresh and needs no reset. What
-    /// a host like this loses is the peak of the runs that are nobody's
-    /// submission — a build, a checker, an interactor — which no screen shows.
-    /// Processor time is unaffected either way, so this is said at start rather
-    /// than refused.
+    /// per-run peak needs `memory.peak` reset — a write to a root-owned file,
+    /// and a kernel interface that arrived in **Linux 6.12**, commit
+    /// `c6f53ed8f213`. Processor time is unaffected, so this is said at start
+    /// rather than refused: every verdict still stands, and only the number
+    /// beside it is missing.
     ///
     /// **The write is attempted and not merely the open**, because an open
     /// tests a file mode rather than the interface. Before 6.12 the file is
@@ -398,159 +324,10 @@ impl Cgroups {
             .and_then(|mut file| file.write_all(b"0"));
         attempt.err().map(|e| {
             format!(
-                "{} cannot be reset: {e}. Under the systemd cgroup driver one slice serves \
-                 every run, so a peak taken from it needs memory.peak reset, which needs Linux \
-                 6.12 or later and a cgroup tree mounted writable in a container running as \
-                 root. A judged submission is unaffected: its peak is read from a cgroup made \
-                 for it alone. What is lost is the peak of builds, checkers and interactors, \
-                 which no screen shows",
+                "{} cannot be reset: {e}. Under the systemd cgroup driver one slice serves                  every run, so a per-run peak is taken by resetting memory.peak, which needs                  Linux 6.12 or later and a cgroup tree mounted writable in a container running                  as root",
                 peak.display()
             )
         })
-    }
-}
-
-/// Where the **daemon** finds the cgroup tree.
-///
-/// Not [`Cgroups::home`], which is this process's own view and may be wherever a
-/// `-v` put it. That the two name the same tree is already assumed — `parent()`
-/// hands the daemon a path relative to its root and says nothing about where the
-/// root is — and this is the one place the assumption has to become an absolute
-/// path, because a bind mount is resolved by the daemon.
-const DAEMON_ROOT: &str = "/sys/fs/cgroup";
-
-/// One period of `cpu.max`, in microseconds. The kernel's own default, and the
-/// one the runtime uses when it converts `--cpus`.
-const CPU_PERIOD_US: i64 = 100_000;
-
-/// What one submission is held to, in the cgroup that holds it and nothing else.
-///
-/// **Every field here is a control the kernel applies to a cgroup**, and the
-/// submission is in a cgroup of its own — so each has to be stated twice, once
-/// on the container and once on the submission's own. That is the whole risk of
-/// giving the submission a cgroup: a control set on the container alone stops
-/// reaching the program it was for, silently, and a fork bomb or an unpinned run
-/// looks exactly like a working one.
-///
-/// The mechanism against that is not vigilance. Both places destructure this
-/// struct **without `..`**, so a fifth control cannot be added here without the
-/// compiler stopping at each of them.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Bounds {
-    pub(crate) memory_bytes: u64,
-    pub(crate) pids: i64,
-    pub(crate) cpus: f64,
-    pub(crate) cpuset: Option<String>,
-}
-
-impl Bounds {
-    /// Everything in a profile that a cgroup enforces, and nothing else.
-    pub(crate) fn of(profile: &crate::Profile) -> Self {
-        Self {
-            memory_bytes: profile.memory_bytes,
-            pids: profile.pids,
-            cpus: profile.cpus,
-            cpuset: profile.cpuset.clone(),
-        }
-    }
-
-    /// Writes every one of them into a cgroup that already exists.
-    pub(crate) fn applied_to(&self, at: &Path) -> std::io::Result<()> {
-        let Self {
-            memory_bytes,
-            pids,
-            cpus,
-            cpuset,
-        } = self;
-
-        std::fs::write(at.join("memory.max"), memory_bytes.to_string())?;
-        // Equal to the limit, exactly as on the container and for the same
-        // reason: without it the program swaps instead of being killed. Absent
-        // is a kernel with no swap controller, where there is nothing to evade.
-        write_if_present(&at.join("memory.swap.max"), "0")?;
-        // **The cgroup dies together.** One process of a submission killed while
-        // the others carry on is a program whose answer came out of a run the
-        // kernel had already stopped; and the participant is told about the
-        // whole submission either way.
-        write_if_present(&at.join("memory.oom.group"), "1")?;
-        std::fs::write(at.join("pids.max"), pids.to_string())?;
-        std::fs::write(
-            at.join("cpu.max"),
-            format!("{} {CPU_PERIOD_US}", (cpus * CPU_PERIOD_US as f64) as i64),
-        )?;
-        if let Some(cpuset) = cpuset {
-            std::fs::write(at.join("cpuset.cpus"), cpuset)?;
-        }
-        Ok(())
-    }
-}
-
-/// Writes a control that a kernel may simply not carry, and treats its absence
-/// as nothing to do. A file that **is** there and refuses the write is an error:
-/// the difference between a control this host has not got and one it would not
-/// apply is the difference between a limit that needs no enforcing and one that
-/// silently is not.
-fn write_if_present(at: &Path, value: &str) -> std::io::Result<()> {
-    if !at.exists() {
-        return Ok(());
-    }
-    std::fs::write(at, value)
-}
-
-/// Hands a cgroup's children the controllers this Runner sets on them.
-///
-/// A child's `memory.max` does not exist until its parent's
-/// `cgroup.subtree_control` says `memory`. The runtime does this along the path
-/// it creates — but it does it when it creates the container's cgroup, which is
-/// after the submission's own has to be there.
-///
-/// **One controller per write.** A single write naming several is refused whole
-/// if any one of them is unavailable, so asking for four on a kernel built
-/// without `cpuset` would leave a run with none. Each is asked for separately
-/// and only where the cgroup says it has it; whether it took is answered by
-/// [`Bounds::applied_to`], which writes the files themselves.
-/// Hands the controllers down **every** cgroup from the tree's root to `down_to`.
-///
-/// **A cgroup can only pass on what it was passed**, so enabling `cpu` on the
-/// directory a box sits in does nothing if the directory above it never had
-/// `cpu` to give. That is not hypothetical: measured 2026-09-06 in WSL under the
-/// systemd driver, `algojudge.slice` carried `memory hugetlb pids rdma` and no
-/// `cpu` or `cpuset`, so a slice made under it inherited the same four, `+cpu`
-/// on it was refused, and the box came out with no `cpu.max` and no
-/// `cpuset.cpus` — which failed the run, because a control that cannot be
-/// applied is not a control that may be skipped.
-///
-/// A slice **systemd** made carries all of them, because the runtime asked for
-/// them when it set `--cpus` on a container. So this only ever matters for the
-/// first run of a Runner's life, which is the run that has to make the slice
-/// itself — and that is exactly the run that used to fail on every host with
-/// systemd.
-///
-/// Top down, because that is the only order in which each write can succeed.
-fn delegate_chain(root: &Path, down_to: &Path) {
-    let mut chain = vec![down_to];
-    while let Some(up) = chain.last().and_then(|at| at.parent()) {
-        if !up.starts_with(root) {
-            break;
-        }
-        chain.push(up);
-        if up == root {
-            break;
-        }
-    }
-    for dir in chain.into_iter().rev() {
-        delegate(dir);
-    }
-}
-
-fn delegate(dir: &Path) {
-    let Ok(available) = std::fs::read_to_string(dir.join("cgroup.controllers")) else {
-        return;
-    };
-    for controller in ["memory", "pids", "cpu", "cpuset"] {
-        if available.split_whitespace().any(|it| it == controller) {
-            let _ = std::fs::write(dir.join("cgroup.subtree_control"), format!("+{controller}"));
-        }
     }
 }
 
@@ -587,63 +364,15 @@ pub(crate) struct Reading {
     pub(crate) over_limit: u64,
 }
 
-impl Reading {
-    /// The memory half taken from the submission's own cgroup where there is
-    /// one, and the processor time kept.
-    ///
-    /// **The two quantities are read from two different cgroups, deliberately.**
-    /// Memory is the submission's own, because a container's floor and the page
-    /// cache of everything it read are not the program's doing and a limit is
-    /// compared against this. Processor time stays the whole run's: that is what
-    /// the reaping deadline watches for progress and what a shim's report is
-    /// disbelieved against, and the shim's own time is microseconds either way.
-    fn about_the_submission(self, submission: Option<Reading>) -> Reading {
-        match submission {
-            None => self,
-            Some(its_own) => Reading {
-                cpu_time: self.cpu_time,
-                ..its_own
-            },
-        }
-    }
-}
-
-/// What the submission's own cgroup held, taking it away as it reads it.
-///
-/// Removed here and before the run's own directory it sits in: `rmdir` refuses
-/// a cgroup that still has a child, so a finish that took the outer one first
-/// would leave both behind for the sweep.
-fn took_the_submissions_own(bound: Option<PathBuf>) -> Option<Reading> {
-    let at = bound?;
-    let peak = read_number(&at.join("memory.peak"));
-    let (oom_kills, over_limit) = memory_kills(&at).unwrap_or((0, 0));
-    let _ = std::fs::remove_dir(&at);
-    Some(Reading {
-        peak_memory_bytes: peak,
-        cpu_time: None,
-        oom_kills,
-        over_limit,
-    })
-}
-
 /// One run's measurement, held from before its container starts until after it
 /// is gone.
 pub(crate) enum Measuring {
     /// A directory of this run's own: read it, then take it away.
-    Own {
-        here: PathBuf,
-        /// The submission's own cgroup, inside this one - see
-        /// [`Cgroups::bound_at`]. `None` for every run that is not a judged
-        /// submission, and for a host that could not make one.
-        bound: Option<PathBuf>,
-    },
+    Own { here: PathBuf },
     /// A slice shared by every run of this Runner: what changed in it while
     /// this run was the only thing there.
     Shared {
         here: PathBuf,
-        /// The submission's own cgroup, beside its container - see
-        /// [`Cgroups::bound_at`].
-        bound: Option<PathBuf>,
         cpu_before: u64,
         /// What the slice had already seen, both counters. Cumulative like
         /// `cpu_before`, and for the same reason: one slice serves every run.
@@ -671,17 +400,6 @@ pub(crate) enum Measuring {
 }
 
 impl Measuring {
-    /// Whether the submission was given a cgroup of its own.
-    ///
-    /// The caller asked for one or it did not, and this says whether it got it.
-    /// A judged run that asked and did not get one is refused rather than judged
-    /// under limits that were never applied.
-    pub(crate) fn bounded(&self) -> bool {
-        match self {
-            Self::Own { bound, .. } | Self::Shared { bound, .. } => bound.is_some(),
-        }
-    }
-
     /// Processor time so far, **without ending the measurement**.
     ///
     /// The same arithmetic as [`Self::finish`] does for processor time, and it
@@ -691,7 +409,7 @@ impl Measuring {
     /// is simply read again.
     pub(crate) fn so_far(&self) -> Option<Duration> {
         match self {
-            Self::Own { here, .. } => usage_usec(here).map(Duration::from_micros),
+            Self::Own { here } => usage_usec(here).map(Duration::from_micros),
             Self::Shared {
                 here, cpu_before, ..
             } => usage_usec(here)
@@ -725,7 +443,7 @@ impl Measuring {
     /// before this existed: an absent instrument may not change a verdict.
     pub(crate) fn stalled(&self) -> Option<Duration> {
         let here = match self {
-            Self::Own { here, .. } => here,
+            Self::Own { here } => here,
             Self::Shared { here, .. } => here,
         };
         stalled_usec(here).map(Duration::from_micros)
@@ -738,12 +456,11 @@ impl Measuring {
     /// whether or not this succeeds.
     pub(crate) fn finish(self) -> Reading {
         match self {
-            Self::Own { here, bound } => {
+            Self::Own { here } => {
                 let peak = read_number(&here.join("memory.peak"));
                 let cpu = usage_usec(&here).map(Duration::from_micros);
                 // A directory of this run's own, so the counts are this run's.
                 let (oom_kills, over_limit) = memory_kills(&here).unwrap_or((0, 0));
-                let submission = took_the_submissions_own(bound);
                 // Read before the directory goes, and removed here rather than
                 // left: the child's own cgroup is taken away with its container,
                 // and this one is nobody else's to collect.
@@ -754,11 +471,9 @@ impl Measuring {
                     oom_kills,
                     over_limit,
                 }
-                .about_the_submission(submission)
             }
             Self::Shared {
                 here,
-                bound,
                 cpu_before,
                 oom_before,
                 memory_before,
@@ -787,7 +502,6 @@ impl Measuring {
                     oom_kills: kills.saturating_sub(oom_before.0),
                     over_limit: limits.saturating_sub(oom_before.1),
                 }
-                .about_the_submission(took_the_submissions_own(bound))
             }
         }
     }
@@ -1184,7 +898,7 @@ mod tests {
     /// at the same moment.
     #[test]
     fn two_runners_preparing_at_once_do_not_collide() {
-        let root = std::env::temp_dir().join(format!("aj-prepare-systemd-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("aj-prepare-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("a scratch root");
 
@@ -1208,48 +922,6 @@ mod tests {
                 );
             }
         }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// **`systemd` proves what `cgroupfs` proves**, and until a memory limit was
-    /// enforced on a cgroup of the submission's own it had nothing to prove: it
-    /// let systemd make its one slice and only read it. That cgroup is this
-    /// Runner's to make under either backend, so a host that cannot make one
-    /// would start, register, and then refuse every job it claimed — which is
-    /// the failure `prepare` exists to turn into a refusal at start.
-    #[test]
-    fn a_systemd_host_that_cannot_be_written_to_is_refused_at_start() {
-        let root = std::env::temp_dir().join(format!("aj-prepare-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("a scratch root");
-
-        let backend = |root: &PathBuf| Cgroups::Systemd {
-            root: root.clone(),
-            slice: "algojudge-ours.slice".to_owned(),
-            gate: Arc::new(tokio::sync::Mutex::new(())),
-        };
-
-        // Writable: it makes what it needs, and leaves none of it behind.
-        backend(&root).prepare("ours").expect("a writable tree");
-        assert!(
-            !root
-                .join("algojudge.slice/algojudge-ours.slice")
-                .join(probe_name("ours"))
-                .exists(),
-            "the probe was left in the tree",
-        );
-
-        // A file where the hierarchy should be, which is what a tree this Runner
-        // cannot write into looks like from here.
-        let _ = std::fs::remove_dir_all(root.join("algojudge.slice"));
-        std::fs::write(root.join("algojudge.slice"), "not a directory").unwrap();
-        let refusal = backend(&root)
-            .prepare("ours")
-            .expect_err("a refusal")
-            .to_string();
-        assert!(refusal.contains("memory limit"), "{refusal}");
-        assert!(refusal.contains("processor time"), "{refusal}");
-
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1278,21 +950,12 @@ mod tests {
         for made in [&ours, &neighbour, &probe] {
             std::fs::create_dir(made).expect("a scratch run");
         }
-        // **The submission's own cgroup is inside the run's**, and `rmdir`
-        // refuses a directory that has one. A sweep that did not take it first
-        // would report a number and leave everything where it was.
-        let inner = ours.join(BOX);
-        std::fs::create_dir(&inner).expect("a scratch box");
 
         let backend = Cgroups::Cgroupfs { root: root.clone() };
         assert_eq!(backend.abandoned("ours"), 1);
         assert!(!ours.is_dir(), "the abandoned run was left behind");
         assert!(neighbour.is_dir(), "another Runner's run was swept");
         assert!(probe.is_dir(), "a start-up probe was swept");
-        assert!(
-            !inner.is_dir(),
-            "the cgroup the submission was judged in stayed"
-        );
 
         // And nothing is left to find on the second pass, so a sweep at every
         // start and every stop stays quiet rather than reporting a number.
@@ -1301,36 +964,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// **The `systemd` backend has one thing per run to sweep and exactly one.**
-    /// Its slice is the Runner's for its whole life and removing it would take
-    /// the measurement away from the run in it -- but the cgroup a submission is
-    /// judged in is made per run inside that slice, and a Runner stopped mid-job
-    /// leaves one there just as it does under `cgroupfs`.
+    /// **The `systemd` backend has nothing per run to sweep**, and must not go
+    /// looking: its one slice is the Runner's for its whole life, and removing
+    /// it would take the measurement away from the run in it.
     #[test]
-    fn a_systemd_backend_sweeps_the_boxes_and_nothing_else() {
+    fn a_systemd_backend_sweeps_nothing() {
         let root = std::env::temp_dir().join(format!("aj-abandoned-slice-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let slice = root.join("algojudge.slice").join("algojudge-ours.slice");
         std::fs::create_dir_all(&slice).expect("a scratch slice");
-
-        // A run cancelled where it stood, a neighbour's, and the daemon's own
-        // container. Only the first is this Runner's to take away.
-        let ours = slice.join(format!("{}dead", run_prefix("ours")));
-        let neighbour = slice.join(format!("{}live", run_prefix("theirs")));
-        let scope = slice.join("docker-0123456789ab.scope");
-        for made in [&ours, &neighbour, &scope] {
-            std::fs::create_dir(made).expect("a scratch cgroup");
-        }
 
         let backend = Cgroups::Systemd {
             root: root.clone(),
             slice: "algojudge-ours.slice".to_owned(),
             gate: Arc::new(tokio::sync::Mutex::new(())),
         };
-        assert_eq!(backend.abandoned("ours"), 1);
-        assert!(!ours.is_dir(), "the abandoned box was left behind");
-        assert!(neighbour.is_dir(), "another Runner's box was swept");
-        assert!(scope.is_dir(), "a container the daemon made was swept");
+        assert_eq!(backend.abandoned("ours"), 0);
         assert!(slice.is_dir(), "the Runner's own slice was removed");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1368,11 +1017,7 @@ oom_group_kill 0
         )
         .unwrap();
 
-        let reading = Measuring::Own {
-            here: here.clone(),
-            bound: None,
-        }
-        .finish();
+        let reading = Measuring::Own { here: here.clone() }.finish();
         assert_eq!(reading.oom_kills, 2);
         assert_eq!(
             reading.over_limit, 1,
@@ -1386,169 +1031,6 @@ oom_group_kill 0
         // not on this imitation. `a_measured_run_leaves_no_cgroup_behind` is
         // where that is checked, against a cgroup.
         let _ = std::fs::remove_dir_all(&here);
-    }
-
-    /// **Top down, and every cgroup on the way.**
-    ///
-    /// A cgroup passes on only what it was passed, so enabling a controller on
-    /// the directory a box sits in does nothing if the one above never had it.
-    /// Measured 2026-09-06 in WSL under the systemd driver: `algojudge.slice`
-    /// carried no `cpu`, a slice made under it inherited none, and the box came
-    /// out with no `cpu.max` — which failed every first run of a Runner's life
-    /// on every host with systemd.
-    #[test]
-    fn every_cgroup_between_the_root_and_the_box_is_handed_the_controllers() {
-        let root = std::env::temp_dir().join(format!("aj-chain-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let deep = root.join("algojudge.slice").join("algojudge-x.slice");
-        std::fs::create_dir_all(&deep).expect("a scratch chain");
-
-        // A real tree answers `cgroup.controllers`; `delegate` reads it to
-        // decide what to ask for, so every level has to have one.
-        for dir in [root.as_path(), &root.join("algojudge.slice"), &deep] {
-            std::fs::write(dir.join("cgroup.controllers"), "cpuset cpu memory pids").unwrap();
-            std::fs::write(dir.join("cgroup.subtree_control"), "").unwrap();
-        }
-
-        delegate_chain(&root, &deep);
-
-        for dir in [root.as_path(), &root.join("algojudge.slice"), &deep] {
-            let asked = std::fs::read_to_string(dir.join("cgroup.subtree_control")).unwrap();
-            assert_eq!(
-                asked,
-                "+cpuset",
-                "{} was not handed the controllers: a real cgroup takes one write per \
-                 controller and keeps the union, and this scratch file keeps only the last — \
-                 what matters is that every level was written to at all",
-                dir.display(),
-            );
-        }
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// **Every control the container gets, the submission's own cgroup gets.**
-    ///
-    /// [`Bounds`] is destructured without `..` in both places that apply it, so
-    /// a fifth control cannot be added without the compiler stopping at each —
-    /// but nothing in that says the values arrive. This says it.
-    #[test]
-    fn every_bound_reaches_the_cgroup_the_submission_is_judged_in() {
-        let at = std::env::temp_dir().join(format!("aj-bounds-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&at);
-        std::fs::create_dir_all(&at).expect("a scratch cgroup");
-        // The kernel makes these files; a scratch directory has to be given them.
-        for file in [
-            "memory.max",
-            "memory.swap.max",
-            "memory.oom.group",
-            "pids.max",
-            "cpu.max",
-            "cpuset.cpus",
-        ] {
-            std::fs::write(at.join(file), "unset").unwrap();
-        }
-
-        let bounds = Bounds {
-            memory_bytes: 2 * 1024 * 1024,
-            pids: 16,
-            cpus: 1.0,
-            cpuset: Some("3".to_owned()),
-        };
-        bounds.applied_to(&at).expect("the controls");
-
-        let said = |file: &str| std::fs::read_to_string(at.join(file)).unwrap();
-        // Two mebibytes, which is a third of what the container runtime accepts
-        // as its own smallest limit — and the whole point of the cgroup being
-        // the submission's rather than the container's.
-        assert_eq!(said("memory.max"), "2097152");
-        assert_eq!(
-            said("memory.swap.max"),
-            "0",
-            "a limit that can be swapped past"
-        );
-        assert_eq!(said("memory.oom.group"), "1");
-        assert_eq!(said("pids.max"), "16", "a fork bomb would hit nothing");
-        assert_eq!(said("cpu.max"), "100000 100000");
-        assert_eq!(said("cpuset.cpus"), "3", "the run would not be pinned");
-
-        // **A kernel that carries neither is not a failure to apply them.**
-        // Without a swap controller there is nothing to swap past, and without
-        // `memory.oom.group` the kernel kills one process instead of all of
-        // them. A control this host has not got and one it would not apply are
-        // different things, and only the second is an error.
-        for file in ["memory.swap.max", "memory.oom.group"] {
-            std::fs::remove_file(at.join(file)).unwrap();
-        }
-        bounds
-            .applied_to(&at)
-            .expect("the controls, on a plainer kernel");
-
-        let _ = std::fs::remove_dir_all(&at);
-    }
-
-    /// Memory comes off the cgroup that held the submission, processor time off
-    /// the one that held the whole run, and both directories go.
-    #[test]
-    fn a_bounded_run_reports_the_submissions_memory_and_the_runs_time() {
-        let here = std::env::temp_dir().join(format!("aj-bounded-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&here);
-        let bound = here.join(BOX);
-        std::fs::create_dir_all(&bound).expect("a scratch pair");
-
-        let events = |oom: u64, kills: u64| {
-            format!("low 0\nhigh 0\nmax 3\noom {oom}\noom_kill {kills}\noom_group_kill 0\n")
-        };
-        // The run's own: the container's floor and the page cache of everything
-        // it read, and a kill count of nobody.
-        std::fs::write(here.join("memory.peak"), "98765432\n").unwrap();
-        std::fs::write(here.join("memory.events"), events(0, 0)).unwrap();
-        std::fs::write(here.join("cpu.stat"), "usage_usec 4056\n").unwrap();
-        // The submission's own.
-        std::fs::write(bound.join("memory.peak"), "2097152\n").unwrap();
-        std::fs::write(bound.join("memory.events"), events(1, 2)).unwrap();
-
-        let reading = Measuring::Own {
-            here: here.clone(),
-            bound: Some(bound.clone()),
-        }
-        .finish();
-
-        assert_eq!(
-            reading.peak_memory_bytes,
-            Some(2_097_152),
-            "the container's own peak was reported as the program's",
-        );
-        assert_eq!((reading.oom_kills, reading.over_limit), (2, 1));
-        assert_eq!(
-            reading.cpu_time,
-            Some(Duration::from_micros(4056)),
-            "processor time is the whole run's on purpose",
-        );
-        // Not asserted here, and for the reason the case above it gives: a
-        // cgroup's files are not directory entries, so `rmdir` works on a real
-        // one and refuses this one. That both directories go, and that the
-        // inner one goes first, is proved against a real tree in
-        // `adversarial.rs::a_measured_run_leaves_no_cgroup_behind`.
-        let _ = std::fs::remove_dir_all(&here);
-    }
-
-    /// The daemon resolves the bind mount, and it does not share this process's
-    /// view of where the tree is.
-    #[test]
-    fn the_daemon_is_told_an_absolute_path_under_its_own_root() {
-        let elsewhere = PathBuf::from("/mnt/somebody-elses-mount");
-        let cgroupfs = Cgroups::Cgroupfs {
-            root: elsewhere.clone(),
-        };
-        assert_eq!(
-            cgroupfs.bound_for_daemon("aj-run-ours-7").as_deref(),
-            Some("/sys/fs/cgroup/algojudge/aj-run-ours-7/box"),
-        );
-        assert!(
-            cgroupfs.bound_at("aj-run-ours-7").starts_with(&elsewhere),
-            "this process reads it where this process can see it",
-        );
     }
 
     #[test]
