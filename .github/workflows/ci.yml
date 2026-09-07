@@ -272,7 +272,7 @@ jobs:
 
       # Built, not pushed — a choice rather than a gap. Building is what catches
       # a Dockerfile that stopped matching the workspace, and `release.yml`
-      # publishes this image and both language images to `ghcr.io/algojudge`
-      # when somebody pushes a `v*` tag.
+      # publishes this image and the four language images to
+      # `ghcr.io/algojudge` when somebody pushes a `v*` tag.
       - name: Build the container image
         run: docker build -t algojudge-runner:ci .

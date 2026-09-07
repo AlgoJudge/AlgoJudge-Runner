@@ -6,6 +6,19 @@ courses, with automatic evaluation of submitted solutions.
 This is the component that does the evaluating: isolated execution and marking,
 for [AlgoJudge](https://github.com/AlgoJudge).
 
+## Documentation
+
+**[docs.algojudge.pl](https://docs.algojudge.pl/en/runner/)** is written for
+somebody who does not have this source open. This README is the other half:
+what the repository is, and how to build, run and change it.
+
+| | |
+|---|---|
+| [`/en/runner/`](https://docs.algojudge.pl/en/runner/) | what a Runner is, isolation and limits, the four languages, problem types, routing by tags, and every configuration key |
+| [`/en/protocol/`](https://docs.algojudge.pl/en/protocol/) | the contract this Runner and the Server share, written for a reader rather than as a specification |
+
+Both are English. Polish covers `/client/` and `/install/`.
+
 ## What it does
 
 **It judges.** This Runner registers, is approved, authenticates, claims jobs,
@@ -27,11 +40,11 @@ The Runner is the component that actually runs untrusted code. It is
 deliberately interchangeable: the Server must never depend on any particular
 Runner implementation, and several may coexist.
 
-The Server–Runner contract is at **v1.1**, amended three times. **Ten
+The Server–Runner contract is at **v1.1**, amended seven times. **Thirty
 conformance cases hold the Server to it**, in
 `AlgoJudge.Server.Tests/RunnerConformanceTests.cs`; the protocol is written up
-for a reader in [AlgoJudge-Docs](https://github.com/AlgoJudge/AlgoJudge-Docs),
-under `/protocol/`.
+for a reader at
+[`/en/protocol/`](https://docs.algojudge.pl/en/protocol/).
 
 Three properties of it shape everything here:
 
@@ -53,19 +66,19 @@ Pushing a `v*` tag publishes **five images under one version**, to GitHub's
 container registry:
 
 ```bash
-docker pull ghcr.io/algojudge/algojudge-runner:1.2.3
-docker pull ghcr.io/algojudge/lang-gcc:1.2.3
-docker pull ghcr.io/algojudge/lang-clang:1.2.3
-docker pull ghcr.io/algojudge/lang-python:1.2.3
-docker pull ghcr.io/algojudge/lang-pypy:1.2.3
+docker pull ghcr.io/algojudge/algojudge-runner:0.1.0
+docker pull ghcr.io/algojudge/lang-gcc:0.1.0
+docker pull ghcr.io/algojudge/lang-clang:0.1.0
+docker pull ghcr.io/algojudge/lang-python:0.1.0
+docker pull ghcr.io/algojudge/lang-pypy:0.1.0
 ```
 
 **All five, because a Runner without the language images judges nothing**, and
 because a release is tested as one set: the images and the binary are built,
 checked and pushed together, or not at all.
 
-`1.2.3`, `1.2`, `1` and `latest` point at the same image; **a prerelease
-(`v1.2.3-rc.1`) publishes only its own tag**, so nothing moving ever points at a
+`0.1.0`, `0.1`, `0` and `latest` point at the same image; **a prerelease
+(`v0.1.0-rc.1`) publishes only its own tag**, so nothing moving ever points at a
 release candidate.
 
 The Runner is `linux/amd64` only. That is not an oversight: cgroup v2 on amd64 is
@@ -76,10 +89,10 @@ A deployment names the language images explicitly, because the built-in defaults
 (`algojudge/lang-gcc:local`) are what the development stack builds locally:
 
 ```sh
-AJ_Sandbox__Image__Gcc=ghcr.io/algojudge/lang-gcc:1.2.3
-AJ_Sandbox__Image__Clang=ghcr.io/algojudge/lang-clang:1.2.3
-AJ_Sandbox__Image__Python=ghcr.io/algojudge/lang-python:1.2.3
-AJ_Sandbox__Image__Pypy=ghcr.io/algojudge/lang-pypy:1.2.3
+AJ_Sandbox__Image__Gcc=ghcr.io/algojudge/lang-gcc:0.1.0
+AJ_Sandbox__Image__Clang=ghcr.io/algojudge/lang-clang:0.1.0
+AJ_Sandbox__Image__Python=ghcr.io/algojudge/lang-python:0.1.0
+AJ_Sandbox__Image__Pypy=ghcr.io/algojudge/lang-pypy:0.1.0
 ```
 
 Each is independent: anything left unset keeps its compiled-in default, so an
@@ -186,8 +199,8 @@ gate.
   have to agree on
 - [AlgoJudge-Ops](https://github.com/AlgoJudge/AlgoJudge-Ops) — the production
   Compose stack, which is what runs this image at an installation
-- [AlgoJudge-Docs](https://github.com/AlgoJudge/AlgoJudge-Docs) — the public
-  documentation site, whose `/runner/` and `/protocol/` sections describe this
+- [AlgoJudge-Docs](https://github.com/AlgoJudge/AlgoJudge-Docs) — the source of
+  the documentation site linked under *Documentation* above
 
 ## Contributing
 

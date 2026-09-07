@@ -417,7 +417,9 @@ impl Config {
 
         if self.checker.is_some() && self.interactor.is_some() {
             return Err(Error::invalid(
-                "a package declares a checker or an interactor, never both: they                  decide the same question and nothing here says which of them judges",
+                "a package declares a checker or an interactor, never both: they \
+                 decide the same question and nothing here says which of \
+                 them judges",
             ));
         }
 

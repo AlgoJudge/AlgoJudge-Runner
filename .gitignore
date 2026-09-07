@@ -13,8 +13,10 @@
 # Throwaway directories from diagnosing a container by hand.
 /.probe/
 
-# Job scratch for the development stack.
+# Job scratch for the development stack. The second belongs to the second
+# Runner in `example-shared-cache-overlay.yaml`.
 /.runner-work/
+/.runner-work-2/
 
 # Compose reads this for variable substitution beside the development stack,
 # and it holds the Server admin token. Never committed.

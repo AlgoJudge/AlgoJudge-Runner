@@ -4,11 +4,10 @@
 > hard, and how to tell whether a machine satisfies it before it is asked to
 > mark anybody's work.
 >
-> Measured 2026-08-09 on the development host described in
-> `../../docs/DEVELOPMENT_HOST.md`, and again on 2026-09-03 for §5, where a
-> second measurement backend arrived and the numbers behind it are dated in
-> place. `docs/SECURITY.md` §5 states the security side of the same requirement;
-> this document is the operational one.
+> Measured 2026-08-09 on one development host, and again on 2026-09-03 for §5,
+> where a second measurement backend arrived and the numbers behind it are dated
+> in place. `docs/SECURITY.md` §5 states the security side of the same
+> requirement; this document is the operational one.
 
 ---
 

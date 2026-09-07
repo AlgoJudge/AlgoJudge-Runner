@@ -9,10 +9,6 @@ members = [
     "crates/aj-sandbox",
 ]
 
-# `aj-standard-io` — the handler that ties a package to a sandbox — arrives
-# next. Creating it empty now would add a crate that compiles to nothing and a
-# name in every dependency graph, to no end.
-
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
@@ -30,7 +26,7 @@ libc = "0.2"
 # claiming a version here would be a second source that drifts from the first.
 anyhow = "1.0"
 async-trait = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 # The container layer. Speaks to Docker and to Podman, which keeps the
 # evaluation host's runtime a deployment choice rather than a code one.
 bollard = "0.19"
@@ -55,7 +51,7 @@ serde_json = "1.0"
 # participant — semi-trusted, not untrusted — but an unmaintained parser on any
 # input path is a liability worth avoiding.
 serde_yaml_ng = "0.10"
-sha2 = "0.10"
+sha2 = "0.11"
 # Reading what a build container produced, which arrives as a tar stream from
 # the runtime API rather than through a writable bind mount.
 tar = "0.4"
@@ -63,7 +59,7 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [profile.release]
 # The artefact is a static binary in a scratch image; size is worth the link

@@ -34,10 +34,10 @@
 #     time. See `language.rs`, which carries the whole of that.
 #   - **glibc's static linking has a known caveat**: `getaddrinfo` and
 #     `gethostbyname` do not work in a fully static binary, and the linker warns
-#     about it on every build. Harmless here — network access is disabled for
-#     judged code by default (`.claude/rules/runner.md`) — and written down so it
-#     is an accepted trade rather than a warning somebody later mistakes for a
-#     broken image.
+#     about it on every build. Harmless here — a judged container is created
+#     with `network_mode: none` (`crates/aj-sandbox/src/docker.rs`) — and written
+#     down so it is an accepted trade rather than a warning somebody later
+#     mistakes for a broken image.
 
 # ── the measuring shim ──────────────────────────────────────────────────────
 #
