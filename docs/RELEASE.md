@@ -93,12 +93,31 @@ running it.
   Record what the release actually shipped:
   `docker run --rm <image> cat /etc/algojudge-toolchain` prints it.
 
+### Every image this repository pins, and how each one moves
+
+Eleven `FROM` and `image:` lines, five distinct images, in seven files. The
+checklist below asks whether a newer one exists; this table says where to look
+and what the answer is worth.
+
+| | where | how it moves |
+|---|---|---|
+| `rust@sha256:3b2879…` | `Dockerfile`, `Dockerfile.toolchain`, `ci.yml` | **digest, three places** — and `AlgoJudge-External-Runner` pins the same one in two more. Five copies of one decision |
+| `gcr.io/distroless/static-debian12:nonroot` | `Dockerfile` | a tag, and **the base of the image this repository publishes**. Debian **12**, while the language images are Debian 13 — the binary is static, so this is a choice rather than a mismatch, and it is a choice nobody has written down |
+| `debian:trixie-slim` | four language `Dockerfile`s, six lines | a tag. The shim stage of all four, and the runtime of gcc and clang |
+| `python:3-slim`, `pypy:3-slim` | one each | tags, and **which interpreter a submission meets** |
+| `postgres:18` | `example-runner-development-docker-compose.yaml` | a tag, major pinned on purpose — development only, nothing published depends on it |
+
+**A newer base is not automatically a better one here.** The four language
+images decide what a submission is compiled and run by, and a problem author's
+limits were measured against one compiler. Raising them is a decision with a
+date, taken between releases rather than inside one.
+
 ## The dependencies
 
 Both figures below are from 2026-09-07 and both go stale.
 
-- **No advisory against anything in `Cargo.lock`.** `cargo audit` 0.22.2 scanned
-  252 crate dependencies against 1239 advisories and found none. One warning:
+- **No advisory against anything in `Cargo.lock`.** `cargo audit` scanned 252
+  crate dependencies against 1242 advisories and found none. One warning:
   **`chacha20` 0.10.1 is yanked**, reached through `rand` 0.10.2.
 - **`cargo audit` is not in the toolchain image.** Install it into the `./x`
   cargo volume first: `./x install cargo-audit --locked`, then `./x audit`.
@@ -130,8 +149,10 @@ a green run is trusted:
   which is described where it is used rather than offered to be typed.
 
 Read by hand on 2026-09-07 against `config.rs` and `cgroups.rs`: every default
-the file states matches the source. The one defect the check cannot see is under
-*Corrections* below.
+the file states matches the source. **Read the prose too**, and read where each
+block sits: a section that drifts below the file's closing *Do not set these*
+is invisible to a check that compares key sets, and so is a sentence that has
+lost a word.
 
 ## Before the tag
 
@@ -159,6 +180,12 @@ pinned toolchain. Rust is not a prerequisite; `./x` runs cargo in a container.
 - [ ] The Rust base digest in `Dockerfile` and `Dockerfile.toolchain` is the one
       intended, and **the same digest the external Runner pins**. Two Rust images
       a month apart is two compilers nobody chose.
+- [ ] **Every image in the table above has been looked at**, and what is behind
+      is behind for a reason somebody wrote down. `grep -rn '^FROM ' Dockerfile*
+      images/*/Dockerfile` and `grep -rn 'image:' example-*.yaml
+      .github/workflows/*.yml` list them; a digest says what it is and never
+      what it is behind, so this is a question to ask the registry rather than
+      the file. Record the answer and the date, whether or not anything moves.
 - [ ] `.env.example` is the only `.env*` in the repository. `git ls-files` and
       the working tree both said so on 2026-09-07; `.gitignore` ignores `/.env`
       and `/.env.*` and re-admits the example alone, a pattern that has swallowed
@@ -202,31 +229,6 @@ suite is the other half: the wire protocol, against a real Server.
       its `integration` and `adversarial` jobs, and the step that runs each
       toolchain — `g++`, `gcc`, `clang`, `python3`, `pypy3` — is in
       `release.yml`, where it gates the push on the tag and nothing earlier.
-
-### Corrections this release is waiting on
-
-Each is a claim the tag would publish as it stands, found on 2026-09-07. None is
-a defect in what the Runner does.
-
-- [ ] `Cargo.toml:12` — the comment says `aj-standard-io` "arrives next". It is
-      a workspace member at line 8.
-- [ ] `.github/workflows/release.yml:10` and `:85` — "Three images, one version"
-      and "Build all three". It builds and pushes five.
-- [ ] `.github/workflows/ci.yml:275` — "publishes this image and both language
-      images". There are four language images.
-- [ ] `README.md:43`, and `CLAUDE.md:41` and `:53` — the contract is described as
-      amended three times, with **ten** conformance cases. Its own header in
-      `AlgoJudge-Design/specifications/server-runner/SERVER_RUNNER_API.md`
-      records **seven** amendments, and
-      `AlgoJudge.Server.Tests/RunnerConformanceTests.cs` holds **thirty** test
-      methods.
-- [ ] `images/gcc/Dockerfile:38` cites `.claude/rules/runner.md`, and
-      `docs/CGROUP_V2.md:8` cites `../../docs/DEVELOPMENT_HOST.md`. Neither is in
-      this repository, and the second is in a private one.
-- [ ] `.env.example:218` — the `AJ_Pipes__*` block sits *after* the closing *Do
-      not set these* section, and its prose has lost words: "Where a judged run
-      channels are made", "A judged run output travels", "the job own scratch".
-      The key-set check sees none of that.
 
 ## After the tag
 
