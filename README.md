@@ -40,7 +40,7 @@ The Runner is the component that actually runs untrusted code. It is
 deliberately interchangeable: the Server must never depend on any particular
 Runner implementation, and several may coexist.
 
-The Server–Runner contract is at **v1.1**, amended three times. **Ten
+The Server–Runner contract is at **v1.1**, amended seven times. **Thirty
 conformance cases hold the Server to it**, in
 `AlgoJudge.Server.Tests/RunnerConformanceTests.cs`; the protocol is written up
 for a reader at

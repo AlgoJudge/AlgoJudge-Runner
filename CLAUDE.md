@@ -37,9 +37,11 @@ A Runner:
 ## The contract is accepted, and it is not here
 
 `AlgoJudge-Design/specifications/server-runner/SERVER_RUNNER_API.md`, **v1.1**,
-**`Accepted` 2026-08-08; amended 2026-08-09 with §9, unavailability; amended
-2026-08-22, §5 and §6; amended 2026-08-24, §3 and §5, Runner tags.** It is the
-contract; where this repository and that document disagree, **the document wins
+**`Accepted` 2026-08-08, and amended seven times since: 2026-08-09, §9,
+unavailability; 2026-08-22, §5 and §6; 2026-08-24, §3 and §5, Runner tags; and
+four on 2026-09-04 — §5 and §11, releasing a job; §5, §10 and §11, waiting for
+work; §3 and §5, proving a key and one Runner per submission; §5 and §7, what a
+refusal tells a Runner.** It is the contract; where this repository and that document disagree, **the document wins
 and the difference is reported** rather than worked around. Read its amendment
 tables before the body: an amended section still states its pre-amendment form.
 
@@ -50,9 +52,11 @@ tables before the body: an amended section still states its pre-amendment form.
 > the document's own header on 2026-08-30.
 
 Its conformance suite is `AlgoJudge.Server.Tests/RunnerConformanceTests.cs` in
-AlgoJudge-Server — **ten cases** a second implementation must also pass. The
-tenth arrived on 2026-08-16, when a second implementation found the defect it
-was written for: a Runner marking out of one was read as a hundredth.
+AlgoJudge-Server — **thirty cases** a second implementation must also pass,
+counted 2026-09-07. The tenth arrived on 2026-08-16, when a second
+implementation found the defect it was written for: a Runner marking out of one
+was read as a hundredth; the four amendments of 2026-09-04 brought most of the
+rest.
 
 Three things it **deliberately does not specify**, so nobody adds them back by
 accident:

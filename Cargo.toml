@@ -9,10 +9,6 @@ members = [
     "crates/aj-sandbox",
 ]
 
-# `aj-standard-io` — the handler that ties a package to a sandbox — arrives
-# next. Creating it empty now would add a crate that compiles to nothing and a
-# name in every dependency graph, to no end.
-
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

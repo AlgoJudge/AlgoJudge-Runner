@@ -7,7 +7,7 @@ name: Release
 # `v1.2.3-rc.1`. The `v*` filter is what enforces the prefix — the arithmetic
 # below only strips it.
 #
-# **Three images, one version.** A Runner without the language images judges
+# **Five images, one version.** A Runner without the language images judges
 # nothing, and the compiler version is a capability it *reports* — so the
 # toolchain that shipped with a Runner is the toolchain that carries its version
 # number. They are pushed together or not at all.
@@ -82,7 +82,7 @@ jobs:
       # `image.source` is not decoration: it is what makes GitHub attach each
       # package to this repository, so a package page links back to the code
       # rather than standing on its own.
-      - name: Build all three
+      - name: Build all five
         run: |
           # An array rather than a string of flags: one label carries a URL and
           # another a timestamp, and word-splitting a string is how one of them
