@@ -455,6 +455,46 @@ impl Server {
         accept(response).await.map(|_| ())
     }
 
+    /// Renews every lease named, in one call.
+    ///
+    /// **For a Runner that holds a pool rather than one job.** The answer says
+    /// what happened to each, so one stale lease does not decide the rest — read
+    /// [`wire::LeaseOutcome`] per job rather than treating the call as one
+    /// success or one failure.
+    ///
+    /// A **404** means this Server does not know the route: it is older than the
+    /// batch endpoints, not that a job is missing.
+    pub async fn renew_many(
+        &self,
+        jobs: Vec<LeaseRef>,
+        lease_seconds: Option<u32>,
+    ) -> Result<LeaseOutcomes> {
+        let response = self
+            .bearer(self.http.post(self.url("runner/jobs/leases")))
+            .json(&RenewMany {
+                lease_seconds,
+                jobs,
+            })
+            .send()
+            .await?;
+        read(accept(response).await?).await
+    }
+
+    /// Gives every job named back, in one call, because this Runner is stopping.
+    ///
+    /// Means exactly what [`Server::release`] means. Every per-item code is a
+    /// job that is already back, which is the outcome this was asking for.
+    ///
+    /// A **404** means this Server does not know the route.
+    pub async fn release_many(&self, jobs: Vec<LeaseRef>) -> Result<LeaseOutcomes> {
+        let response = self
+            .bearer(self.http.post(self.url("runner/jobs/releases")))
+            .json(&ReleaseMany { jobs })
+            .send()
+            .await?;
+        read(accept(response).await?).await
+    }
+
     /// Records a verdict, once.
     ///
     /// **Safe to resend.** Idempotency is on the lease token and is enforced by

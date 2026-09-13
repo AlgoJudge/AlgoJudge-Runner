@@ -1,10 +1,11 @@
 //! The Server–Runner contract.
 //!
 //! The specification is
-//! `AlgoJudge-Design/specifications/server-runner/SERVER_RUNNER_API.md`, v1.0,
-//! accepted 2026-08-08, with nine conformance cases in
+//! `AlgoJudge-Design/specifications/server-runner/SERVER_RUNNER_API.md`, v1.1,
+//! accepted 2026-08-08 and amended since, with its conformance cases in
 //! `AlgoJudge.Server.Tests/RunnerConformanceTests.cs`. **Where this crate and
-//! that document disagree, the document wins.**
+//! that document disagree, the document wins**, and its amendment table is what
+//! to read first: the body of an amended section states the earlier form.
 //!
 //! Nothing here knows what a submission is, how it is compiled or what a
 //! verdict means. This layer moves bytes and holds a lease; deciding what to

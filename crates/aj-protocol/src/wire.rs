@@ -329,6 +329,52 @@ pub struct Lease {
     pub lease_expires_at: String,
 }
 
+/// One job in a batch, named with the lease that proves it is held.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseRef {
+    pub job_id: String,
+    pub lease_token: String,
+}
+
+/// Renews many leases at once. `lease_seconds` applies to the whole batch.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenewMany {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_seconds: Option<u32>,
+    pub jobs: Vec<LeaseRef>,
+}
+
+/// Gives many jobs back at once, because this Runner is stopping.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseMany {
+    pub jobs: Vec<LeaseRef>,
+}
+
+/// What happened to one job in a batch.
+///
+/// **An absent `code` means it worked.** The codes are the ones a single-job
+/// call answers with as a status — `runner.lease.stale`, `runner.lease.foreign`,
+/// `job.state`, `not_found` — so the same strings are read whichever call was
+/// made.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseOutcome {
+    pub job_id: String,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub lease_expires_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseOutcomes {
+    pub results: Vec<LeaseOutcome>,
+}
+
 // ── Reporting ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
