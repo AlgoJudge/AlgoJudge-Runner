@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aj_protocol::wire::{AttachToJob, Register, ReportResult};
+use aj_protocol::wire::{AttachToJob, LeaseRef, Register, ReportResult};
 use aj_protocol::{Cache, Identity, Server};
 
 /// The development stack's Server. `AJ_TEST_SERVER` points these somewhere else.
@@ -576,6 +576,107 @@ async fn a_runner_that_is_stopping_gives_the_job_back() {
     // that stopped cannot reach past the one now holding it.
     let stale = server.renew(&job.job_id, &job.lease_token, None).await;
     assert!(stale.is_err(), "the old lease still renewed");
+}
+
+/// **A pool is renewed in one call, and the answer speaks per job.** §5.
+///
+/// The stale entry is the point: a Runner holding a hundred jobs cannot act on
+/// a refusal that covers all of them, so a batch that failed whole would be
+/// unusable exactly where a batch is needed.
+#[tokio::test]
+#[ignore = "needs a Server"]
+async fn a_batch_of_leases_is_renewed_and_answers_per_job() {
+    let (server, _identity) = approved("renew-many").await;
+    let participant = Participant::enrolled().await;
+    participant
+        .submit(
+            "print('renew many')
+",
+        )
+        .await;
+
+    let job = claim_ours(&server).await;
+
+    let answered = server
+        .renew_many(
+            vec![
+                LeaseRef {
+                    job_id: job.job_id.clone(),
+                    lease_token: job.lease_token.clone(),
+                },
+                // An id that names nothing, so the answer has to carry two
+                // different outcomes rather than one status.
+                LeaseRef {
+                    job_id: "00000000-0000-0000-0000-0000000000ff".to_owned(),
+                    lease_token: "00000000-0000-0000-0000-0000000000fe".to_owned(),
+                },
+            ],
+            None,
+        )
+        .await
+        .expect("the batch renewal");
+
+    assert_eq!(answered.results.len(), 2);
+
+    let held = answered
+        .results
+        .iter()
+        .find(|one| one.job_id == job.job_id)
+        .expect("our job in the answer");
+    assert!(
+        held.code.is_none(),
+        "our lease was refused: {:?}",
+        held.code
+    );
+    assert!(
+        held.lease_expires_at.is_some(),
+        "a renewed lease says until when",
+    );
+
+    let missing = answered
+        .results
+        .iter()
+        .find(|one| one.job_id != job.job_id)
+        .expect("the unknown job in the answer");
+    assert_eq!(missing.code.as_deref(), Some("not_found"));
+}
+
+/// **A Runner being stopped gives its whole pool back in one call.** §5.1, and
+/// the reason the batch exists: a stop is otherwise a race between one request
+/// per held job and whatever grace the platform allows.
+#[tokio::test]
+#[ignore = "needs a Server"]
+async fn a_stopping_runner_gives_every_job_back_in_one_call() {
+    let (server, _identity) = approved("release-many").await;
+    let participant = Participant::enrolled().await;
+    participant
+        .submit(
+            "print('release many')
+",
+        )
+        .await;
+
+    let job = claim_ours(&server).await;
+
+    let answered = server
+        .release_many(vec![LeaseRef {
+            job_id: job.job_id.clone(),
+            lease_token: job.lease_token.clone(),
+        }])
+        .await
+        .expect("the batch release");
+
+    assert_eq!(answered.results.len(), 1);
+    assert!(
+        answered.results[0].code.is_none(),
+        "the release was refused: {:?}",
+        answered.results[0].code,
+    );
+
+    // Back in the queue this instant, and it is the same job.
+    let again = claim_ours(&server).await;
+    assert_eq!(again.job_id, job.job_id);
+    assert_ne!(again.lease_token, job.lease_token);
 }
 
 // ── §7 files ────────────────────────────────────────────────────────────────
