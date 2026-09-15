@@ -163,6 +163,11 @@ jobs:
       # that no slice has anything *inside* it.
       - name: No per-run cgroup was left behind
         if: always()
+        # **A lane's slice is a sibling of the Runner's own, not a child**, so
+        # `-mindepth 2` still means "something a run left". Named here because
+        # the naming is what keeps it true: a dash in a systemd unit name is a
+        # level of nesting, so `algojudge-<instance>-l1.slice` would sit exactly
+        # at the depth this counts and read as a leak on every green run.
         run: |
           case "${{ matrix.driver }}" in
             cgroupfs) home=/sys/fs/cgroup/algojudge ;;
@@ -252,6 +257,11 @@ jobs:
       # has just run some fifty containers through one backend.
       - name: No per-run cgroup was left behind
         if: always()
+        # **A lane's slice is a sibling of the Runner's own, not a child**, so
+        # `-mindepth 2` still means "something a run left". Named here because
+        # the naming is what keeps it true: a dash in a systemd unit name is a
+        # level of nesting, so `algojudge-<instance>-l1.slice` would sit exactly
+        # at the depth this counts and read as a leak on every green run.
         run: |
           case "${{ matrix.driver }}" in
             cgroupfs) home=/sys/fs/cgroup/algojudge ;;
