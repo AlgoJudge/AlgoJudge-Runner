@@ -18,8 +18,30 @@ use aj_sandbox::Sandbox as _;
 use aj_runner::config::Config;
 use aj_runner::run;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// **The runtime is built here rather than by `#[tokio::main]`**, for one line:
+/// the `shutdown_timeout` below.
+///
+/// Dropping a runtime waits for every blocking task to finish, and this Runner
+/// has two that a stop cannot interrupt — unpacking a package, which may be a
+/// gigabyte, and the relay threads a container that never started leaves
+/// waiting. A container runtime allows thirty seconds between `SIGTERM` and
+/// `SIGKILL`, and the whole of the stopping arrangement is about giving the
+/// jobs in hand back inside it. Waiting out an extraction nobody wants any more
+/// would spend that grace on work whose result is already abandoned.
+///
+/// Five seconds after `work` has returned, which is long past anything that is
+/// still doing something useful: the job has been handed back and the report
+/// loop has ended before this is reached.
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let worked = runtime.block_on(started());
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    worked
+}
+
+async fn started() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
