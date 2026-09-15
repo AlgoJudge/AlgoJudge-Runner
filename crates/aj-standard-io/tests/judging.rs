@@ -228,6 +228,20 @@ async fn judge_for(
     name: &str,
 ) -> Option<Judge> {
     let declares = config.checker.as_ref().or(config.interactor.as_ref())?;
+
+    // **What `aj_runner::prepare` does under the cache's lock, and this stands
+    // in for it.** A judge's container binds `tests/` whole, and an interactive
+    // package may name its tests by a count and ship no files at all — so the
+    // directory has to be made rather than assumed. Production makes it inside
+    // the cache entry before publishing it; a `Pipeline` driven directly, as it
+    // is here, never goes through that.
+    //
+    // It is not the daemon's job either: a **required** mount refuses a source
+    // that is not there, which is the whole point of marking it one. Docker
+    // Desktop creating it quietly is what made this pass on a workstation and
+    // hang on CI.
+    std::fs::create_dir_all(package.here.join("tests")).expect("a judge reads tests/");
+
     let (here, on_host) = fixture(&format!("{name}-judge"));
     let into = Places { here, on_host };
     Some(

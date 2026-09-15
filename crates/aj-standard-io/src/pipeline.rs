@@ -1165,13 +1165,21 @@ impl<S: Sandbox> Pipeline<S> {
                 .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT).required()),
                 ),
             )
-            .await
-            .map_err(|e| format!("the interactor could not be run: {e}"))?;
+            .await;
 
+        // **Released before the run's own failure is looked at.** An interactor
+        // whose container never starts — a mount the daemon will not make, an
+        // image that is not there — used to return through `?` with the verdict
+        // channel still being read by a blocking thread nothing would ever
+        // write to. That thread outlives the job, and dropping a runtime waits
+        // for it: a Runner told to stop would wait out its grace and be killed,
+        // and a test binary would hang instead of failing. Measured 2026-09-15,
+        // on CI, as fifteen minutes of a suite producing no output at all.
         release(&beside_them.here.join(VERDICT));
         let verdict = reading
             .await
             .map_err(|e| format!("the interactor's verdict was not read: {e}"))?;
+        let run = run.map_err(|e| format!("the interactor could not be run: {e}"))?;
 
         if run.stopped != Stopped::OnItsOwn {
             return Err(format!("the interactor was stopped: {:?}", run.stopped));
