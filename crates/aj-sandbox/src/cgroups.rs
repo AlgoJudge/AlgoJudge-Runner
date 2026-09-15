@@ -73,6 +73,94 @@ pub enum Cgroups {
     },
 }
 
+/// Where each of this Runner's lanes takes its numbers from.
+///
+/// **One [`Cgroups`] per lane, and every one of them means exactly what it
+/// meant when there was one of them.** Under `cgroupfs` they all name one
+/// directory and a run makes its own inside it, so the lanes are
+/// indistinguishable there and that is correct. Under `systemd` each is a slice
+/// of its own -- which is what lets a reading stay a difference, because one
+/// run at a time is in each.
+///
+/// **Bounded, which is the whole difference from a slice per run.** This
+/// module's head refuses one slice per test because systemd never collects one,
+/// so they grow for as long as an installation judges anything. There are as
+/// many of these as an operator asked for tests at once, for the life of the
+/// Runner, and lane zero is the slice that already existed.
+#[derive(Debug, Clone)]
+pub struct Homes {
+    lanes: Vec<Cgroups>,
+}
+
+impl Homes {
+    /// One home per lane, or a refusal saying why this host suits neither
+    /// backend.
+    pub fn resolve(driver: &str, root: PathBuf, instance: &str, lanes: usize) -> Result<Self> {
+        readable_hierarchy(&root)?;
+        let lanes = (0..lanes.max(1))
+            .map(|lane| Cgroups::choose_lane(driver, root.clone(), instance, lane))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { lanes })
+    }
+
+    /// The home a run in this lane is measured in.
+    ///
+    /// **A lane nobody has is the first one, and not a panic.** An index out of
+    /// range is this Runner's own mistake, and the place it would be discovered
+    /// is the middle of judging somebody's submission -- where measuring in
+    /// lane zero is a worse number and a panic is no verdict at all.
+    pub(crate) fn lane(&self, index: usize) -> &Cgroups {
+        self.lanes.get(index).unwrap_or(&self.lanes[0])
+    }
+
+    /// Any of them, for the questions whose answer is the same in every lane:
+    /// which driver this is, whether peak memory can be reported, and what a
+    /// refusal has to say.
+    pub fn any(&self) -> &Cgroups {
+        &self.lanes[0]
+    }
+
+    /// Every distinct home, in lane order -- distinct because under `cgroupfs`
+    /// every lane names the same directory.
+    pub fn homes(&self) -> Vec<PathBuf> {
+        let mut seen: Vec<PathBuf> = Vec::new();
+        for home in self.lanes.iter().map(Cgroups::home) {
+            if !seen.contains(&home) {
+                seen.push(home);
+            }
+        }
+        seen
+    }
+
+    /// Makes what every lane needs up front, and proves the Runner can use it.
+    ///
+    /// **Every lane and not just the first.** Each home is the source of the
+    /// mount a shim reaches its own cgroup through, so a lane whose slice was
+    /// never realised is a judged container with no memory limit -- discovered
+    /// one submission at a time. It is also what puts every lane's slice in the
+    /// tree *before* a test snapshots it, which is what lets a leak check
+    /// compare like with like.
+    pub(crate) fn prepare(&self, instance: &str) -> Result<()> {
+        let mut done: Vec<PathBuf> = Vec::new();
+        for lane in &self.lanes {
+            let home = lane.home();
+            if done.contains(&home) {
+                continue;
+            }
+            lane.prepare(instance)?;
+            done.push(home);
+        }
+        Ok(())
+    }
+
+    /// See [`Cgroups::abandoned`]. One pass finds every lane's leftovers: under
+    /// `cgroupfs` they are all in one directory and carry this Runner's own
+    /// prefix, and under `systemd` there is nothing to find.
+    pub(crate) fn abandoned(&self, instance: &str) -> usize {
+        self.any().abandoned(instance)
+    }
+}
+
 impl Cgroups {
     /// Which backend this daemon needs, or a refusal saying why neither fits.
     pub fn resolve(driver: &str, root: PathBuf, instance: &str) -> Result<Self> {
@@ -83,10 +171,16 @@ impl Cgroups {
     /// The choice alone, as a function of its arguments, so that every case of
     /// it is testable on a host with no cgroups at all.
     fn choose(driver: &str, root: PathBuf, instance: &str) -> Result<Self> {
+        Self::choose_lane(driver, root, instance, 0)
+    }
+
+    /// The same, for one lane of several. Lane zero is the only one a Runner
+    /// that judges one test at a time ever asks for.
+    fn choose_lane(driver: &str, root: PathBuf, instance: &str, lane: usize) -> Result<Self> {
         match driver {
             "cgroupfs" => Ok(Self::Cgroupfs { root }),
             "systemd" => Ok(Self::Systemd {
-                slice: format!("{OURS}-{}.slice", unit_safe(instance)),
+                slice: slice_name(instance, lane),
                 root,
                 gate: Arc::new(tokio::sync::Mutex::new(())),
             }),
@@ -611,6 +705,28 @@ pub(crate) fn unsupported_version(reported: &str) -> Error {
 ///
 /// `None` for a name systemd would not accept, because the path would then be a
 /// guess about somebody else's directory.
+/// The slice one lane's runs are measured in.
+///
+/// **`_l1` and not `-l1`, and the underscore is the load-bearing character.** A
+/// `-` in a unit name is a level of nesting rather than a letter -- that is what
+/// [`slice_path`] implements -- so `algojudge-<instance>-l1.slice` would sit
+/// *inside* `algojudge-<instance>.slice`, one level deeper than this tree has
+/// ever gone, with a slice systemd never collects standing between. A leak
+/// check counts exactly that level (`find "$home" -mindepth 2 -type d`, in CI
+/// under both drivers), so the naming decides whether a correct arrangement
+/// reads as a leaked one. With `_` every lane's slice is a **sibling** of the
+/// one a Runner has today, and [`unit_safe`] already keeps the character.
+///
+/// **Lane zero keeps the name it has always had.** A Runner nobody widened then
+/// measures in the slice it measured in yesterday and gains no new unit at all,
+/// which is what makes widening an operator's decision rather than an upgrade's.
+fn slice_name(instance: &str, lane: usize) -> String {
+    match lane {
+        0 => format!("{OURS}-{}.slice", unit_safe(instance)),
+        n => format!("{OURS}-{}_l{n}.slice", unit_safe(instance)),
+    }
+}
+
 fn slice_path(root: &Path, slice: &str) -> Option<PathBuf> {
     // `-.slice` is systemd's own name for the root of the hierarchy.
     let stem = slice
@@ -1228,5 +1344,97 @@ oom_kill 0
             assert!(refusal.contains("processor time"), "{refusal}");
             assert!(!refusal.contains("native.cgroupdriver"), "{refusal}");
         }
+    }
+
+    fn homes(driver: &str, lanes: usize) -> Homes {
+        Homes::resolve(driver, root(), "abc", lanes).expect("homes")
+    }
+
+    /// **The one assertion that decides whether the cgroup tree keeps its
+    /// shape.** A lane's slice has to be a sibling of the slice a Runner has
+    /// always had, not a child of it: `-l1` would nest, and both the leak check
+    /// in CI and `a_measured_run_leaves_no_cgroup_behind` read a level that a
+    /// nested slice would sit in for ever.
+    #[test]
+    fn a_lanes_slice_is_a_sibling_of_the_one_a_single_lane_runner_has() {
+        let alone = Cgroups::choose("systemd", root(), "abc").expect("a backend");
+        let second = Cgroups::choose_lane("systemd", root(), "abc", 1).expect("a backend");
+        assert_eq!(second.home().parent(), Some(alone.family().as_path()));
+        assert_eq!(second.home().parent(), alone.home().parent());
+        assert_ne!(second.home(), alone.home());
+    }
+
+    /// An installation that widens nothing measures where it measured
+    /// yesterday, and gains no permanent systemd unit for upgrading.
+    #[test]
+    fn lane_zero_is_named_exactly_as_it_always_was() {
+        assert_eq!(slice_name("abc", 0), "algojudge-abc.slice");
+        assert_eq!(slice_name("abc", 1), "algojudge-abc_l1.slice");
+        // A fingerprint is hex in production and a test's own name here; a `-`
+        // in either would be a level of nesting, which `unit_safe` takes out.
+        assert_eq!(slice_name("test-lanes", 2), "algojudge-test_lanes_l2.slice");
+    }
+
+    /// Under `systemd` a reading is a difference across a slice, so two lanes
+    /// sharing one would charge each run the other's processor time and peak
+    /// memory -- with nothing anywhere reporting it.
+    #[test]
+    fn every_lane_measures_somewhere_of_its_own_under_systemd() {
+        let mut seen = std::collections::HashSet::new();
+        assert!(homes("systemd", 3)
+            .homes()
+            .into_iter()
+            .all(|home| seen.insert(home)));
+        assert_eq!(seen.len(), 3);
+        // Under `cgroupfs` one directory serves them all, because a run makes
+        // its own inside it.
+        assert_eq!(homes("cgroupfs", 3).homes().len(), 1);
+    }
+
+    /// The deadlock that would make the whole arrangement a slower way of
+    /// judging one test at a time.
+    #[tokio::test]
+    async fn two_lanes_do_not_share_a_gate() {
+        let homes = homes("systemd", 2);
+        let first = homes.lane(0).begin("one").await.expect("a measurement");
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            homes.lane(1).begin("two"),
+        )
+        .await
+        .expect("a second lane must not wait for the first");
+        assert!(second.is_some());
+        drop(first);
+    }
+
+    /// And the invariant it must not cost: within one lane, one run at a time,
+    /// which is what makes `cpu_before` and the peak reset mean anything.
+    #[tokio::test]
+    async fn one_lane_still_admits_one_run_at_a_time() {
+        let homes = homes("systemd", 2);
+        let held = homes.lane(0).begin("one").await.expect("a measurement");
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            homes.lane(0).begin("two"),
+        )
+        .await
+        .is_err());
+        drop(held);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            homes.lane(0).begin("three"),
+        )
+        .await
+        .expect("the gate is released with the run that held it")
+        .is_some());
+    }
+
+    /// A lane index nobody has is this Runner's own mistake, and the place it
+    /// would show is the middle of somebody's submission.
+    #[test]
+    fn a_lane_nobody_has_is_lane_zero() {
+        let homes = homes("systemd", 2);
+        assert_eq!(homes.lane(99).home(), homes.any().home());
+        assert_eq!(homes.lane(1).home(), homes.homes()[1]);
     }
 }

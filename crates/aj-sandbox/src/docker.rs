@@ -30,7 +30,7 @@ use bollard::query_parameters::{
 };
 use futures_util::StreamExt as _;
 
-use crate::cgroups::{self, Cgroups};
+use crate::cgroups::{self, Cgroups, Homes};
 use std::path::{Path, PathBuf};
 
 use crate::profile::{Outcome, Pipes, Profile, Stopped, SHIM};
@@ -78,7 +78,7 @@ pub struct Docker {
     /// unless [`Self::across`] said otherwise, which is what keeps a Runner
     /// nobody widened on exactly the arrangement it had before lanes existed.
     lanes: usize,
-    cgroups: std::sync::OnceLock<Option<Cgroups>>,
+    cgroups: std::sync::OnceLock<Option<Homes>>,
     /// What each image's measuring shim can do, asked once.
     ///
     /// **It has to be known before the container is made**, because it decides
@@ -141,6 +141,12 @@ impl Docker {
     /// What [`Self::preflight`] decided, for a log and for a suite that has to
     /// know which host it is on before it can assert anything about a number.
     pub fn cgroups(&self) -> Option<&Cgroups> {
+        Some(self.homes()?.any())
+    }
+
+    /// The same, one per lane. What a suite needs to assert that two lanes
+    /// measure in two places rather than in one.
+    pub fn homes(&self) -> Option<&Homes> {
         self.cgroups.get()?.as_ref()
     }
 
@@ -366,8 +372,8 @@ impl Docker {
         // container's own as a child while the container exists, and a cgroup
         // with a child cannot be removed.
         let abandoned = self
-            .cgroups()
-            .map_or(0, |cgroups| cgroups.abandoned(&self.instance));
+            .homes()
+            .map_or(0, |homes| homes.abandoned(&self.instance));
         if abandoned > 0 {
             tracing::warn!(
                 abandoned,
@@ -679,20 +685,21 @@ impl Sandbox for Docker {
             .map(|d| d.to_string())
             .unwrap_or_default();
         let decided = cgroups::root_from_environment()
-            .and_then(|root| Cgroups::resolve(&driver, root, &self.instance))
+            .and_then(|root| Homes::resolve(&driver, root, &self.instance, self.lanes))
             .and_then(|chosen| chosen.prepare(&self.instance).map(|()| chosen));
 
         if let Ok(chosen) = &decided {
             tracing::info!(
-                driver = chosen.driver(),
-                home = %chosen.home().display(),
+                driver = chosen.any().driver(),
+                lanes = self.lanes,
+                homes = ?chosen.homes(),
                 "processor time and peak memory are read from here",
             );
             // Not a refusal: a verdict is made of processor time, which is
             // unaffected. Said once, at start, because the alternative is a
             // participant wondering why one installation prints a number and
             // another does not.
-            if let Some(why) = chosen.without_peak_memory() {
+            if let Some(why) = chosen.any().without_peak_memory() {
                 tracing::warn!("peak memory will not be reported: {why}");
             }
         }
@@ -757,13 +764,17 @@ impl Sandbox for Docker {
         // it and because under the systemd backend the reading is a difference
         // that has to have a beginning. Failure here is not an error: the run
         // proceeds unmeasured.
-        let cgroup = match self.cgroups() {
+        let cgroup = match self.homes() {
             // **A run beside another one opens nothing.** Under `systemd` the
             // gate `begin` takes is held for the whole of the run that owns it,
             // so asking for one here is how a checker comes to wait for the
             // submission that is waiting for the checker.
             _ if profile.alongside => None,
-            Some(cgroups) => cgroups.begin(&name).await,
+            // **The lane the caller placed this run in**, which is the lane its
+            // processors came from: a run measured in one lane's home while
+            // running on another's would be a reading taken where a second run
+            // was also making one.
+            Some(homes) => homes.lane(profile.lane).begin(&name).await,
             None => None,
         };
 
@@ -778,8 +789,8 @@ impl Sandbox for Docker {
         // unapplied.
         let bound = shim
             .then(|| {
-                self.cgroups()
-                    .and_then(|cgroups| cgroups.mount_point(&name))
+                self.homes()
+                    .and_then(|homes| homes.lane(profile.lane).mount_point(&name))
             })
             .flatten();
         if shim && bound.is_none() {

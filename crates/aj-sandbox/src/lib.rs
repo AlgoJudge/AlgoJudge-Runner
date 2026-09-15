@@ -33,7 +33,7 @@ pub mod pipes;
 mod profile;
 
 pub use beside::{Beside, Enough};
-pub use cgroups::Cgroups;
+pub use cgroups::{Cgroups, Homes};
 pub use docker::{Docker, ShimFeatures};
 #[cfg(target_os = "linux")]
 pub use memfd::SealedInput;
