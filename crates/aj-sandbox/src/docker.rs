@@ -191,8 +191,19 @@ impl Docker {
                 return None;
             }
         };
-        if let Some(known) = self.shims.lock().await.get(&id) {
-            return *known;
+        // **Held across the probe, and that is the fix rather than the cost.**
+        // Two tests starting at once both find this map empty, and the probe's
+        // container has a fixed name -- so the second one's `take_nothing`
+        // removes the first one's container out from under the read, and
+        // whichever loses answers *this image has no shim*. A measured, silent
+        // run in an image with no shim is refused, so that answer fails a
+        // submission -- and it is then remembered, so it fails every submission
+        // until the Runner is restarted. The lock costs one probe's wait, once
+        // per image for the life of a Runner, and it does the work once instead
+        // of once per lane. Nothing under it asks for it again.
+        let mut known = self.shims.lock().await;
+        if let Some(found) = known.get(&id) {
+            return *found;
         }
 
         let name = format!("algojudge-{}-shimprobe", self.instance);
@@ -235,7 +246,7 @@ impl Docker {
             socket_input = found.is_some_and(|f| f.socket_input),
             "measured runs in this image",
         );
-        self.shims.lock().await.insert(id, found);
+        known.insert(id, found);
         found
     }
 
@@ -246,6 +257,10 @@ impl Docker {
     /// into the container that judges with them — so a path that is real here
     /// and meaningless to the daemon is every submission to every problem with
     /// a checker failing, worded as though the author's checker did not build.
+    ///
+    /// **A fixed container name here needs no lock, where [`Self::image_shim`]
+    /// does**: this is asked once, from the Runner's start-up, before anything
+    /// has been claimed -- there is no second caller to race.
     ///
     /// A **typed** mount, which refuses a source that is not there, on a
     /// container that is created and never started: the check costs no image
