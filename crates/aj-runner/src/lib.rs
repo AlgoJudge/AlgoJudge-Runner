@@ -13,6 +13,7 @@ use std::time::Duration;
 
 pub mod config;
 pub mod keeper;
+pub mod prepare;
 pub mod run;
 
 /// Waits between attempts at something that may simply not be ready.

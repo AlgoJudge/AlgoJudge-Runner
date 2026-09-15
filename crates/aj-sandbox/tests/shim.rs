@@ -80,6 +80,17 @@ int main(int argc, char **argv) {
             printf("%s nonce=%d\n", from, found);
             fclose(f);
         }
+    } else if (!strcmp(what, "rewind")) {
+        /* Reads its input, goes back to the start, and reads it again -- which
+         * a file allows and a pipe does not. */
+        char line[256];
+        if (!fgets(line, sizeof line, stdin)) { printf("read nothing\n"); }
+        else {
+            printf("first %s", line);
+            if (fseek(stdin, 0, SEEK_SET) != 0) printf("cannot seek\n");
+            else if (fgets(line, sizeof line, stdin)) printf("again %s", line);
+            else printf("again nothing\n");
+        }
     } else if (!strcmp(what, "echo")) {
         char line[256];
         if (fgets(line, sizeof line, stdin)) printf("read %s", line);
@@ -131,11 +142,20 @@ impl Ran {
 }
 
 fn compile(source: &str, into: &Path, name: &str) -> Option<PathBuf> {
+    compile_with(source, into, name, &["-O1", "-Wall", "-Wextra"])
+}
+
+/// **The shim is built the way the images build it**, at `-O2` and with
+/// `-Werror`, so that what is tested here is the binary an operator gets: an
+/// optimiser that drops the feature marker, or a warning the image build would
+/// refuse, is found by `cargo test` rather than by `docker build`.
+fn compile_with(source: &str, into: &Path, name: &str, flags: &[&str]) -> Option<PathBuf> {
     let file = into.join(format!("{name}.c"));
     std::fs::write(&file, source).expect("write the source");
     let out = into.join(name);
     let built = Command::new("cc")
-        .args(["-O1", "-Wall", "-Wextra", "-o"])
+        .args(flags)
+        .arg("-o")
         .arg(&out)
         .arg(&file)
         .output()
@@ -154,10 +174,11 @@ fn build() -> Option<Built> {
     std::fs::create_dir_all(&root).expect("a place to build in");
 
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../images/shim/aj-shim.c");
-    let shim = compile(
+    let shim = compile_with(
         &std::fs::read_to_string(&source).expect("the shim's source"),
         &root,
         "aj-shim",
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
     )?;
     let helper = compile(&HELPER.replace("NONCE_HERE", NONCE), &root, "helper")?;
 
@@ -173,13 +194,16 @@ fn build() -> Option<Built> {
 }
 
 fn run(built: &Built, args: &[&str], nonce: Option<&str>) -> Ran {
+    let input = built.input.clone();
+    run_reading(built, &input, args, nonce)
+}
+
+/// The same, with the standard input named by the caller: a file, a pipe, or
+/// the socket a batch test's input arrives on.
+fn run_reading(built: &Built, input: &Path, args: &[&str], nonce: Option<&str>) -> Ran {
     let at = built.output_for(&args.join("-"));
     let mut command = Command::new(&built.shim);
-    command
-        .arg(&built.input)
-        .arg(&at)
-        .arg(&built.helper)
-        .args(args);
+    command.arg(input).arg(&at).arg(&built.helper).args(args);
     match nonce {
         Some(nonce) => command.env("AJ_SHIM_NONCE", nonce),
         None => command.env_remove("AJ_SHIM_NONCE"),
@@ -645,5 +669,120 @@ fn the_report_splits_the_total_into_the_program_and_the_kernel() {
         grown.system_us > 0,
         "faulting in thirty-two megabytes is work done for it, and it read {} system",
         grown.system_us,
+    );
+}
+
+// ── the input a batch test now arrives on ───────────────────────────────────
+
+/// **The input reaches the program as a descriptor, over a socket.**
+///
+/// Nothing is mounted and nothing is copied into the job's scratch: the Runner
+/// reads the package's `<test>.in` out of the shared cache into a sealed file
+/// in memory and hands this shim the descriptor. Both halves here are the
+/// production ones — `SealedInput::hand_over` sends, the shim's `open_input`
+/// receives.
+#[tokio::test]
+async fn the_input_arrives_on_a_socket() {
+    let built = built!();
+
+    let at = built.outputs.parent().unwrap().join("input.socket");
+    let _ = std::fs::remove_file(&at);
+    let (socket, listener) = aj_sandbox::pipes::Socket::make(&at, 0o600).expect("a socket");
+    let handing = aj_sandbox::SealedInput::from_file(&built.input)
+        .await
+        .expect("the input, in memory")
+        .hand_over(listener);
+
+    let input = socket.path().to_path_buf();
+    let built_for = built;
+    let output =
+        tokio::task::spawn_blocking(move || run_reading(built_for, &input, &["echo"], Some(NONCE)))
+            .await
+            .expect("the shim runs");
+
+    // **Bounded, and the program's own output is the evidence.** A shim that
+    // never connected would leave this waiting for ever, which is a test that
+    // hangs rather than one that fails.
+    handing.abort();
+    assert_eq!(
+        String::from_utf8_lossy(&output.written),
+        "read 42 the input line\n",
+    );
+}
+
+/// **And it is seekable, which is the whole reason it is not a pipe.**
+///
+/// A solution that reads its input twice — `rewind`, a second pass, a fast-input
+/// template that maps it — works on its author's machine. A pipe would fail it
+/// here, and the participant would have nothing to look at.
+#[tokio::test]
+async fn a_program_may_read_the_input_it_was_handed_twice() {
+    let built = built!();
+
+    let at = built.outputs.parent().unwrap().join("rewind.socket");
+    let _ = std::fs::remove_file(&at);
+    let (socket, listener) = aj_sandbox::pipes::Socket::make(&at, 0o600).expect("a socket");
+    let handing = aj_sandbox::SealedInput::from_file(&built.input)
+        .await
+        .expect("the input, in memory")
+        .hand_over(listener);
+
+    let input = socket.path().to_path_buf();
+    let built_for = built;
+    let output = tokio::task::spawn_blocking(move || {
+        run_reading(built_for, &input, &["rewind"], Some(NONCE))
+    })
+    .await
+    .expect("the shim runs");
+
+    handing.abort();
+    let said = String::from_utf8_lossy(&output.written);
+    assert_eq!(
+        said, "first 42 the input line\nagain 42 the input line\n",
+        "a program could not read its own input twice: {said}",
+    );
+}
+
+/// A socket nobody is serving is fatal, and nothing is measured.
+///
+/// The Runner having gone away between making the socket and starting the
+/// container is the case: the program must not be judged on an empty input.
+#[test]
+fn an_input_socket_nobody_serves_is_fatal() {
+    let built = built!();
+
+    let at = built.outputs.parent().unwrap().join("unserved.socket");
+    let _ = std::fs::remove_file(&at);
+    {
+        // Bound and then let go of: the file stays, and nothing is listening.
+        let _listener = std::os::unix::net::UnixListener::bind(&at).expect("a socket");
+    }
+
+    let output = run_reading(built, &at, &["echo"], Some(NONCE));
+    assert_eq!(output.status.code(), Some(125), "the shim's own code");
+    assert!(report_in(&output).is_none(), "nothing may be measured");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("input socket"),
+        "the reason has to name what it could not reach: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// **What the shim can do, readable out of the binary.**
+///
+/// A Runner decides before it starts a container whether an image's shim can
+/// take a descriptor, by fetching the binary and looking for this. Without the
+/// marker it would hand a socket to a shim that opens it as a file — ENXIO, and
+/// every test reported as a run that measured nothing.
+#[test]
+fn the_shim_says_what_it_can_do() {
+    let built = built!();
+    let binary = std::fs::read(&built.shim).expect("the shim that was built");
+
+    assert!(
+        binary
+            .windows(aj_sandbox::SOCKET_INPUT.len())
+            .any(|at| at == aj_sandbox::SOCKET_INPUT.as_bytes()),
+        "the marker was optimised away, and every image would be refused",
     );
 }

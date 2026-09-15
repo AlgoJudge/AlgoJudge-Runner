@@ -43,11 +43,17 @@ async fn main() -> anyhow::Result<()> {
     // The same fingerprint the sandbox is given, and for the same reason: a
     // cache volume may be shared between Runners on one host, and an entry one
     // of them is reading must not be evicted by another.
-    let cache = Arc::new(Cache::new(
-        &config.cache_path,
-        config.cache_max_bytes,
-        identity.fingerprint(),
-    ));
+    let cache = Arc::new(
+        Cache::new(
+            &config.cache_path,
+            config.cache_max_bytes,
+            identity.fingerprint(),
+        )
+        // What the **daemon** calls the same directory. A judge's container is
+        // given the package unpacked here and the program built from it, and
+        // the daemon is what resolves a bind mount.
+        .with_host_root(&config.cache_host_path),
+    );
     // What a previous incarnation of this Runner was reading when it stopped.
     // Nobody else can release those, and an entry nobody can evict is a disk
     // that fills.
@@ -74,6 +80,19 @@ async fn main() -> anyhow::Result<()> {
              cgroups, so this Runner registers and answers the protocol and then \
              fails every job it claims."
         );
+    }
+
+    // **Before anything is judged, because the failure it catches is silent.**
+    // The cache is where a package is unpacked and its judge built, and both
+    // are mounted into the container that judges with them — so a path the
+    // daemon cannot open is every submission to every checker problem failing,
+    // in words that blame the package's author.
+    // One image is enough — what is being asked about is the path — and any of
+    // them will do, so the first that is on this host already answers it.
+    for image in config.images.all() {
+        if sandbox.can_mount(&config.cache_host_path, &image).await? {
+            break;
+        }
     }
 
     // Job containers are siblings, so they outlive the process that made them.

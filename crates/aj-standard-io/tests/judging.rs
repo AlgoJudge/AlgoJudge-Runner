@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use aj_package::{Config, TestSet};
 use aj_sandbox::{Docker, Sandbox};
-use aj_standard_io::{catalogue, for_id, Evaluated, Family, Images, Job, Pipeline, Places};
+use aj_standard_io::{catalogue, for_id, Evaluated, Family, Images, Job, Judge, Pipeline, Places};
 
 const CONFIG: &str = r#"
 type: "standard-io@1"
@@ -216,6 +216,28 @@ async fn pipeline() -> Pipeline<Docker> {
     Pipeline::new(docker, images)
 }
 
+/// The judge a package declares, **built the way the Runner builds it**: once,
+/// beside the package, rather than inside the job that is about to use it.
+///
+/// `None` where the package declares neither a checker nor an interactor, which
+/// is what every job here passes.
+async fn judge_for(
+    pipeline: &Pipeline<Docker>,
+    config: &Config,
+    package: &Places,
+    name: &str,
+) -> Option<Judge> {
+    let declares = config.checker.as_ref().or(config.interactor.as_ref())?;
+    let (here, on_host) = fixture(&format!("{name}-judge"));
+    let into = Places { here, on_host };
+    Some(
+        pipeline
+            .build_judge(declares, package, &into)
+            .await
+            .expect("the package's own judge has to build"),
+    )
+}
+
 /// A package on disk, in both the views a bind mount needs.
 fn package(name: &str) -> (Places, Config, TestSet) {
     let (here, on_the_host) = fixture(name);
@@ -300,6 +322,7 @@ async fn judge(name: &str, language: &str, source: &str) -> Evaluated {
             language,
             file_name: file_named(language),
             source: source.as_bytes(),
+            judge: None,
             package,
             work: work(name),
             pipes: None,
@@ -381,6 +404,7 @@ groups:
                 language: "cpp20-gcc",
                 file_name: "main.cpp",
                 source: CORRECT_CPP.as_bytes(),
+                judge: None,
                 package: Places { here, on_host },
                 work: work("excluded-language"),
                 pipes: None,
@@ -507,6 +531,7 @@ async fn a_file_the_chosen_toolchain_does_not_accept_is_a_compilation_error() {
                 // file field, and nothing stops the two disagreeing.
                 file_name: "solution.py",
                 source: CORRECT_PYTHON.as_bytes(),
+                judge: None,
                 package,
                 work: work("wrong-extension"),
                 pipes: None,
@@ -628,6 +653,7 @@ async fn held_to(name: &str, memory_bytes: u64, source: &str) -> serde_json::Val
                 language: "cpp",
                 file_name: "main.cpp",
                 source: source.as_bytes(),
+                judge: None,
                 package: Places { here, on_host },
                 work: work(name),
                 pipes: None,
@@ -831,6 +857,7 @@ async fn waited_for(name: &str, limit_ms: u64, seconds: u64) -> serde_json::Valu
                 language: "cpp",
                 file_name: "main.cpp",
                 source: waiting.as_bytes(),
+                judge: None,
                 package: Places { here, on_host },
                 work: work(name),
                 pipes: None,
@@ -918,6 +945,7 @@ groups:
                 language: "cpp",
                 file_name: "main.cpp",
                 source: correct.as_bytes(),
+                judge: None,
                 package: Places { here, on_host },
                 work: work(name),
                 pipes: Some(elsewhere.clone()),
@@ -1050,6 +1078,7 @@ async fn judge_with_checker(name: &str, source: &str, checker: &str) -> Evaluate
 
     let config = Config::parse(&declared).unwrap();
     let tests = TestSet::read(&package.here, &config).unwrap();
+    let judge = judge_for(&pipeline, &config, &package, name).await;
 
     let evaluated = pipeline
         .evaluate(&Job {
@@ -1058,6 +1087,7 @@ async fn judge_with_checker(name: &str, source: &str, checker: &str) -> Evaluate
             language: "cpp",
             file_name: "main.cpp",
             source: source.as_bytes(),
+            judge: judge.as_ref(),
             package: package.clone(),
             work: work(name),
             pipes: None,
@@ -1178,6 +1208,7 @@ async fn judge_interactive(name: &str, source: &str, interactor: &str) -> Evalua
 
     let config = Config::parse(&declared).unwrap();
     let tests = TestSet::read(&package.here, &config).unwrap();
+    let judge = judge_for(&pipeline, &config, &package, name).await;
 
     let w = work(name);
     pipeline
@@ -1187,6 +1218,7 @@ async fn judge_interactive(name: &str, source: &str, interactor: &str) -> Evalua
             language: "cpp",
             file_name: "main.cpp",
             source: source.as_bytes(),
+            judge: judge.as_ref(),
             package,
             work: w,
             pipes: None,
@@ -1497,33 +1529,28 @@ int main(int argc, char** argv) {
 /// which is the cheap half. This is the expensive half: a program that actually
 /// calls `open` on every test file the package has, and reports what it got.
 ///
-/// Three things at once, per test: the running test's `.out` is unreachable,
-/// **every other** test's `.out` is unreachable, and every other test's `.in` is
-/// unreachable. That last one is `docs/SECURITY.md` §2 rule 2 — "one test, one
-/// input" — which had no proof of its own either.
-///
-/// `/in` opens and refuses to be read: the mount binds a single **file** at
-/// `/in/<test>.in`, so the runtime synthesises the directory around it, and
-/// `read` on a directory is `EISDIR`.
+/// **Nothing of the package is reachable at all**, which is more than the rule
+/// it was written for asked. The package is unpacked once into a cache every
+/// submission to the problem reads, so a mount of any part of it would be an
+/// inode shared between contestants — `docs/SECURITY.md` §6 — and there is
+/// none: the input arrives as a sealed file in memory, handed to the shim over
+/// a socket before the container starts.
 #[tokio::test]
 #[ignore = "needs a container runtime and the language images"]
 async fn a_judged_submission_cannot_read_the_answer_key() {
     let judged = verdict(judge_with_checker("cpp-probe-batch", PROBE, ECHOING_CHECKER).await);
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
 
-    for (index, name, seen) in [
-        (0, "0a", "OPEN(4:1 2.)"),
-        (1, "1a", "OPEN(6:10 20.)"),
-        (2, "2a", "OPEN(8:1000000 )"),
-    ] {
-        let mut expected = String::from("PROBE /in=OPEN(-1:)");
-        for test in ["0a", "1a", "2a"] {
-            expected.push_str(&format!(
-                " /in/{test}.in={}",
-                if test == name { seen } else { "absent" }
-            ));
-            expected.push_str(&format!(" /in/{test}.out=absent"));
-        }
+    // **Not even its own input**, since 2026-09-15: nothing of the package is
+    // mounted, and what it reads arrives as a descriptor the shim was handed.
+    // A batch submission and an interactive one now reach exactly the same
+    // nothing, which is why the two tests assert the same string.
+    let mut expected = String::from("PROBE /in=absent");
+    for test in ["0a", "1a", "2a"] {
+        expected.push_str(&format!(" /in/{test}.in=absent /in/{test}.out=absent"));
+    }
+
+    for (index, name) in ["0a", "1a", "2a"].iter().enumerate() {
         assert_eq!(
             document["tests"][index]["note"], expected,
             "judging {name}, the submission reached something it must not: {document}",
@@ -1604,6 +1631,7 @@ int main(int argc, char** argv) {
     let config = Config::parse(&declared).unwrap();
     let tests = TestSet::read(&package.here, &config).expect("a package with no .out files");
     assert_eq!(tests.len(), 3, "the .in files are still the census");
+    let judge = judge_for(&pipeline, &config, &package, name).await;
 
     let judged = verdict(
         pipeline
@@ -1613,6 +1641,7 @@ int main(int argc, char** argv) {
                 language: "cpp",
                 file_name: "main.cpp",
                 source: CORRECT_CPP.as_bytes(),
+                judge: judge.as_ref(),
                 package,
                 work: work(name),
                 pipes: None,
@@ -1677,6 +1706,12 @@ int main() { long long n; if (std::scanf("%lld", &n) != 1) return 1; std::printf
     let tests = TestSet::read(&here, &config).expect("a package whose tests are declared");
     assert_eq!(tests.len(), 3, "three tests, and not one file among them");
 
+    let package = Places {
+        here: here.clone(),
+        on_host: on_the_host.clone(),
+    };
+    let judge = judge_for(&pipeline, &config, &package, name).await;
+
     let judged = verdict(
         pipeline
             .evaluate(&Job {
@@ -1685,10 +1720,8 @@ int main() { long long n; if (std::scanf("%lld", &n) != 1) return 1; std::printf
                 language: "cpp",
                 file_name: "main.cpp",
                 source: doubler.as_bytes(),
-                package: Places {
-                    here,
-                    on_host: on_the_host,
-                },
+                judge: judge.as_ref(),
+                package,
                 work: work(name),
                 pipes: None,
             })
@@ -1990,6 +2023,12 @@ async fn the_committed_package_judges_a_correct_solution() {
     assert_eq!(tests.len(), 5);
     assert_eq!(config.max_score(), 100);
 
+    let package = Places {
+        here: unpacked,
+        on_host: on_the_host.join("package"),
+    };
+    let judge = judge_for(&pipeline, &config, &package, "archive").await;
+
     let evaluated = pipeline
         .evaluate(&Job {
             config: &config,
@@ -1997,10 +2036,8 @@ async fn the_committed_package_judges_a_correct_solution() {
             language: "cpp",
             file_name: "main.cpp",
             source: CORRECT_CPP.as_bytes(),
-            package: Places {
-                here: unpacked,
-                on_host: on_the_host.join("package"),
-            },
+            judge: judge.as_ref(),
+            package: package.clone(),
             work: work("archive"),
             pipes: None,
         })
@@ -2045,10 +2082,18 @@ async fn a_trial_measures_every_model_solution_per_group() {
     let declared = std::fs::read_to_string(root.join("config.yml")).unwrap();
     let config = Config::parse(&declared).unwrap();
     let tests = TestSet::read(&root, &config).unwrap();
+    let judge = judge_for(&pipeline, &config, &package, "trial").await;
 
-    let measured = aj_standard_io::measure(&pipeline, &config, &tests, &package, &work("trial"))
-        .await
-        .expect("the package's own model solutions should measure");
+    let measured = aj_standard_io::measure(
+        &pipeline,
+        &config,
+        &tests,
+        &package,
+        judge.as_ref(),
+        &work("trial"),
+    )
+    .await
+    .expect("the package's own model solutions should measure");
 
     assert!(!measured.measured.is_empty(), "nothing was measured");
 
@@ -2175,6 +2220,7 @@ groups:
                 language: "python",
                 file_name: "main.py",
                 source: b"a, b = map(int, input().split())\nprint(a + b)\n",
+                judge: None,
                 package: Places { here, on_host },
                 work: work("limits-reported"),
                 pipes: None,
@@ -2250,6 +2296,7 @@ groups:
                 language: "cpp",
                 file_name: "main.cpp",
                 source: slow.as_bytes(),
+                judge: None,
                 package: Places { here, on_host },
                 work: work("overrun"),
                 pipes: None,
@@ -2270,4 +2317,39 @@ groups:
         "and it should say so by name: {}",
         document["tests"][0],
     );
+}
+
+/// **A solution may read its own input twice**, which is why the input is a
+/// sealed file in memory and not a pipe.
+///
+/// `rewind`, a second pass, a fast-input template that maps standard input:
+/// each of them works on the author's machine, and a pipe would fail every one
+/// of them here for a reason the participant could not see. That objection is
+/// the whole of why the input was a mounted file for so long — and it is
+/// answered without a mount.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_solution_may_read_its_input_twice() {
+    // Reads the pair, seeks back to the start, reads it again, and answers from
+    // the second reading alone. On a pipe the seek fails and it prints nothing.
+    let twice = r#"
+#include <cstdio>
+int main() {
+    long long a = 0, b = 0;
+    if (std::scanf("%lld %lld", &a, &b) != 2) return 1;
+    if (std::fseek(stdin, 0, SEEK_SET) != 0) { std::printf("cannot seek\n"); return 0; }
+    long long c = 0, d = 0;
+    if (std::scanf("%lld %lld", &c, &d) != 2) { std::printf("read once only\n"); return 0; }
+    std::printf("%lld\n", c + d);
+    return 0;
+}
+"#;
+
+    let judged = verdict(judge("cpp-rewind", "cpp", twice).await);
+    assert_eq!(
+        judged.judgement.verdict, "Accepted",
+        "a solution that reads its input twice was judged wrong: {:?}",
+        judged.judgement.tests,
+    );
+    assert_eq!(judged.judgement.score, judged.judgement.max_score);
 }

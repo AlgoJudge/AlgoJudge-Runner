@@ -556,6 +556,33 @@ impl Server {
         Ok(hex::encode(digest.finalize()))
     }
 
+    /// The same download, verified, for bytes that are **not** worth caching.
+    ///
+    /// **A submission is one person's file, read once.** Keeping it in the
+    /// cache costs an entry, an eviction candidate and a holding marker for
+    /// something no second job will ever ask for; the cache is for what several
+    /// submissions share, which is the package.
+    ///
+    /// The checksum is computed from the stream, so what is compared is what
+    /// arrived rather than what was written — and a mismatch takes the file
+    /// away before it is reported, so a retry cannot read the same bad bytes.
+    pub async fn download_verified(&self, file_id: &str, sha256: &str, into: &Path) -> Result<()> {
+        // The file id is spliced into a URL below, and `into` is this Runner's
+        // own path rather than the Server's. See `cache::a_name`.
+        crate::cache::a_name("the file id", file_id)?;
+
+        let actual = self.download_to(file_id, into).await?;
+        if !actual.eq_ignore_ascii_case(sha256) {
+            let _ = tokio::fs::remove_file(into).await;
+            return Err(Error::ChecksumMismatch {
+                what: format!("file {file_id}"),
+                expected: sha256.to_ascii_lowercase(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+
     /// Stores bytes this Runner produced. The Server recomputes the checksum
     /// and refuses to store on a mismatch, exactly as it does for anybody else.
     pub async fn upload(

@@ -28,11 +28,20 @@
  * be charged for, and measurement showed that charging the larger of the two
  * failed correct submissions.
  *
- *   aj-shim <input-file> <output-file> <program> [args...]
+ *   aj-shim <input> <output-file> <program> [args...]
  *
- * The input file becomes the child's stdin. `sh -c "exec prog < input"` did
+ * The first argument becomes the child's stdin. `sh -c "exec prog < input"` did
  * that before and is what this replaces; a shell would otherwise be a second
  * process in the accounting, and its own start is part of what is being removed.
+ *
+ * **It names a file or a socket, and the socket is how a batch test arrives.**
+ * A test's input is no longer mounted: the Runner reads it out of the shared
+ * cache into a sealed file in memory and hands the descriptor over here, over a
+ * Unix socket only this process can reach. What the submission gets is a
+ * descriptor it can read, seek and map privately, and no path at all -- so a
+ * test file is copied into no job's scratch, and no two submissions to one
+ * problem hold the same inode. A file is still opened where one is named, which
+ * is what an interactive problem's pipe and the test suite both use.
  *
  * **The second argument becomes the child's stdout, and it is normally a pipe.**
  * Left on the container's own stdout, everything a submission prints is written
@@ -71,8 +80,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -89,6 +100,19 @@
 #define SHIM_FAILED 125
 #define EXEC_FAILED 126
 #define NOT_FOUND 127
+
+/* What this shim can do, said in the binary so that a Runner can find out
+ * before it starts one.
+ *
+ * **The Runner reads the shim out of the image rather than running it** -- see
+ * `Docker::image_shim` -- so this is how an image built before socket input
+ * tells itself apart from one built after. Without it a Runner would hand a
+ * socket to a shim that opens it as a file, which fails with ENXIO and reports
+ * every test as a run that measured nothing.
+ *
+ * `used`, because nothing reads it here: at -O2 an unreferenced static is
+ * folded away, and the guard would then refuse every image it was added to. */
+__attribute__((used)) static const char features[] = "aj-shim-features: socket-input";
 
 extern char **environ;
 
@@ -395,6 +419,79 @@ static void kill_the_rest(pid_t group) {
     }
 }
 
+/* The child's standard input: a file to open, or a descriptor to collect.
+ *
+ * **A socket means the Runner is holding the input in memory for us.** It made
+ * a sealed `memfd` out of the package's `<test>.in` and is waiting to hand the
+ * descriptor over; one connection is accepted and the socket is then closed at
+ * both ends, so nothing that runs afterwards can ask for a second copy. This
+ * process is still root here, and the socket is 0600 in a directory that is
+ * root's -- the submission is uid 65534 four lines later and can reach neither.
+ *
+ * Anything else is opened as a path, which is what an interactive problem's
+ * pipe is and what the test suite uses.
+ *
+ * Failing is fatal either way: a submission with no standard input would be
+ * judged on what it printed knowing nothing, which is a verdict about a run
+ * that never happened. */
+static int open_input(const char *path) {
+    struct stat about;
+    if (stat(path, &about) != 0 || !S_ISSOCK(about.st_mode)) {
+        return open(path, O_RDONLY | O_CLOEXEC);
+    }
+
+    struct sockaddr_un where;
+    memset(&where, 0, sizeof where);
+    where.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof where.sun_path) {
+        errno = ENAMETOOLONG;
+        fatal("the input socket's path does not fit an address");
+    }
+    snprintf(where.sun_path, sizeof where.sun_path, "%s", path);
+
+    int channel = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (channel < 0) fatal("cannot make the input socket");
+    if (connect(channel, (struct sockaddr *)&where, sizeof where) != 0) {
+        fatal("cannot reach the input socket");
+    }
+
+    /* One byte travels with the descriptor: a control message on its own is
+     * not delivered. What it says is nothing and it is thrown away. */
+    char byte = 0;
+    struct iovec carrier;
+    memset(&carrier, 0, sizeof carrier);
+    carrier.iov_base = &byte;
+    carrier.iov_len = 1;
+
+    union {
+        struct cmsghdr aligned;
+        char bytes[CMSG_SPACE(sizeof(int))];
+    } control;
+    memset(&control, 0, sizeof control);
+
+    struct msghdr message;
+    memset(&message, 0, sizeof message);
+    message.msg_iov = &carrier;
+    message.msg_iovlen = 1;
+    message.msg_control = control.bytes;
+    message.msg_controllen = sizeof control.bytes;
+
+    if (recvmsg(channel, &message, MSG_CMSG_CLOEXEC) < 0) fatal("cannot receive the input");
+
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    if (header == NULL || header->cmsg_level != SOL_SOCKET
+        || header->cmsg_type != SCM_RIGHTS
+        || header->cmsg_len != CMSG_LEN(sizeof(int))) {
+        errno = EPROTO;
+        fatal("nothing was handed over on the input socket");
+    }
+
+    int input;
+    memcpy(&input, CMSG_DATA(header), sizeof input);
+    close(channel);
+    return input;
+}
+
 int main(int argc, char **argv) {
     if (argc < 4) {
         errno = EINVAL;
@@ -424,7 +521,7 @@ int main(int argc, char **argv) {
      * `the shim reported nothing` and says nothing about why. */
     make_the_submissions_cgroup();
 
-    int input = open(argv[1], O_RDONLY | O_CLOEXEC);
+    int input = open_input(argv[1]);
     if (input < 0) fatal("cannot open the input file");
 
     struct timeval began;

@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use aj_package::{Config, Measurement, TestSet};
 use aj_sandbox::Sandbox;
 
-use crate::pipeline::{Evaluated, Job, Pipeline, Places};
+use crate::pipeline::{Evaluated, Job, Judge, Pipeline, Places};
 
 /// What one trial produced: the rows that go into `calibration.measured`.
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -35,6 +35,7 @@ pub async fn measure<S: Sandbox>(
     config: &Config,
     tests: &TestSet,
     package: &Places,
+    judge: Option<&Judge>,
     work: &Places,
 ) -> Result<Measured, String> {
     let models = config.models();
@@ -71,6 +72,9 @@ pub async fn measure<S: Sandbox>(
                 file_name: &model.source,
                 source: &bytes,
                 package: package.clone(),
+                // The same one every model solution is measured against, built
+                // once with the package it belongs to.
+                judge,
                 work: mine,
                 // Calibration runs a jury's own solutions, not a submission --
                 // and it wants the same paths judging uses, so nothing here

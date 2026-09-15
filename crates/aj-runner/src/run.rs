@@ -12,6 +12,7 @@ use aj_standard_io::{Evaluated, Pipeline, Places};
 use crate::config::Config;
 use crate::keeper::Keeper;
 use crate::pause;
+use crate::prepare;
 use aj_protocol::stopping::Stopping;
 
 /// Registers, waits to be approved, and comes back holding a token.
@@ -306,7 +307,7 @@ pub async fn work(
                 match server.claim_trial(Some(config.lease_seconds)).await {
                     Ok(Some(trial)) => {
                         backoff.reset();
-                        run_trial(server, cache, pipeline, config, trial).await;
+                        run_trial(server, cache, pipeline, config, trial, stopping).await;
                         continue;
                     }
                     Ok(None) => {}
@@ -406,6 +407,7 @@ async fn run_trial(
     pipeline: &Pipeline<aj_sandbox::Docker>,
     config: &Config,
     trial: ClaimedTrial,
+    stopping: &Stopping,
 ) {
     tracing::info!(
         trial = %trial.trial_id,
@@ -424,7 +426,7 @@ async fn run_trial(
         config,
     );
 
-    let report = match measure_trial(server, cache, pipeline, config, &trial).await {
+    let report = match measure_trial(server, cache, pipeline, config, &trial, stopping).await {
         Ok(measured) => TrialReport {
             lease_token: trial.lease_token.clone(),
             measurement: Some(measured),
@@ -438,6 +440,12 @@ async fn run_trial(
                 failure_reason: Some(reason),
             }
         }
+        // Nothing to say, and nothing lost: the lease brings the trial back.
+        Err(Trouble::Stopping) => {
+            tracing::info!(trial = %trial.trial_id, "told to stop; the trial is left");
+            return;
+        }
+
         // The same rule as a job, for the same reason: a trial that failed
         // because the Server withdrew did not fail. Its lease brings it back,
         // and the manager waiting on a measurement gets one instead of a
@@ -497,13 +505,14 @@ async fn run_trial(
     }
 }
 
-/// Unpacks, measures, and hands back the document as the format states it.
+/// Prepares, measures, and hands back the document as the format states it.
 async fn measure_trial(
     server: &Server,
     cache: &Arc<Cache>,
     pipeline: &Pipeline<aj_sandbox::Docker>,
     config: &Config,
     trial: &ClaimedTrial,
+    stopping: &Stopping,
 ) -> Result<String, Trouble> {
     let work = Scratch::new(&config.work_path, &config.work_host_path, &trial.trial_id)?;
 
@@ -512,28 +521,30 @@ async fn measure_trial(
         .await
         .map_err(Trouble::from)?;
 
-    let package = unpacked_into(&work.places);
-    aj_package::extract(
-        archive.path(),
-        &package.here,
-        &aj_package::ArchiveLimits::default(),
-    )
-    .map_err(|e| e.to_string())?;
-
-    let declared = std::fs::read_to_string(package.here.join("config.yml"))
-        .map_err(|e| format!("config.yml could not be read: {e}"))?;
-
     // The same dispatch as judging, on the same string. A type this Runner does
     // not know is refused rather than guessed at.
     match trial.problem_type.as_str() {
         "standard-io@1" => {
-            let package_config = aj_package::Config::parse(&declared).map_err(|e| e.to_string())?;
-            let tests = aj_package::TestSet::read(&package.here, &package_config)
-                .map_err(|e| e.to_string())?;
+            // **No overlay here, deliberately.** A `ClaimedTrial` carries no
+            // configuration, because a trial calibrates the package itself
+            // rather than one activity's use of it.
+            let Some(prepared) =
+                prepare::prepare(&archive, pipeline, "standard-io", None, stopping).await?
+            else {
+                // Told to stop while another Runner was preparing. The trial's
+                // lease brings it back; nothing is reported.
+                return Err(Trouble::Stopping);
+            };
 
-            let measured =
-                aj_standard_io::measure(pipeline, &package_config, &tests, &package, &work.places)
-                    .await?;
+            let measured = aj_standard_io::measure(
+                pipeline,
+                &prepared.config,
+                &prepared.tests,
+                &prepared.package,
+                prepared.judge.as_ref(),
+                &work.places,
+            )
+            .await?;
 
             serde_json::to_string(&measured).map_err(|e| e.to_string().into())
         }
@@ -599,7 +610,7 @@ async fn handle(
     // work is redone from the start by whoever claims it next — which is what
     // happens today anyway when the lease expires, ten minutes later.
     let finished = tokio::select! {
-        finished = evaluate(server, cache, pipeline, config, &job) => finished,
+        finished = evaluate(server, cache, pipeline, config, &job, stopping) => finished,
         _ = stopping.wait() => {
             // The renewal stops first, so a renew cannot land after the release
             // and be refused for a job that is no longer running.
@@ -652,8 +663,9 @@ async fn evaluate(
     pipeline: &Pipeline<aj_sandbox::Docker>,
     config: &Config,
     job: &ClaimedJob,
+    stopping: &Stopping,
 ) -> Finished {
-    match judge(server, cache, pipeline, config, job).await {
+    match judge(server, cache, pipeline, config, job, stopping).await {
         Ok((report, attachments)) => Finished::Say(Box::new(report), attachments),
 
         Err(Trouble::Machinery(reason)) => {
@@ -665,6 +677,14 @@ async fn evaluate(
                     details: None,
                 },
             )
+        }
+
+        Err(Trouble::Stopping) => {
+            tracing::info!(
+                job = %job.job_id,
+                "told to stop before this attempt began; the lease requeues it",
+            );
+            Finished::Abandon
         }
 
         Err(Trouble::Away(e)) => {
@@ -710,6 +730,12 @@ enum Trouble {
     /// properly. Reporting anything here would replace a working retry with a
     /// permanent wrong answer.
     Away(aj_protocol::Error),
+
+    /// **Ours, and not a failure at all**: the word came while this attempt was
+    /// waiting for another Runner to finish preparing the package. Nothing is
+    /// reported, for the same reason as above — the lease requeues the job, and
+    /// the Runner that takes it next finds the package ready.
+    Stopping,
 }
 
 impl From<aj_protocol::Error> for Trouble {
@@ -746,6 +772,7 @@ async fn judge(
     pipeline: &Pipeline<aj_sandbox::Docker>,
     config: &Config,
     job: &ClaimedJob,
+    stopping: &Stopping,
 ) -> Result<(ReportResult, Attachments), Trouble> {
     if !job.has_package() {
         // Empty strings, not absent — there is nothing to judge against.
@@ -777,26 +804,22 @@ async fn judge(
         .await
         .map_err(Trouble::from)?;
 
-    let package = unpacked_into(&work.places);
-    aj_package::extract(
-        archive.path(),
-        &package.here,
-        &aj_package::ArchiveLimits::default(),
-    )
-    .map_err(|e| e.to_string())?;
-
-    let declared = std::fs::read_to_string(package.here.join("config.yml"))
-        .map_err(|e| format!("config.yml could not be read: {e}"))?;
-
     // The submission itself, by the name the Server gives it.
+    //
+    // **Downloaded into this job's own scratch and not into the cache**, under
+    // a name this Runner chose. It is one person's file, read once: an entry
+    // for it would be an eviction candidate, a holding marker and a directory
+    // that no second job will ever ask for. The cache is for what submissions
+    // share, which is the package.
     let submitted = job
         .files
         .iter()
         .find(|f| f.name == "source")
         .or_else(|| job.files.first())
         .ok_or("the submission carries no file")?;
-    let source = cache
-        .fetch(server, &submitted.file_id, &submitted.sha256)
+    let source = work.places.here.join("submission");
+    server
+        .download_verified(&submitted.file_id, &submitted.sha256, &source)
         .await
         .map_err(Trouble::from)?;
 
@@ -818,12 +841,18 @@ async fn judge(
             // The trial path above deliberately does not do this: a `ClaimedTrial`
             // carries no config, because a trial calibrates the package itself
             // rather than one activity's use of it.
-            let package_config = aj_package::Config::parse(&declared)
-                .and_then(|c| c.overlaid(job.config.as_ref()))
-                .map_err(|e| e.to_string())?;
-            let tests = aj_package::TestSet::read(&package.here, &package_config)
-                .map_err(|e| e.to_string())?;
-            let bytes = std::fs::read(source.path()).map_err(|e| e.to_string())?;
+            let Some(prepared) = prepare::prepare(
+                &archive,
+                pipeline,
+                "standard-io",
+                job.config.as_ref(),
+                stopping,
+            )
+            .await?
+            else {
+                return Err(Trouble::Stopping);
+            };
+            let bytes = std::fs::read(&source).map_err(|e| e.to_string())?;
 
             // **Required, and not guessed at.** It defaulted to `cpp`, which
             // was harmless while C++ was one of two languages and is not now:
@@ -842,12 +871,13 @@ async fn judge(
 
             let evaluated = pipeline
                 .evaluate(&aj_standard_io::Job {
-                    config: &package_config,
-                    tests: &tests,
+                    config: &prepared.config,
+                    tests: &prepared.tests,
                     language,
                     file_name: &submitted.file_name,
                     source: &bytes,
-                    package,
+                    package: prepared.package.clone(),
+                    judge: prepared.judge.as_ref(),
                     work: work.places.join("scratch"),
                     pipes: pipes.as_ref().map(|s| s.places.clone()),
                 })
@@ -856,18 +886,25 @@ async fn judge(
         }
 
         "output-only@1" => {
-            let package_config = aj_package::Config::parse_as(&declared, "output-only")
-                .and_then(|c| c.overlaid(job.config.as_ref()))
-                .map_err(|e| e.to_string())?;
-            let tests = aj_package::TestSet::read(&package.here, &package_config)
-                .map_err(|e| e.to_string())?;
+            let Some(prepared) = prepare::prepare(
+                &archive,
+                pipeline,
+                "output-only",
+                job.config.as_ref(),
+                stopping,
+            )
+            .await?
+            else {
+                return Err(Trouble::Stopping);
+            };
+            let (package_config, tests) = (&prepared.config, &prepared.tests);
 
             let into = work.places.join("answers").here;
             let answers = if is_archive(&submitted.file_name) {
                 // Untrusted, and the only untrusted archive the product opens.
-                aj_output_only::Answers::unpack(source.path(), &into)?
+                aj_output_only::Answers::unpack(&source, &into)?
             } else if tests.len() == 1 {
-                let bytes = std::fs::read(source.path()).map_err(|e| e.to_string())?;
+                let bytes = std::fs::read(&source).map_err(|e| e.to_string())?;
                 let only = tests.iter().next().expect("one test").name.clone();
                 aj_output_only::Answers::single(&bytes, &only, &into)?
             } else {
@@ -880,8 +917,9 @@ async fn judge(
                 .into());
             };
 
-            let judgement = aj_output_only::mark(&package.here, &package_config, &tests, &answers);
-            let details = aj_output_only::details(&judgement, &package_config);
+            let judgement =
+                aj_output_only::mark(&prepared.package.here, package_config, tests, &answers);
+            let details = aj_output_only::details(&judgement, package_config);
 
             Ok((
                 ReportResult::judged(
@@ -923,27 +961,6 @@ fn finish(evaluated: Evaluated, lease_token: &str) -> Result<(ReportResult, Atta
 /// A per-job directory that removes itself.
 struct Scratch {
     places: Places,
-}
-
-/// Where a job's package is unpacked: **inside that job's own scratch**.
-///
-/// A named function rather than a `join` at two call sites, because what it
-/// carries is not visible from either — and because the alternative is the sort
-/// of change nobody would recognise as a security decision.
-///
-/// **Every path a sandbox mounts comes from `job.work` or `job.package`**
-/// (`pipeline.rs`), and `Scratch` is per job. So while the package is unpacked
-/// *into* the scratch, two concurrently judged submissions share no mounted
-/// inode — and file locks, which are shared across mount namespaces on one
-/// inode, cannot pass between them.
-///
-/// Unpacking straight from the cache instead would save the copy and look like
-/// a performance change. It would also give every submission of a problem the
-/// same inodes, and with them a channel between contestants that nothing in a
-/// review would flag. `docs/SECURITY.md` §6 records the measurement; the test
-/// below is what stops it.
-fn unpacked_into(work: &Places) -> Places {
-    work.join("package")
 }
 
 impl Scratch {
@@ -1417,6 +1434,7 @@ mod tests {
             heartbeat: THIRTY,
             lease_seconds: seconds,
             cache_path: "/dev/null".into(),
+            cache_host_path: "/dev/null".into(),
             cache_max_bytes: 0,
             work_path: "/dev/null".into(),
             work_host_path: "/dev/null".into(),
@@ -1427,7 +1445,7 @@ mod tests {
         }
     }
 
-    /// **Two jobs share no mounted path.**
+    /// **A judged submission's container is given nothing two jobs share.**
     ///
     /// The property, asserted directly rather than through the syscall that
     /// would exploit its absence. File locks pass between processes holding one
@@ -1435,12 +1453,18 @@ mod tests {
     /// and denying `flock` would close that one road while leaving POSIX record
     /// locks, `F_NOTIFY` and anything else two processes can do to one inode.
     ///
-    /// What actually protects us is that there is no shared inode to hold. So
-    /// that is what is pinned here: every path a sandbox mounts comes from
-    /// `job.work` or `job.package`, `Scratch` is per job, and the package is
-    /// unpacked inside it.
+    /// What protects us is that there is no shared inode to hold, and since
+    /// 2026-09-15 there is not even a shared *path*: the package is unpacked
+    /// once into a cache every submission to the problem reads, and a judged
+    /// container is given **none of it** — the program it was compiled into,
+    /// and an input that arrives as a sealed file in memory. So what is pinned
+    /// here is that everything mounted into it comes out of this job's own
+    /// scratch.
+    ///
+    /// The judge's container is the one that *does* read the shared cache, and
+    /// `docs/SECURITY.md` §6 is where that trade is written down.
     #[test]
-    fn two_jobs_mount_nothing_in_common() {
+    fn a_judged_submission_mounts_nothing_another_job_can_reach() {
         let root = std::path::Path::new("/var/lib/algojudge");
         let host = std::path::Path::new("/host/algojudge");
 
@@ -1449,21 +1473,24 @@ mod tests {
 
         assert_ne!(one.places.on_host, two.places.on_host, "scratch is per job");
 
-        // As the daemon resolves them: a bind mount is resolved on the host, so
-        // two jobs sharing an inode would share it through `on_host` whatever
-        // this process sees.
-        let first = unpacked_into(&one.places).on_host;
-        let second = unpacked_into(&two.places).on_host;
+        // Where a submission's program is built and where its channels are
+        // made — every path a judged container is given, in the order
+        // `pipeline.rs` builds them.
+        for job in [&one, &two] {
+            for mounted in ["scratch/build/out", "scratch/out"] {
+                let at = job.places.join(mounted).on_host;
+                assert!(
+                    at.starts_with(&job.places.on_host),
+                    "{at:?} is outside the job's own scratch",
+                );
+            }
+        }
 
-        assert!(
-            first.starts_with(&one.places.on_host),
-            "a package unpacked outside its job's scratch is shared with every other job: {first:?}",
-        );
-        assert!(second.starts_with(&two.places.on_host));
+        let first = one.places.join("scratch").on_host;
+        let second = two.places.join("scratch").on_host;
         assert!(
             !first.starts_with(&second) && !second.starts_with(&first),
-            "two jobs' packages must not nest: {first:?} and {second:?}",
+            "two jobs' scratches must not nest: {first:?} and {second:?}",
         );
-        assert_ne!(first, second);
     }
 }

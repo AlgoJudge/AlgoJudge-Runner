@@ -31,7 +31,7 @@ use bollard::query_parameters::{
 use futures_util::StreamExt as _;
 
 use crate::cgroups::{self, Cgroups};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::profile::{Outcome, Pipes, Profile, Stopped, SHIM};
 use crate::{pipes::release, Beside, Enough, Error, Result, Sandbox};
@@ -72,13 +72,39 @@ pub struct Docker {
     ///
     /// Resolved by [`Self::preflight`], because deciding it needs the daemon.
     cgroups: std::sync::OnceLock<Option<Cgroups>>,
-    /// Whether each image carries the measuring shim, asked once.
+    /// What each image's measuring shim can do, asked once.
     ///
     /// **It has to be known before the container is made**, because it decides
     /// who the container starts as, and that is fixed at creation. An image with
     /// no shim runs unprivileged and measures from the cgroup alone; one that
     /// has it starts as root so the shim can drop.
-    shims: tokio::sync::Mutex<HashMap<String, bool>>,
+    ///
+    /// **Keyed by the image's id and not by its name**, because a tag moves. An
+    /// operator who republishes `lang-gcc:0` and restarts nothing would
+    /// otherwise have this Runner answering for the image that tag used to
+    /// name — and after a rollback the answer would be the newer image's,
+    /// which is how a socket comes to be handed to a shim that cannot take
+    /// one.
+    shims: tokio::sync::Mutex<HashMap<String, Option<ShimFeatures>>>,
+}
+
+/// What an image's measuring shim is able to do.
+///
+/// One field today, and a struct rather than a `bool` because the question it
+/// answers — "can this image judge the way this Runner judges" — is the sort
+/// that gains an entry rather than changes its type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShimFeatures {
+    /// It takes the test's input as a descriptor over a socket, rather than
+    /// opening a path.
+    pub socket_input: bool,
+}
+
+/// Whether `what` appears anywhere in `bytes`.
+fn carries(bytes: &[u8], what: &str) -> bool {
+    bytes
+        .windows(what.len())
+        .any(|window| window == what.as_bytes())
 }
 
 impl Docker {
@@ -131,8 +157,15 @@ impl Docker {
     /// Any failure answers `false`, which is the safe direction: the run falls
     /// back to the shell, the container stays unprivileged, and the measurement
     /// is the cgroup's alone.
-    async fn image_has_shim(&self, image: &str) -> bool {
-        if let Some(known) = self.shims.lock().await.get(image) {
+    async fn image_shim(&self, image: &str) -> Option<ShimFeatures> {
+        let id = match self.image_id(image).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::debug!(image, %e, "could not ask what this image is");
+                return None;
+            }
+        };
+        if let Some(known) = self.shims.lock().await.get(&id) {
             return *known;
         }
 
@@ -153,18 +186,87 @@ impl Docker {
         let found = match created {
             Err(e) => {
                 tracing::debug!(image, %e, "could not probe for the shim");
-                false
+                None
             }
-            Ok(_) => {
-                let read = self.take(&name, crate::SHIM, 8 * 1024 * 1024).await;
-                matches!(read, Ok(Some(_)))
-            }
+            Ok(_) => match self.take(&name, crate::SHIM, 8 * 1024 * 1024).await {
+                // **A tar stream, not the binary**: the archive endpoint hands
+                // back what a `docker cp` would. Nothing untars it — the shim is
+                // one stored file, so what is being looked for is contiguous in
+                // it, and a substring search over the whole stream answers the
+                // one question being asked.
+                Ok(Some(archive)) => Some(ShimFeatures {
+                    socket_input: carries(&archive, crate::SOCKET_INPUT),
+                }),
+                _ => None,
+            },
         };
         self.remove(&name).await;
 
-        tracing::info!(image, shim = found, "measured runs in this image");
-        self.shims.lock().await.insert(image.to_owned(), found);
+        tracing::info!(
+            image,
+            %id,
+            shim = found.is_some(),
+            socket_input = found.is_some_and(|f| f.socket_input),
+            "measured runs in this image",
+        );
+        self.shims.lock().await.insert(id, found);
         found
+    }
+
+    /// Whether the daemon can open a directory this Runner means to hand it.
+    ///
+    /// **The cache is the one the Runner cannot discover any other way.** A
+    /// package is unpacked and its judge built there, and both are bind-mounted
+    /// into the container that judges with them — so a path that is real here
+    /// and meaningless to the daemon is every submission to every problem with
+    /// a checker failing, worded as though the author's checker did not build.
+    ///
+    /// A **typed** mount, which refuses a source that is not there, on a
+    /// container that is created and never started: the check costs no image
+    /// pull and runs nothing. Skipped where the image is not on this host yet —
+    /// the first judged run pulls it and would produce the same refusal, with
+    /// the same words.
+    pub async fn can_mount(&self, at: &Path, image: &str) -> Result<bool> {
+        if self.client.inspect_image(image).await.is_err() {
+            tracing::debug!(image, "not here yet, so the cache mount was not checked");
+            return Ok(false);
+        }
+
+        let name = format!("algojudge-{}-mountprobe", self.instance);
+        self.take_nothing(&name).await;
+        let made = self
+            .client
+            .create_container(
+                Some(CreateContainerOptionsBuilder::default().name(&name).build()),
+                ContainerCreateBody {
+                    image: Some(image.to_owned()),
+                    labels: Some(self.labels()),
+                    host_config: Some(HostConfig {
+                        mounts: Some(vec![bollard::models::Mount {
+                            typ: Some(bollard::models::MountTypeEnum::BIND),
+                            source: Some(at.display().to_string()),
+                            target: Some("/probe".to_owned()),
+                            read_only: Some(true),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+        self.remove(&name).await;
+
+        made.map(|_| true).map_err(|e| {
+            Error::Refused(format!(
+                "the container runtime's daemon cannot open {} — {e}. It is where this \
+                 Runner unpacks packages and builds the judges they declare, and every \
+                 judge's container reads it, so a path only this process can see would \
+                 judge submissions against an empty directory. Set AJ_Cache__HostPath \
+                 to the cache as the daemon sees it",
+                at.display(),
+            ))
+        })
     }
 
     pub async fn ensure_image(&self, image: &str) -> Result<()> {
@@ -361,6 +463,9 @@ impl Docker {
                 profile
                     .mounts
                     .iter()
+                    // The ones that must exist are typed mounts below, which
+                    // refuse a source the daemon cannot open.
+                    .filter(|m| !m.required)
                     .map(|m| (m.from.clone(), m.to.clone(), m.writable))
                     // **Added here rather than by the caller, so it cannot be
                     // forgotten.** A profile that names a stdout directory and
@@ -390,15 +495,32 @@ impl Docker {
             // one, which the shim would join and be held to nothing by. A mount
             // refuses a source that is not there, so a path this Runner and the
             // daemon disagree about is a container that does not start.
-            mounts: bound.map(|from| {
-                vec![bollard::models::Mount {
-                    typ: Some(bollard::models::MountTypeEnum::BIND),
-                    source: Some(from.to_owned()),
-                    target: Some(BOUND_AT.to_owned()),
-                    read_only: Some(false),
-                    ..Default::default()
-                }]
-            }),
+            mounts: {
+                let mut typed: Vec<bollard::models::Mount> = bound
+                    .map(|from| bollard::models::Mount {
+                        typ: Some(bollard::models::MountTypeEnum::BIND),
+                        source: Some(from.to_owned()),
+                        target: Some(BOUND_AT.to_owned()),
+                        read_only: Some(false),
+                        ..Default::default()
+                    })
+                    .into_iter()
+                    .collect();
+                // **Everything that comes out of the shared cache**, for the
+                // reason the cgroup mount above gives: a path this Runner and
+                // the daemon disagree about has to be a container that does not
+                // start, not an empty directory a submission is judged against.
+                typed.extend(profile.mounts.iter().filter(|m| m.required).map(|m| {
+                    bollard::models::Mount {
+                        typ: Some(bollard::models::MountTypeEnum::BIND),
+                        source: Some(m.from.display().to_string()),
+                        target: Some(m.to.clone()),
+                        read_only: Some(!m.writable),
+                        ..Default::default()
+                    }
+                }));
+                (!typed.is_empty()).then_some(typed)
+            },
 
             // **Every container this Runner starts states its driver**, and
             // never inherits the daemon's. The default on a stock host is an
@@ -462,6 +584,18 @@ impl Docker {
 impl Sandbox for Docker {
     fn name(&self) -> &'static str {
         "docker"
+    }
+
+    /// **Asked every time, and cheap**: it is a local call, and it is the only
+    /// way to notice that a tag has been republished under a Runner that has
+    /// not restarted. Everything remembered about an image is filed under this.
+    async fn image_id(&self, image: &str) -> Result<String> {
+        Ok(self
+            .client
+            .inspect_image(image)
+            .await?
+            .id
+            .unwrap_or_else(|| image.to_owned()))
     }
 
     /// Reachable runtime, and a kernel that can enforce what is asked of it.
@@ -546,7 +680,11 @@ impl Sandbox for Docker {
         // Asked before anything is created: the user a container starts as
         // cannot be changed afterwards, and an image with no shim must not be
         // handed a root one.
-        let shim = profile.measured && self.image_has_shim(&profile.image).await;
+        let features = match profile.measured {
+            true => self.image_shim(&profile.image).await,
+            false => None,
+        };
+        let shim = features.is_some();
 
         // **A silent measured run without the shim would judge nobody's
         // program**, so it is refused before anything starts.
@@ -569,6 +707,20 @@ impl Sandbox for Docker {
                 profile.image
             )));
         }
+        // **An image built before the input became a descriptor cannot judge**,
+        // and the sentence has to say what to do about it. Its shim would open
+        // the socket as though it were a file, fail with `ENXIO`, and the run
+        // would arrive here as one that finished having measured nothing —
+        // which reads as a broken host rather than as an image to rebuild.
+        if profile.socket_input && !features.is_some_and(|f| f.socket_input) {
+            return Err(Error::Refused(format!(
+                "the {SHIM} in {} predates the input arriving as a descriptor, so it \
+                 cannot judge. Pull the language images published with this Runner \
+                 and restart it: an image is probed once and the answer is remembered",
+                profile.image
+            )));
+        }
+
         let nonce = shim.then(|| format!("{:016x}{:016x}", rand_suffix(), rand_suffix()));
 
         let name = format!(

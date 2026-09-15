@@ -18,6 +18,12 @@ pub mod affinity;
 pub mod beside;
 mod cgroups;
 pub mod docker;
+/// A test's input, as a sealed file in memory rather than a mounted one.
+///
+/// Linux only, and not merely Unix: `memfd_create` and its seals are what the
+/// arrangement rests on.
+#[cfg(target_os = "linux")]
+pub mod memfd;
 /// Named pipes, and why a judged run travels on one.
 ///
 /// Unix only, and that is not a gap: the sandbox starts Linux containers
@@ -28,8 +34,10 @@ mod profile;
 
 pub use beside::{Beside, Enough};
 pub use cgroups::Cgroups;
-pub use docker::Docker;
-pub use profile::{Mount, Outcome, Pipes, Profile, Stopped, SHIM};
+pub use docker::{Docker, ShimFeatures};
+#[cfg(target_os = "linux")]
+pub use memfd::SealedInput;
+pub use profile::{Mount, Outcome, Pipes, Profile, Stopped, SHIM, SOCKET_INPUT};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -60,6 +68,19 @@ pub trait Sandbox: Send + Sync {
     /// start and reported loudly, because a sandbox that silently does not
     /// enforce a limit produces wrong verdicts rather than errors.
     async fn preflight(&self) -> Result<()>;
+
+    /// What the mechanism calls this image **right now**.
+    ///
+    /// For a caller that has to notice a tag being republished: everything a
+    /// Runner remembers about an image — whether its shim can take a
+    /// descriptor, what was compiled against it and cached — is filed under
+    /// this rather than under the name, because the name moves.
+    ///
+    /// The name itself where a mechanism has no such notion, which is honest:
+    /// it then never looks stale because it never was fresh.
+    async fn image_id(&self, image: &str) -> Result<String> {
+        Ok(image.to_owned())
+    }
 
     /// Runs it with nothing beside it, which is what most callers want.
     async fn run(&self, profile: &Profile) -> Result<Outcome> {

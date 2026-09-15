@@ -532,18 +532,15 @@ fn quoted(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
 }
 
-/// Where a batch problem's input comes from: the file the package brought.
-pub fn test_input(test: &str) -> String {
-    format!("{INPUT}/{test}.in")
-}
-
 /// Wraps a start command so the submission reads one channel and writes another,
 /// through the measuring shim.
 ///
 /// **Two paths and no knowledge of what is behind them**, which is what lets one
-/// function serve both kinds of problem. For a batch problem the input is a file
-/// the package brought; for an interactive one it is a pipe with an interactor
-/// on the far end. The shim opens what it is given either way.
+/// function serve both kinds of problem. Both are in the run's own channel
+/// directory: a batch problem's input is a socket the Runner hands a descriptor
+/// over — the package's `<test>.in`, sealed, in memory — and an interactive
+/// one's is a pipe with an interactor on the far end. The shim takes what it is
+/// given either way, and no test file is mounted for either.
 ///
 /// **`exec`, and that is what makes the shell free.** It replaces itself, so it
 /// is not a second process in the accounting and not a second entry against the
@@ -713,22 +710,23 @@ mod tests {
     fn the_shim_is_given_the_input_and_the_output_in_that_order() {
         let script = with_channels(
             &["python3".into(), "/program/program.py".into()],
-            &test_input("1a"),
+            &format!("{OUTPUT}/{}", aj_sandbox::Pipes::INPUT),
             "/aj-out/stdout",
         )
         .pop()
         .unwrap();
 
-        // Both files are arguments, because the shim opens both — the input to
-        // read and the output to write. **Their order is the assertion**:
-        // swapped, the shim would truncate the test's input and feed the
-        // submission its own empty output, which is a wrong answer rather than
-        // an error anybody would see.
+        // Both channels are arguments, because the shim takes both — the
+        // input to read and the output to write. **Their order is the
+        // assertion**: swapped, the shim would write the program's answer into
+        // the channel its input was meant to arrive on and feed it its own
+        // empty output, which is a wrong answer rather than an error anybody
+        // would see.
         assert_eq!(
             script,
             concat!(
                 "exec /usr/local/bin/aj-shim ",
-                "'/in/1a.in' '/aj-out/stdout' 'python3' '/program/program.py'",
+                "'/aj-out/stdin' '/aj-out/stdout' 'python3' '/program/program.py'",
             ),
             "got {script}",
         );
@@ -749,7 +747,7 @@ mod tests {
     fn nothing_but_the_shim_and_no_shell_behind_it() {
         let script = with_channels(
             &["/program/program".into()],
-            &test_input("0a"),
+            &format!("{OUTPUT}/{}", aj_sandbox::Pipes::INPUT),
             "/aj-out/stdout",
         )
         .pop()

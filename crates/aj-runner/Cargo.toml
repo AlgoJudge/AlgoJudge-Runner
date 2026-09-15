@@ -19,7 +19,11 @@ aj-sandbox = { path = "../aj-sandbox" }
 aj-standard-io = { path = "../aj-standard-io" }
 
 anyhow.workspace = true
+# The key a built judge is filed under in the shared cache: its source, the
+# language it declares and the id of the image it was compiled against.
+hex.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -36,8 +40,6 @@ reqwest = { workspace = true, features = ["cookies", "multipart"] }
 # One test sends the Runner a real `SIGTERM` and watches what the Server sees.
 # Nothing else here talks to the daemon; the sandbox does that for the rest.
 bollard = { workspace = true }
-hex.workspace = true
-sha2.workspace = true
 # The clock, stopped. Renewal is a timer against a ten-minute lease, and a test
 # that proved anything about it by waiting would take ten minutes to run.
 # `test-util` is not part of `full`, and it is wanted only here — a release build
