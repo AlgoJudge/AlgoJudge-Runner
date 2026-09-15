@@ -295,7 +295,7 @@ docker info --format '{{.CgroupDriver}}'    # cgroupfs or systemd; both are supp
 | Daemon reconfiguration | none | none |
 | What the daemon is told | a path, `/algojudge/<run>` | a slice name, `algojudge-<instance>.slice` |
 | Who creates the cgroup | the Runner, `mkdir` | systemd, when the daemon asks it |
-| How many | **one per run**, removed afterwards | **one per Runner**, for its whole life |
+| How many | **one per run**, removed afterwards | **one per lane**, for the Runner's whole life — `algojudge-<instance>.slice` and, above one lane, `algojudge-<instance>_l1.slice` beside it |
 | A run's processor time | `cpu.stat`'s `usage_usec`, read | the same, as the **difference** across the run |
 | A **judged** run's peak memory | `memory.peak` of the submission's own cgroup, made per run by the shim inside the container | the same — this is the one row the driver does not reach |
 | Any other run's peak memory | `memory.peak`, read | `memory.peak` **reset** at the start of the run, **minus what the slice already held** |
@@ -325,10 +325,24 @@ can reclaim what those left with `systemctl stop 'algojudge-*.slice'`, naming
 only the fingerprints no running Runner announced at start.
 
 That is what makes the systemd numbers differences rather than readings, and
-what makes **one run at a time** part of the arrangement rather than an
-accident. The Runner claims one job at a time and judges one test at a time, and
-a mutex holds the invariant so that a second caller would wait rather than
-quietly spoil both readings.
+what makes **one run at a time in a slice** part of the arrangement rather than
+an accident. A mutex holds the invariant so that a second caller waits rather
+than quietly spoiling both readings.
+
+**One run at a time in a slice, not in a Runner.** Since 2026-09-15 a Runner may
+judge several of one submission's tests at once — `AJ_Runner__TestsAtOnce` — and
+each of those lanes has a slice of its own, so the subtraction above still
+describes one run. What the widths change is how many slices exist, not what a
+reading means: a Runner judging four tests at once has four, bounded by that
+variable, against the unbounded growth a slice per *test* would be.
+
+The extra ones are named with an underscore — `algojudge-<instance>_l1.slice` —
+because a `-` in a unit name is a level of nesting rather than a character. With
+a dash they would sit *inside* the Runner's own slice, one level deeper than
+anything else here, and a check for a leaked per-run cgroup reads exactly that
+level. **Lane zero keeps the name it has always had**, so a Runner nobody
+widened has exactly the tree it had before lanes existed, and `systemctl stop
+'algojudge-*.slice'` still matches all of them.
 
 **`memory.peak` is reset per file descriptor**, which is why the reset is not a
 one-line write: `echo > memory.peak` resets the mark only for the descriptor
