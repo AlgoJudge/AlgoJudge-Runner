@@ -37,6 +37,24 @@ pub struct Config {
     /// deadline it actually granted.
     pub lease_seconds: u32,
 
+    /// How many of one submission's tests are judged at once.
+    ///
+    /// **One, and that is the default rather than a starting point.** Every
+    /// lane wants a processor of its own: two judged runs on two threads of one
+    /// core take each other's execution units, and a limit is processor time --
+    /// so the same work costs more of it and a correct solution can be told it
+    /// was too slow. Widen this *and* this Runner's `cpuset` together, by whole
+    /// physical cores, or run fewer Runners over the same machine.
+    ///
+    /// It also multiplies what the host holds at once: this many judged
+    /// containers at the problem's memory limit plus 64 MiB each, this many
+    /// checker containers at 256 MiB, and this many sealed test inputs in the
+    /// Runner's own memory.
+    ///
+    /// A trial is unaffected -- it judges one test at a time whatever this
+    /// says, because the limits it derives are permanent.
+    pub tests_at_once: usize,
+
     pub cache_path: PathBuf,
     /// The same directory as the **daemon** sees it.
     ///
@@ -173,6 +191,8 @@ impl Config {
             heartbeat: Duration::from_secs(number("Heartbeat__Seconds", 60)),
 
             lease_seconds: number("Lease__RequestSeconds", 600) as u32,
+
+            tests_at_once: number("Runner__TestsAtOnce", 1) as usize,
 
             cache_path: cache.clone().into(),
             cache_host_path: var("Cache__HostPath").unwrap_or(cache).into(),

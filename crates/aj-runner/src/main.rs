@@ -61,6 +61,32 @@ async fn started() -> anyhow::Result<()> {
         "starting",
     );
 
+    // **Refused here rather than cut too thin, and refused at start rather than
+    // one submission at a time.** A lane is a processor's worth of judging: ask
+    // for more lanes than this Runner has processors and every lane is given
+    // the whole set, so two judged runs share execution units and spend more
+    // processor time on the same work -- and a time limit is processor time, so
+    // what an operator would see is correct solutions told they were too slow.
+    // There is nothing in a verdict that would say why.
+    let processors = aj_sandbox::affinity::width().or_else(aj_sandbox::affinity::on_this_host);
+    if let Some(processors) = processors {
+        if config.tests_at_once > processors {
+            anyhow::bail!(
+                "AJ_Runner__TestsAtOnce is {}, and this Runner has {processors} processor(s){}.                  Each test judged at once wants a processor of its own: two judged runs sharing                  one spend more processor time on the same work, and a time limit is processor                  time. Widen this Runner's cpuset, or lower AJ_Runner__TestsAtOnce",
+                config.tests_at_once,
+                match aj_sandbox::affinity::allowed() {
+                    Some(set) => format!(" ({set})"),
+                    None => String::new(),
+                },
+            );
+        }
+    }
+    tracing::info!(
+        tests_at_once = config.tests_at_once,
+        lanes = ?aj_sandbox::affinity::cut(config.tests_at_once),
+        "how many tests of one submission are judged at once, and where",
+    );
+
     let server = Arc::new(Server::new(&config.base_url)?);
     // The same fingerprint the sandbox is given, and for the same reason: a
     // cache volume may be shared between Runners on one host, and an entry one
@@ -87,7 +113,7 @@ async fn started() -> anyhow::Result<()> {
     // The fingerprint names this Runner's own containers, so a second Runner on
     // the host sweeps its orphans and not this one's evaluations. It is on disk
     // and survives a restart, which is the case the sweep exists for.
-    let sandbox = aj_sandbox::Docker::connect(identity.fingerprint())?;
+    let sandbox = aj_sandbox::Docker::connect(identity.fingerprint())?.across(config.tests_at_once);
     if let Err(e) = sandbox.preflight().await {
         if !below_specification(&e, config.allow_unmeasured) {
             return Err(e.into());

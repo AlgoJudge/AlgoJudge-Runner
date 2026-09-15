@@ -190,10 +190,19 @@ int main(void) {
 "#;
 
 async fn pipeline() -> Pipeline<Docker> {
+    pipeline_across(1).await
+}
+
+/// The same, judging `lanes` tests of one submission at once.
+async fn pipeline_across(lanes: usize) -> Pipeline<Docker> {
     // This suite's own name, so the clean slate below is this suite's and not a
     // Runner's that happens to be judging on the same host. Fixed rather than
     // per-run, so a previous run's leftovers are still swept.
-    let docker = Docker::connect("test-judging").expect("a container runtime");
+    // **Widened before preflight, not after**: preflight is what makes and
+    // proves this Runner's measurement homes, and there is one per lane.
+    let docker = Docker::connect("test-judging")
+        .expect("a container runtime")
+        .across(lanes);
     // **No override here, and there used to be one.** This suite judges, and a
     // verdict is made of processor time read from the run's own cgroup — so
     // continuing past a refused preflight would make every case below an
@@ -2366,4 +2375,240 @@ int main() {
         judged.judgement.tests,
     );
     assert_eq!(judged.judgement.score, judged.judgement.max_score);
+}
+
+// == lanes: one submission's tests, judged at once ===========================
+
+/// Four seconds, because each test below deliberately burns a second of
+/// processor time; 256 MiB, because one of them deliberately holds 64.
+const LANES_CONFIG: &str = r#"
+type: "standard-io@1"
+limits:
+  timeMs: 4000
+  memoryBytes: 268435456
+groups:
+  - group: 1
+    points: 100
+"#;
+
+/// **A second of processor time, taken from the program's own clock rather
+/// than counted in iterations.** A loop of a fixed length costs whatever this
+/// host makes of it; a second of `clock()` costs a second everywhere, which is
+/// what lets the wall-clock assertion below mean the same thing on a
+/// developer's machine and on CI.
+const BURNS_A_SECOND: &str = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+int main(void) {
+    long megabytes, plus;
+    if (scanf("%ld %ld", &megabytes, &plus) != 2) return 1;
+
+    /* Held and touched until the program ends: an allocation nothing reads is
+       one the compiler is free to forget. */
+    char *held = NULL;
+    if (megabytes > 0) {
+        held = (char *) malloc((size_t) megabytes * 1024 * 1024);
+        if (!held) return 2;
+        memset(held, 1, (size_t) megabytes * 1024 * 1024);
+    }
+
+    clock_t from = clock();
+    volatile double spin = 0;
+    while ((double) (clock() - from) / CLOCKS_PER_SEC < 1.0) {
+        for (int i = 0; i < 100000; i++) spin += i;
+    }
+
+    printf("%ld\n", megabytes + plus + (held ? held[0] - 1 : 0));
+    return 0;
+}
+"#;
+
+/// A package whose tests each cost a second of processor time, named by what
+/// the solution above does with its input: `<megabytes> <plus>`.
+fn a_slow_package(name: &str, tests: &[(&str, &str)]) -> (Places, Config, TestSet) {
+    let (here, on_host) = fixture(name);
+    std::fs::create_dir_all(here.join("tests")).unwrap();
+    std::fs::write(here.join("config.yml"), LANES_CONFIG).unwrap();
+
+    for (test, input) in tests {
+        let (megabytes, plus) = input.split_once(' ').expect("two numbers");
+        let sum: i64 = megabytes.parse::<i64>().unwrap() + plus.parse::<i64>().unwrap();
+        std::fs::write(here.join(format!("tests/{test}.in")), format!("{input}\n")).unwrap();
+        std::fs::write(here.join(format!("tests/{test}.out")), format!("{sum}\n")).unwrap();
+    }
+
+    let config = Config::parse(LANES_CONFIG).unwrap();
+    let tests = TestSet::read(&here, &config).unwrap();
+    (Places { here, on_host }, config, tests)
+}
+
+async fn judged_across(
+    lanes: usize,
+    name: &str,
+    package: &Places,
+    config: &Config,
+    tests: &TestSet,
+) -> Evaluated {
+    pipeline_across(lanes)
+        .await
+        .evaluate(&Job {
+            config,
+            tests,
+            language: "cpp",
+            file_name: "main.cpp",
+            source: BURNS_A_SECOND.as_bytes(),
+            judge: None,
+            package: package.clone(),
+            work: work(name),
+            pipes: None,
+        })
+        .await
+}
+
+fn test_names(verdict: &aj_standard_io::Verdict) -> Vec<String> {
+    verdict
+        .details
+        .tests
+        .iter()
+        .map(|test| test.no.clone())
+        .collect()
+}
+
+/// **The point of the whole arrangement**: a submission's tests are judged at
+/// once, so a participant waits for the slowest rather than for all of them.
+///
+/// Six tests of a second each. The assertion is deliberately loose -- eight
+/// tenths of the serial time -- because it has to survive a CI host with two
+/// processors and other work on them; what it is there to catch is lanes that
+/// do not overlap at all, and that takes the whole of the serial time or more.
+///
+/// It is also what proves a fresh Runner can ask an image about its shim from
+/// several lanes at once: the map is empty at the first test, the lanes reach
+/// it together, and a probe that let them take each other's container away
+/// would refuse a measured run and fail this job outright.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn several_tests_of_one_submission_are_judged_at_once() {
+    let inputs: Vec<(&str, &str)> = vec![
+        ("1a", "0 3"),
+        ("1b", "0 4"),
+        ("1c", "0 5"),
+        ("1d", "0 6"),
+        ("1e", "0 7"),
+        ("1f", "0 8"),
+    ];
+
+    let (package, config, tests) = a_slow_package("lanes-serial", &inputs);
+    let began = std::time::Instant::now();
+    let alone = verdict(judged_across(1, "lanes-serial", &package, &config, &tests).await);
+    let serial = began.elapsed();
+
+    let (package, config, tests) = a_slow_package("lanes-parallel", &inputs);
+    let began = std::time::Instant::now();
+    let together = verdict(judged_across(3, "lanes-parallel", &package, &config, &tests).await);
+    let parallel = began.elapsed();
+
+    // **The same submission, the same answer.** Widening a Runner may not
+    // change a verdict, a score, or the order the table is read in.
+    assert_eq!(alone.judgement.verdict, together.judgement.verdict);
+    assert_eq!(alone.judgement.score, together.judgement.score);
+    assert_eq!(test_names(&alone), test_names(&together));
+    assert_eq!(
+        test_names(&together),
+        ["1a", "1b", "1c", "1d", "1e", "1f"],
+        "the table is read in test order, whatever order the tests finished in",
+    );
+
+    assert!(
+        parallel.as_millis() * 10 < serial.as_millis() * 8,
+        "six tests of a second each took {serial:?} one at a time and {parallel:?} in \
+         three lanes; the lanes are not overlapping",
+    );
+}
+
+/// **Each lane's numbers are its own.** Under the `systemd` driver a reading is
+/// a difference across a slice, so two tests measured in one slice are each
+/// charged the other's peak -- silently, as a number printed beside a verdict.
+///
+/// One test holds 64 MiB and the other holds nothing, both for a second, both
+/// at the same time.
+///
+/// **It is the `systemd` leg of CI that this case is for.** Under `cgroupfs`
+/// every run has a directory of its own whatever lane it is in, so the property
+/// holds there for a reason that has nothing to do with lanes and the case
+/// passes without proving anything.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn each_lane_measures_in_a_home_of_its_own() {
+    let (package, config, tests) = a_slow_package("lanes-memory", &[("1a", "0 1"), ("1b", "64 1")]);
+    let together = verdict(judged_across(2, "lanes-memory", &package, &config, &tests).await);
+
+    let held = |name: &str| {
+        together
+            .details
+            .tests
+            .iter()
+            .find(|test| test.no == name)
+            .and_then(|test| test.memory_bytes)
+            .unwrap_or_else(|| panic!("{name} reported no memory"))
+    };
+    assert!(
+        held("1b") > 60 * 1024 * 1024,
+        "the test that held 64 MiB reported {} bytes",
+        held("1b"),
+    );
+    assert!(
+        held("1a") < 32 * 1024 * 1024,
+        "the test that held nothing reported {} bytes, which is its neighbour's",
+        held("1a"),
+    );
+}
+
+/// **A test whose machinery failed abandons the job, not the tests beside it.**
+///
+/// The tests already running run to their end. Dropping them where they stand
+/// would leave a container alive, a measurement gate held and a relay thread
+/// blocked on an open nothing will answer -- which is not a failed job but a
+/// Runner that never answers again. **The timeout is the assertion**: this case
+/// hangs rather than fails if that regresses. Measured: with the fan-out
+/// changed to stop by dropping what is still running, this case does not
+/// complete in ten minutes, against sixteen seconds for the three lane cases
+/// together.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_test_whose_machinery_failed_does_not_abandon_the_tests_beside_it() {
+    let (package, config, tests) = a_slow_package(
+        "lanes-broken",
+        &[("1a", "0 1"), ("1b", "0 2"), ("1c", "0 3")],
+    );
+    // The package says there is a test here and there is not: what a job meets
+    // when an entry was unpacked short, and an infrastructure failure rather
+    // than anybody's wrong answer.
+    std::fs::remove_file(package.here.join("tests/1b.in")).expect("a test to take away");
+
+    let judging = judged_across(2, "lanes-broken", &package, &config, &tests);
+    let evaluated = tokio::time::timeout(std::time::Duration::from_secs(120), judging)
+        .await
+        .expect("a failing test must not hold the tests beside it open");
+
+    match evaluated {
+        Evaluated::Failed(reason) => assert!(
+            reason.contains("1b"),
+            "the failure names the test it happened on: {reason}",
+        ),
+        Evaluated::Judged(_) => panic!("a test that could not be read is not a verdict"),
+    }
+
+    // Nothing was left running: a sweep that finds a container is a future
+    // dropped where it stood.
+    let left = pipeline_across(1)
+        .await
+        .sandbox()
+        .sweep()
+        .await
+        .expect("a sweep");
+    assert_eq!(left, 0, "{left} containers outlived the job that made them");
 }

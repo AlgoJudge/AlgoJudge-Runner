@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aj_package::{Config, Test, TestSet};
-use futures_util::StreamExt as _;
 use aj_sandbox::pipes::{open_for_writing, release, release_writer, Fifo};
 use aj_sandbox::{Beside, Enough, Mount, Pipes, Profile, Sandbox, Stopped};
+use futures_util::StreamExt as _;
 
 use crate::checker::{checker_said, Broken};
 use crate::compare::{Comparing, Comparison};
@@ -685,7 +685,6 @@ impl<S: Sandbox> Pipeline<S> {
         })))
     }
 
-
     /// One test, from its channels to its outcome.
     ///
     /// **Every path out of here releases what it made.** That was already true
@@ -828,9 +827,9 @@ impl<S: Sandbox> Pipeline<S> {
                         test.name, test.name,
                     )
                 })?;
-                let input = aj_sandbox::SealedInput::from_file(at).await.map_err(|e| {
-                    format!("test {}: the input could not be read: {e}", test.name)
-                })?;
+                let input = aj_sandbox::SealedInput::from_file(at)
+                    .await
+                    .map_err(|e| format!("test {}: the input could not be read: {e}", test.name))?;
                 let (socket, listener) =
                     aj_sandbox::pipes::Socket::make(channels.here.join(Pipes::INPUT), 0o600)
                         .map_err(|e| {

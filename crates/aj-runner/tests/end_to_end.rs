@@ -1065,6 +1065,7 @@ fn probe_config() -> Config {
         key_path: scratch.join("identity.key"),
         problem_types: vec!["lease-probe@1".into()],
         tags: vec![],
+        tests_at_once: 1,
         poll_min: Duration::from_secs(1),
         poll_max: Duration::from_secs(5),
         // No wait: these cases drive the claim loop directly and assert on when

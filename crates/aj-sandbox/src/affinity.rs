@@ -92,7 +92,21 @@ fn parse(list: &str) -> Option<Vec<usize>> {
 /// the host's count: how many lanes to judge in is the operator's to say, and
 /// nothing here would be checking it against a division anybody drew.
 pub fn width() -> Option<usize> {
-    allowed().as_deref().and_then(parse).map(|found| found.len())
+    allowed()
+        .as_deref()
+        .and_then(parse)
+        .map(|found| found.len())
+}
+
+/// How many processors this host has online, where that can be read.
+///
+/// **Only ever used to refuse an impossible width.** A Runner given the whole
+/// machine still pins nothing; this says how much "the whole machine" is, so an
+/// operator who asks for sixty-four lanes on four processors is told at start
+/// rather than discovering it as every submission taking longer than it should.
+pub fn on_this_host() -> Option<usize> {
+    let online = std::fs::read_to_string("/sys/devices/system/cpu/online").ok()?;
+    parse(online.trim()).map(|found| found.len())
 }
 
 /// The processors each of `lanes` lanes may use, in lane order.
