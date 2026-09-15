@@ -47,10 +47,11 @@ impl Comparison {
     /// the first differing token of every failing test at once. For a problem
     /// answered with one number per test, that is the answer key.
     ///
-    /// `input_mount` was changed on 2026-08-09 so that `<name>.out` never
-    /// reaches the participant's container. This was the same file reaching
-    /// them by the other road, and `output-only@1` shares this function — where
-    /// the answers *are* the submission, so it mattered more there still.
+    /// A judged container is given no part of the package at all, so that
+    /// `<name>.out` never reaches the participant. This was the same file
+    /// reaching them by the other road, and `output-only@1` shares this
+    /// function — where the answers *are* the submission, so it mattered more
+    /// there still.
     ///
     /// What is left is what they can act on: which token, and what they put
     /// there. Their own output discloses nothing they did not send.

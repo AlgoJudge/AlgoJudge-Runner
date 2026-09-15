@@ -54,8 +54,12 @@ Three properties of it shape everything here:
    answers `204` — a normal state, not an error. This is simpler than a socket,
    survives a dropped connection with no reconnection logic, and cannot deliver
    a job twice.
-3. **The Runner is stateless apart from a package cache.** One that dies
-   mid-evaluation resumes nothing and nobody comes back for that work. The
+3. **The Runner is stateless apart from a package cache.** It holds each
+   archive it has downloaded, the package unpacked from it and the judge
+   compiled out of that — prepared once for every submission to the problem,
+   under a lock several Runners can share — and discarding the lot costs a
+   download rather than a result. One that dies mid-evaluation resumes nothing
+   and nobody comes back for that work. The
    Server's **lease** is the whole recovery story: it expires, the job returns
    to the queue, and the Runner that woke up late is refused rather than allowed
    to overwrite whoever holds it now.

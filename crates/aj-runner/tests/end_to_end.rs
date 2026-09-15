@@ -538,6 +538,8 @@ async fn a_runner_judges_every_outcome_a_participant_can_get() {
 #[tokio::test]
 #[ignore = "needs the development stack with two Runners sharing one cache"]
 async fn two_runners_sharing_one_cache_judge_the_same_problem_at_once() {
+    let before_unpacking = prepared("_extracted");
+
     let admin = Session::as_("admin", "admin-development-only").await;
     approve_the_runner(&admin).await;
 
@@ -579,6 +581,17 @@ int main(){long long a,b;std::cin>>a>>b;std::cout<<a+b;}
         assert_eq!(judged["verdict"], "Accepted", "{judged}");
         assert_eq!(judged["score"], 100.0, "{judged}");
     }
+
+    // **And they prepared it once between them.** Two Runners missing the same
+    // entry at the start of a contest is the case the lock exists for: one
+    // unpacks the archive and builds the checker, the other waits and then
+    // finds both ready.
+    let unpacked = appeared(&before_unpacking, "_extracted");
+    assert_eq!(
+        unpacked.len(),
+        1,
+        "two Runners unpacked the same package: {unpacked:?}",
+    );
 }
 
 /// The sixth outcome, and the only one that is **not a verdict**.
@@ -1327,4 +1340,125 @@ async fn wait_for(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     panic!("submission {submission} never reached {want}");
+}
+
+// ── what the cache prepares once ────────────────────────────────────────────
+
+/// Everything of one name under the development stack's cache.
+///
+/// The stack binds `${PWD}/.runner-cache`, which this process sees through the
+/// same checkout: the toolchain container has the repository at `/work` and the
+/// Runner has the cache at the path the daemon opened.
+///
+/// **Counted as a difference and never as a total**, by [`appeared`]. Every
+/// test here publishes its package afresh and the Server gives each upload a
+/// file id of its own — which is the name of the entry, so the same bytes
+/// published twice are two entries by design. What a test can ask is how many
+/// appeared while it was running.
+fn prepared(name: &str) -> Vec<std::path::PathBuf> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.runner-cache")
+        .join("packages");
+
+    let mut found = Vec::new();
+    let mut stack = vec![root];
+    while let Some(at) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&at) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|n| n == name) {
+                found.push(path);
+            } else if path.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// **A package is unpacked once and its checker built once, however many
+/// submissions arrive.**
+///
+/// That is the whole of what the cache entry's directory is for: before it,
+/// every submission unpacked the archive into its own scratch and ran a
+/// compiler over the package's checker again. The committed package declares
+/// one, so this measures both halves at once.
+///
+/// **What is asserted is the count and not the timing**, because a timing
+/// assertion on a shared runner is a flake. One `_extracted` and one `_build`
+/// for one package is the property; a second of either means the work was done
+/// twice.
+#[tokio::test]
+#[ignore = "needs the development stack and the language images"]
+async fn one_package_is_prepared_once_however_many_submissions_arrive() {
+    let before_unpacking = prepared("_extracted");
+    let before_building = prepared("_build");
+
+    let admin = Session::as_("admin", "admin-development-only").await;
+    approve_the_runner(&admin).await;
+
+    let activity = publish(&admin, fixture("sum.zip")).await;
+    let participant = Session::as_("student", "student-development-only").await;
+    participant
+        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .await;
+    wait_until_open(&participant, &activity).await;
+
+    const CORRECT: &str = "#include <iostream>
+int main(){long long a,b;std::cin>>a>>b;std::cout<<a+b;}
+";
+    let mut sent = Vec::new();
+    for _ in 0..3 {
+        sent.push(participant.submit(&activity, CORRECT, "cpp").await);
+    }
+    for submission in sent {
+        let judged = settled(&participant, &activity, &submission).await;
+        assert_eq!(judged["verdict"], "Accepted", "{judged}");
+    }
+
+    let unpacked = appeared(&before_unpacking, "_extracted");
+    assert_eq!(
+        unpacked.len(),
+        1,
+        "three submissions to one package unpacked it {} times: {unpacked:?}",
+        unpacked.len(),
+    );
+
+    // One `_build` directory, holding exactly one judge: a second key under it
+    // would mean the checker was compiled against two different images, which
+    // nothing in one run can cause.
+    let builds = appeared(&before_building, "_build");
+    assert_eq!(
+        builds.len(),
+        1,
+        "the checker was built {} times",
+        builds.len()
+    );
+    let keys: Vec<_> = std::fs::read_dir(&builds[0])
+        .expect("the builds directory")
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(keys.len(), 1, "one checker, one build: {keys:?}");
+    assert!(
+        keys[0].join("out").exists(),
+        "the built judge is where a container mounts it from: {keys:?}",
+    );
+
+    // And the submissions themselves are **not** in the cache: it is for what
+    // several of them share, which is the package.
+    assert!(
+        prepared("submission").is_empty(),
+        "a participant's file was cached",
+    );
+}
+
+/// What appeared under the cache while a test was running.
+fn appeared(before: &[std::path::PathBuf], name: &str) -> Vec<std::path::PathBuf> {
+    prepared(name)
+        .into_iter()
+        .filter(|at| !before.contains(at))
+        .collect()
 }

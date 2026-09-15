@@ -168,6 +168,10 @@ services:
       # produces an empty directory rather than an error.
       AJ_Work__Path: /var/lib/algojudge-runner/work
       AJ_Work__HostPath: ${PWD}/.runner-work
+      # The cache as the **daemon** sees it, for the same reason and with the
+      # same trap: a package is unpacked and its checker built once, in the
+      # cache, and both are mounted into the container that judges with them.
+      AJ_Cache__HostPath: ${PWD}/.runner-cache
       # **No `AJ_Sandbox__AllowUnmeasured` here, deliberately.** It used to set
       # the old spelling of it so a development stack would start on a Docker
       # Desktop reporting cgroup v1. Starting is no longer the interesting part:
@@ -177,7 +181,12 @@ services:
       # it come up and then refuse work, one job at a time.
     volumes:
       - algojudge_runner_dev_identity:/var/lib/algojudge-runner
-      - algojudge_runner_dev_cache:/var/cache/algojudge-runner
+      # **A directory and not a named volume**, because the daemon has to be
+      # able to open it: a judge's container mounts the unpacked package and the
+      # program built from it straight out of here. It also needs `flock` and an
+      # atomic rename, which a bind of a Windows or macOS directory does not
+      # give — so a developer on either runs this stack from a Linux path.
+      - ${PWD}/.runner-cache:/var/cache/algojudge-runner
       - ${PWD}/.runner-work:/var/lib/algojudge-runner/work
       # **Writable, and judging needs it.** Each job container is started under
       # a cgroup that outlives it, and `memory.peak` and `cpu.stat` are read
@@ -205,4 +214,3 @@ services:
 volumes:
   algojudge_runner_dev_db:
   algojudge_runner_dev_identity:
-  algojudge_runner_dev_cache:

@@ -183,9 +183,13 @@ jobs:
 
       - name: Tear it down
         if: always()
-        run: >
-          docker compose -f example-runner-development-docker-compose.yaml
-          down -v
+        run: |
+          docker compose -f example-runner-development-docker-compose.yaml down -v
+          # **The cache is a directory now, so `down -v` does not reach it.** It
+          # has to be, because a judge's container mounts the unpacked package
+          # out of it and the daemon resolves that bind — and the Runner writes
+          # it as root, so this does too.
+          sudo rm -rf .runner-cache
 
   # The release gate for the evaluation pipeline (D-8, 2026-08-06). Every case is
   # a thing untrusted code will try; a suite that is not a gate is not a gate.

@@ -239,8 +239,8 @@ pub struct Profile {
     /// **For a program the package brought, and never for a submission.** The
     /// shim's own variables are added by the sandbox and are not these; a
     /// submission's container gets nothing here, because everything it is told
-    /// arrives as an argument or a mounted file, and an environment is a place
-    /// to leak something into by accident.
+    /// arrives as an argument or on a channel, and an environment is a place to
+    /// leak something into by accident.
     pub env: Vec<String>,
 
     /// A path inside the container to read back after it exits.
@@ -309,10 +309,13 @@ impl Pipes {
 
     /// What a submission's standard input travels on, where it has one.
     ///
-    /// **Only an interactive problem has one.** Everywhere else the input is a
-    /// file the package brought, mounted read-only, which is what makes a batch
-    /// problem reproducible; this is the channel that exists when the input is
-    /// being written by something reading the answers.
+    /// **Every judged run has one**, and what is behind it differs: for an
+    /// interactive problem a pipe with the interactor at the far end, and for
+    /// every other one a socket the Runner hands a descriptor over — the
+    /// package's `<test>.in`, sealed into a file in memory. Nothing of the
+    /// package is mounted into a judged container either way, and the
+    /// descriptor is seekable, which is what a batch problem needs and a pipe
+    /// could not give.
     pub const INPUT: &'static str = "stdin";
 
     /// What the shim's measurement report travels on.

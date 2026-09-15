@@ -131,16 +131,27 @@ has a test rather than a paragraph.
 
 1. **One test, one container, never reused.** A fresh container is the only
    answer that does not depend on cleanup having been written correctly.
-2. **The program is given its own test's input and nothing else.** One file:
-   `<name>.in`, mounted read-only and opened by the measuring shim, which is
-   handed exactly two paths — what to read and what to write. Mounting the whole
-   `tests/` directory would put `<name>.out` — the answer — inside the
-   submission's own container. See `pipeline.rs::input_mount`, and
+2. **The program is given its own test's input and nothing else — as a
+   descriptor, and not as a path.** Nothing of the package is mounted into a
+   judged container. The Runner reads `<name>.in` into a **sealed file in
+   memory** and hands the descriptor to the measuring shim over a Unix socket
+   the submission cannot reach; the shim puts it on standard input before it
+   drops to `nobody`. Sealed with `F_SEAL_WRITE`, `F_SEAL_SHRINK` and
+   `F_SEAL_GROW`, because a memfd's inode is world-writable and a program may
+   reopen its own standard input through `/proc/self/fd/0`.
+
+   The descriptor is **seekable**, which a pipe is not, so a solution that reads
+   its input twice is judged rather than failed. See
+   `aj-sandbox/src/memfd.rs`, `pipeline.rs::judged_mounts`, and
    `judging.rs::a_judged_submission_cannot_read_the_answer_key`, which proves it
    from **inside** a container: a submission that calls `open` on every test file
-   the package has reaches its own `.in` and nothing else — not its own `.out`,
-   and not another test's anything. Its interactive twin reaches nothing at all,
-   `/in` included.
+   the package has reaches nothing at all, its own `.in` included — the same
+   nothing its interactive twin reaches.
+
+   **The rule is stricter than it was and it had to become so**, because the
+   package is now unpacked once into a cache every submission to the problem
+   reads: a mount of any part of it would be an inode shared between
+   contestants. See §6.
 3. **Nothing a program writes reaches the next test.** Asserted in
    `adversarial.rs::nothing_survives_from_one_run_to_the_next`, for the scratch
    tmpfs **and** for `/dev/shm`.
@@ -175,18 +186,18 @@ Two things that follow, and are easy to get wrong in the opposite direction:
   submission writing 64 MiB there under a 32 MiB limit is `Memory limit
   exceeded`. It is still a surface nobody declared, which is why rule 3's test
   names it explicitly.
-- **The input is a mounted file, not a pipe — for a batch problem.** A pipe
-  would be marginally stricter and is deliberately not used: it is **not
-  seekable**, so a solution that reads its input twice would work on the author's
-  machine and fail here. The access surface is already one test either way, so
-  the stricter option buys nothing and costs a participant a verdict they cannot
-  explain.
+- **The input is a sealed file in memory, and neither a mount nor a pipe — for
+  a batch problem.** The two properties that matter pull in opposite directions
+  and this holds both: a pipe is **not seekable**, so a solution that reads its
+  input twice would work on the author's machine and fail here; and a mount out
+  of the shared cache would be an inode every submission to that problem holds
+  at once. A descriptor handed over a socket is seekable and is nobody else's.
 
   **For an interactive problem it is a pipe, and consciously so** (2026-09-05).
-  There is no file to mount: the input does not exist until an interactor decides
-  what to send, having read what the submission wrote. The cost above is real and
-  is paid — a solution cannot re-read its input — and it is inherent to the
-  problem type rather than a choice this document is making.
+  There is no file at all: the input does not exist until an interactor decides
+  what to send, having read what the submission wrote. A solution cannot re-read
+  it, and that is inherent to the problem type rather than a choice this
+  document is making.
 
 - **The submission's output is a pipe in every case** (2026-09-05), and this is
   where the paragraph above stops applying: nobody re-reads their own output. It
@@ -306,27 +317,35 @@ Stated so that absence is not read as a decision:
   mounted read-only see each other's locks, one holding a shared lock and the
   other refused an exclusive one.
 
-  **Corrected 2026-08-09: our sandboxes do not share an inode, so this does not
-  reach us.** An earlier version of this section said two submissions to the same
-  problem share the mounted tests, because the package is cached per problem
-  version. What is cached is the **archive**; the extraction target is
-  `Scratch::new(…, job_id)`, a directory per job, so two concurrently judged
-  submissions unpack their own copies and lock nothing in common. The channel is
-  real where a file *is* shared — which is why it is written down — and the
-  architecture that would expose it is one where the unpacked package is mounted
-  from the cache. It is not.
+  **A submission's container shares no inode with anything, so this does not
+  reach a contestant.** It is given the program it was compiled into and its own
+  channels, both under its job's own scratch, and **no part of the package at
+  all** — the input arrives as a sealed file in memory, made per run. Two
+  submissions to one problem therefore lock nothing in common, which is the
+  property `run.rs::a_judged_submission_mounts_nothing_another_job_can_reach`
+  pins, checked by breaking it on purpose and watching it fail.
 
-  So the lock rule has **no concrete driver here today**, and a custom profile
-  goes back to being defence in depth without a named threat. What would bring it
-  back is a change nobody would think of as a security decision: mounting the
-  unpacked package from the cache instead of unpacking per job, to save the copy.
-  That would be a sensible-looking performance change and would open a
-  contestant-to-contestant channel.
+  **A judge's container does share one, and that is a deliberate trade
+  (2026-09-15).** The package is unpacked once into the cache and the checker or
+  interactor it declares is compiled once beside it, and both are mounted
+  read-only into the container that judges with them — so every job of one
+  package holds those inodes at the same time. The saving is the reason: the
+  alternative is unpacking an archive and running a compiler for every
+  submission to every problem.
 
-  **Decided 2026-08-09: the property is pinned instead of the syscall.**
-  `run.rs::two_jobs_mount_nothing_in_common` asserts that every path a sandbox
-  mounts comes from the job's own scratch, and it was checked by breaking the
-  invariant on purpose and watching it fail.
+  **What that leaves is narrow and worth stating rather than denying.** A
+  checker is the package author's code, not a contestant's — but it reads the
+  participant's output, so a contestant who finds a way through an author's
+  parser is running code that holds those inodes. Two such subverted checkers,
+  in two jobs of the *same package*, could then use the lock channel above. It
+  needs a broken checker, it reaches only jobs of the package that checker
+  belongs to, and it carries nothing a submission could not already tell its own
+  checker.
+
+  So the lock rule has a driver again, narrower than the one it lost, and a
+  custom profile is still **not adopted**: what it would close is that one
+  channel, and what it costs is in the paragraph below — a vendored copy of
+  Docker's builtin that gets quietly weaker as theirs improves.
 
   Denying `flock` would close one road and leave POSIX record locks, `F_NOTIFY`
   and anything else two processes can do to one inode. What protects us is that
