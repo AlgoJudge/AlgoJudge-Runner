@@ -408,6 +408,60 @@ async fn a_measured_run_leaves_no_cgroup_behind() {
     assert_eq!(leftovers(&docker).await, 0);
 }
 
+/// **And a Runner judging several tests at once leaves nothing behind either.**
+///
+/// A lane has a measurement home of its own, so widening a Runner multiplies
+/// what has to be cleared up. Under `systemd` the lanes' slices are made at
+/// start and are meant to stay -- they are this Runner's, like the one a
+/// single-lane Runner has -- so the assertion is the one above: nothing is
+/// added *by a run*, at any width.
+#[tokio::test]
+#[ignore = "needs a container runtime and a writable cgroup mount"]
+async fn runs_in_several_lanes_leave_no_cgroup_behind() {
+    let docker = Docker::connect(SUITE)
+        .expect("a container runtime")
+        .across(3);
+    docker.preflight().await.expect("a host that can measure");
+    docker.sweep().await.expect("a clean slate");
+
+    let Some(homes) = docker.homes() else {
+        eprintln!("nothing to measure from on this host. Skipping.");
+        return;
+    };
+    let family = homes.any().family();
+    // After preflight, which is what makes a lane's home: the homes themselves
+    // are not what a run may leave behind.
+    let before = cgroups_under(&family);
+
+    // Bound rather than passed as temporaries: each run holds a reference to
+    // its profile for as long as it is in flight.
+    let one = shell("echo one").lane(0);
+    let two = shell("echo two").lane(1);
+    let three = shell("echo three").lane(2);
+    let (first, second, third) =
+        tokio::join!(docker.run(&one), docker.run(&two), docker.run(&three),);
+    for outcome in [&first, &second, &third] {
+        let outcome = outcome.as_ref().expect("the run");
+        assert!(
+            outcome.cpu_time.is_some(),
+            "a lane measured nothing on the {} backend",
+            homes.any().driver(),
+        );
+    }
+
+    let added: Vec<String> = cgroups_under(&family)
+        .into_iter()
+        .filter(|path| !before.contains(path))
+        .collect();
+    assert_eq!(
+        added,
+        Vec::<String>::new(),
+        "three lanes added these under {}, and nothing takes them away",
+        family.display()
+    );
+    assert_eq!(leftovers(&docker).await, 0);
+}
+
 /// The systemd backend end to end: **systemd made the slice this Runner named,
 /// and both numbers came out of it.**
 ///
