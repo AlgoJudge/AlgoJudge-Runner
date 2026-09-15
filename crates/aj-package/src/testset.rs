@@ -20,11 +20,11 @@ pub struct Test {
     pub letter: String,
     /// Where `<name>.in` is, when the package ships one.
     ///
-    /// **Nothing opens this path.** The pipeline rebuilds it from `name` when it
-    /// mounts one file into the submission's container, which is what lets that
-    /// rule be asserted without a container at all. What this field answers is
-    /// *is there one* — and only an interactive problem may say no, because
-    /// everywhere else the submission reads it.
+    /// **The Runner opens it, and the submission never does.** It is read into
+    /// a sealed file in memory and the descriptor is handed to the measuring
+    /// shim, so a judged container holds no path into the package — see
+    /// `aj_sandbox::memfd`. Only an interactive problem may say there is none,
+    /// because everywhere else the submission reads it.
     pub input: Option<PathBuf>,
     /// Where `<name>.out` is, when the package ships one.
     ///

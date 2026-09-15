@@ -18,8 +18,30 @@ use aj_sandbox::Sandbox as _;
 use aj_runner::config::Config;
 use aj_runner::run;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// **The runtime is built here rather than by `#[tokio::main]`**, for one line:
+/// the `shutdown_timeout` below.
+///
+/// Dropping a runtime waits for every blocking task to finish, and this Runner
+/// has two that a stop cannot interrupt — unpacking a package, which may be a
+/// gigabyte, and the relay threads a container that never started leaves
+/// waiting. A container runtime allows thirty seconds between `SIGTERM` and
+/// `SIGKILL`, and the whole of the stopping arrangement is about giving the
+/// jobs in hand back inside it. Waiting out an extraction nobody wants any more
+/// would spend that grace on work whose result is already abandoned.
+///
+/// Five seconds after `work` has returned, which is long past anything that is
+/// still doing something useful: the job has been handed back and the report
+/// loop has ended before this is reached.
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let worked = runtime.block_on(started());
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    worked
+}
+
+async fn started() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -43,11 +65,17 @@ async fn main() -> anyhow::Result<()> {
     // The same fingerprint the sandbox is given, and for the same reason: a
     // cache volume may be shared between Runners on one host, and an entry one
     // of them is reading must not be evicted by another.
-    let cache = Arc::new(Cache::new(
-        &config.cache_path,
-        config.cache_max_bytes,
-        identity.fingerprint(),
-    ));
+    let cache = Arc::new(
+        Cache::new(
+            &config.cache_path,
+            config.cache_max_bytes,
+            identity.fingerprint(),
+        )
+        // What the **daemon** calls the same directory. A judge's container is
+        // given the package unpacked here and the program built from it, and
+        // the daemon is what resolves a bind mount.
+        .with_host_root(&config.cache_host_path),
+    );
     // What a previous incarnation of this Runner was reading when it stopped.
     // Nobody else can release those, and an entry nobody can evict is a disk
     // that fills.
@@ -74,6 +102,19 @@ async fn main() -> anyhow::Result<()> {
              cgroups, so this Runner registers and answers the protocol and then \
              fails every job it claims."
         );
+    }
+
+    // **Before anything is judged, because the failure it catches is silent.**
+    // The cache is where a package is unpacked and its judge built, and both
+    // are mounted into the container that judges with them — so a path the
+    // daemon cannot open is every submission to every checker problem failing,
+    // in words that blame the package's author.
+    // One image is enough — what is being asked about is the path — and any of
+    // them will do, so the first that is on this host already answers it.
+    for image in config.images.all() {
+        if sandbox.can_mount(&config.cache_host_path, &image).await? {
+            break;
+        }
     }
 
     // Job containers are siblings, so they outlive the process that made them.

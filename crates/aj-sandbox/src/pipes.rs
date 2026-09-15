@@ -17,6 +17,8 @@
 
 use std::ffi::CString;
 use std::io;
+use std::os::fd::AsRawFd as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -187,6 +189,116 @@ impl Drop for Fifo {
             }
         }
     }
+}
+
+/// One Unix socket, removed when this is dropped.
+///
+/// **A socket where the neighbours are pipes**, because what travels on it is
+/// not bytes but a descriptor: the test's input, as a sealed file in memory.
+/// See [`crate::memfd`] for what is on the other end of it and why.
+pub struct Socket {
+    at: PathBuf,
+}
+
+impl Socket {
+    /// Makes one, and hands back something to accept on.
+    ///
+    /// **Bound through the directory rather than by its own path**, and that is
+    /// not a flourish: a socket address is `sun_path`, **108 bytes including
+    /// the terminator**, where a pipe has the filesystem's own limit. A job's
+    /// channels sit at `<work>/job-<id>/out/<test>/run/`, which is already
+    /// about ninety bytes with a two-character test name — and an operator
+    /// choosing a longer `AJ_Pipes__Path`, or a package naming a test `12ab`,
+    /// would push every batch test past it. Opening the directory and binding
+    /// at `/proc/self/fd/<n>/<name>` makes the address about twenty-five bytes
+    /// whatever the directory is called.
+    ///
+    /// `mode` is set afterwards for the reason [`Fifo::make`] gives: `bind`
+    /// applies the process umask, so the mode asked for is not the mode made.
+    /// The submission's own channels are `0o600` in a directory that is root's,
+    /// so the program — which is `nobody` by the time it runs — cannot open
+    /// them by name even though it can walk to them.
+    pub fn make(at: impl Into<PathBuf>, mode: u32) -> io::Result<(Self, tokio::net::UnixListener)> {
+        let at = at.into();
+        // Whatever is there is from an attempt that did not finish, and a
+        // socket somebody else may still hold an end of is worse than none.
+        let _ = std::fs::remove_file(&at);
+
+        let (directory, name) = match (at.parent(), at.file_name()) {
+            (Some(directory), Some(name)) => (directory, name),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} does not name a socket in a directory", at.display()),
+                ))
+            }
+        };
+
+        let held = opened(directory)?;
+        // SAFETY: `held` is open and owned for the whole of this scope.
+        let short = format!(
+            "/proc/self/fd/{}/{}",
+            held.as_raw_fd(),
+            name.to_string_lossy()
+        );
+
+        let listener = std::os::unix::net::UnixListener::bind(&short).map_err(|why| {
+            io::Error::new(
+                why.kind(),
+                format!(
+                    "could not make the socket {}: {why}. It has to be on a \
+                     filesystem that supports one, which is what AJ_Pipes__Path \
+                     is for",
+                    at.display()
+                ),
+            )
+        })?;
+        std::fs::set_permissions(&short, std::fs::Permissions::from_mode(mode))?;
+        listener.set_nonblocking(true)?;
+
+        Ok((Self { at }, tokio::net::UnixListener::from_std(listener)?))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.at
+    }
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.at) {
+            if e.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(path = %self.at.display(), %e, "a socket was left behind");
+            }
+        }
+    }
+}
+
+/// A directory, opened only to be named again.
+///
+/// `O_PATH` because nothing is read or written through it: it exists so that
+/// `/proc/self/fd/<n>` can stand in for a path too long to be a socket address.
+fn opened(directory: &Path) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+
+    let path = CString::new(directory.as_os_str().as_encoded_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} contains a zero byte", directory.display()),
+        )
+    })?;
+    // SAFETY: `path` is a valid C string that outlives the call.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor this call owns.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
 #[cfg(test)]

@@ -11,6 +11,9 @@ repository.workspace = true
 base64.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
+# `flock`, which is what keeps two Runners sharing a cache volume out of one
+# preparation. std exposes no file lock.
+libc.workspace = true
 rand_core.workspace = true
 reqwest.workspace = true
 serde.workspace = true

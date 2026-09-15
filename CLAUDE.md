@@ -93,6 +93,18 @@ joining a reserved one. Two things about it are easy to get wrong here:
 - **Three layers.** L1 control: protocol, leasing, cache. L2 backend
   orchestration. L3 the sandbox that runs untrusted code. **We do not write our
   own L3** — execution is delegated to an existing, maintained tool.
+- **A cache entry is a directory, and what it holds is prepared once.** The
+  archive, the package unpacked from it and the judge built out of that, under
+  `packages/ch/ec/ks/<fileId>/` with an `flock` in `locks/` keeping two Runners
+  out of one preparation. A **judged** container is given none of it: its input
+  is a sealed `memfd` handed to the shim over a socket, which is seekable and is
+  nobody else's inode. A **judge's** container mounts `tests/` and the built
+  program straight from the cache, which is why `AJ_Cache__HostPath` exists and
+  why `docs/SECURITY.md` §6 was rewritten rather than left as it stood.
+- **A shim change means rebuilding all four language images.** The Runner reads
+  the binary out of an image to decide what it can do, and refuses a judged run
+  in one whose shim predates the input arriving as a descriptor — an image is
+  probed once, so a pull without a restart changes nothing.
 - **Our own Docker pipeline is the first backend. Judge0 is out of the MVP.**
   It may return later as an optional backend an operator deploys, reached over
   HTTP. *Supersedes the 2026-08-02 decision that named Judge0 first.*

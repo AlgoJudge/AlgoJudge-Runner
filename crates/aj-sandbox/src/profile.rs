@@ -10,6 +10,14 @@ use std::time::Duration;
 /// than a language one.
 pub const SHIM: &str = "/usr/local/bin/aj-shim";
 
+/// What a shim says about itself when it can take its input as a descriptor.
+///
+/// **Read out of the binary in the image**, so a Runner can tell an image built
+/// before the arrangement from one built after without starting anything. An
+/// image whose shim predates it would open the socket as a file, fail with
+/// `ENXIO`, and report every test as a run that measured nothing.
+pub const SOCKET_INPUT: &str = "aj-shim-features: socket-input";
+
 /// A read-only or read-write path handed into the sandbox.
 ///
 /// **Never writable and executable at once.** A directory a submission can
@@ -20,6 +28,17 @@ pub struct Mount {
     pub from: PathBuf,
     pub to: String,
     pub writable: bool,
+    /// Whether the container runtime must **refuse** a source that is not
+    /// there, instead of making an empty directory in its place.
+    ///
+    /// **The default is the legacy bind, which creates one**, and that is the
+    /// failure mode every path-as-the-daemon-sees-it mistake ends in: the
+    /// container starts, the mount is empty, and a submission is judged against
+    /// nothing. A mount the Runner knows must exist — the package unpacked in
+    /// the shared cache, the judge built beside it — says so here, and a
+    /// misconfigured `AJ_Cache__HostPath` is then a container that does not
+    /// start and a sentence naming the path.
+    pub required: bool,
 }
 
 impl Mount {
@@ -28,6 +47,7 @@ impl Mount {
             from: from.into(),
             to: to.into(),
             writable: false,
+            required: false,
         }
     }
 
@@ -36,7 +56,14 @@ impl Mount {
             from: from.into(),
             to: to.into(),
             writable: true,
+            required: false,
         }
+    }
+
+    /// A source the daemon must already be able to open. See [`Mount::required`].
+    pub fn required(mut self) -> Self {
+        self.required = true;
+        self
     }
 }
 
@@ -156,6 +183,15 @@ pub struct Profile {
     /// than a coarser number.
     pub measured: bool,
 
+    /// Whether this run's standard input is a socket the Runner will hand a
+    /// descriptor over, rather than a path to open.
+    ///
+    /// Stated rather than guessed at, because the sandbox is the one that has
+    /// to refuse: an image whose shim predates the arrangement opens the socket
+    /// as a file and reports a run that measured nothing, which reads as a
+    /// broken host rather than as an image that needs rebuilding.
+    pub socket_input: bool,
+
     /// Lets the container write to its **own** layer — never to the host.
     ///
     /// Off for anything that runs a submission. On for a build, which has to
@@ -203,8 +239,8 @@ pub struct Profile {
     /// **For a program the package brought, and never for a submission.** The
     /// shim's own variables are added by the sandbox and are not these; a
     /// submission's container gets nothing here, because everything it is told
-    /// arrives as an argument or a mounted file, and an environment is a place
-    /// to leak something into by accident.
+    /// arrives as an argument or on a channel, and an environment is a place to
+    /// leak something into by accident.
     pub env: Vec<String>,
 
     /// A path inside the container to read back after it exits.
@@ -273,10 +309,13 @@ impl Pipes {
 
     /// What a submission's standard input travels on, where it has one.
     ///
-    /// **Only an interactive problem has one.** Everywhere else the input is a
-    /// file the package brought, mounted read-only, which is what makes a batch
-    /// problem reproducible; this is the channel that exists when the input is
-    /// being written by something reading the answers.
+    /// **Every judged run has one**, and what is behind it differs: for an
+    /// interactive problem a pipe with the interactor at the far end, and for
+    /// every other one a socket the Runner hands a descriptor over — the
+    /// package's `<test>.in`, sealed into a file in memory. Nothing of the
+    /// package is mounted into a judged container either way, and the
+    /// descriptor is seekable, which is what a batch problem needs and a pipe
+    /// could not give.
     pub const INPUT: &'static str = "stdin";
 
     /// What the shim's measurement report travels on.
@@ -322,6 +361,7 @@ impl Profile {
             pipes: None,
             mounts: Vec::new(),
             measured: false,
+            socket_input: false,
             tmpfs_bytes: None,
             max_open_files: 256,
             max_file_bytes: 256 * 1024 * 1024,
@@ -403,6 +443,12 @@ impl Profile {
     /// allowed everything.
     pub fn cpuset(mut self, set: impl Into<String>) -> Self {
         self.cpuset = Some(set.into());
+        self
+    }
+
+    /// Its standard input arrives as a descriptor. See [`Profile::socket_input`].
+    pub fn reading_a_socket(mut self) -> Self {
+        self.socket_input = true;
         self
     }
 

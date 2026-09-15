@@ -137,59 +137,34 @@ pub struct Places {
     pub on_host: PathBuf,
 }
 
-/// Everything a judged submission's container is given.
+/// Everything a judged submission's container is given: **the program, and
+/// nothing else.**
 ///
-/// **An interactive one is given no input file, and that is the whole of what
-/// makes a problem interactive.** Everything it reads is what the interactor
-/// decided to send in answer to what it wrote; mounting the file as well would
-/// let it skip the conversation, and for a problem whose secret is derived from
-/// the input it would hand over the answer.
+/// **No test file is mounted at all**, interactive or not. The input arrives as
+/// a descriptor the Runner hands the measuring shim over a socket — a sealed
+/// copy of `<test>.in` in memory — so the submission's container holds no path
+/// into the package and no inode any other job holds. `crate::pipeline`'s
+/// caller keeps the unpacked package in a cache several submissions share, and
+/// that is exactly the arrangement `docs/SECURITY.md` §6 refuses to expose a
+/// submission to.
 ///
-/// `PACKAGE_FORMAT.md` says the submission is given nothing at the start. That
-/// was prose and not code until 2026-09-05: the mount was applied to every
-/// judged run, interactive or not.
+/// **It was one mounted file until 2026-09-15**, and before 2026-08-09 it was
+/// the whole `tests/` directory — which holds `<name>.out` beside `<name>.in`,
+/// so `cat /in/1a.out` printed what the program had been asked to compute. The
+/// only thing that had stood in front of that was the forbidden-identifier
+/// dictionary, which `docs/SECURITY.md` §4 defines as a **policy** control
+/// whose every rule is expected to be bypassable. An answer key must not rest
+/// on a control the project itself calls bypassable, and now nothing rests on
+/// one: there is no file to reach.
 ///
-/// **The forbidden-identifier dictionary already refuses `fopen` and `ifstream`
-/// to a submission**, so this was never the only thing standing there — which is
-/// also why the hole was invisible. It is not enough on its own for the reason
-/// `docs/SECURITY.md` §4 gives: it is a *policy* control by decision (D-10) and
-/// **every rule in it is expected to be bypassable**. `open` and `read` are not
-/// on it at all, deliberately, so a submission that declares them itself reads
-/// whatever it is given — which is exactly what
-/// `a_judged_submission_cannot_read_the_answer_key` does.
+/// An interactive run is unchanged by any of this and always was given none:
+/// everything it reads is what the interactor decided to send in answer to what
+/// it wrote.
 ///
 /// A function rather than a chain at the call site, because this is the one
 /// place the rule is stated and it can then be asserted without a container.
-fn judged_mounts(artefacts: &Path, package: &Path, test: &str, interactive: bool) -> Vec<Mount> {
-    let mut mounts = vec![Mount::read_only(artefacts, PROGRAM)];
-    if !interactive {
-        mounts.push(input_mount(package, test));
-    }
-    mounts
-}
-
-/// What a running submission is given of the package: **one input file.**
-///
-/// A named function with a test rather than an expression at the call site,
-/// because getting it wrong is silent and expensive. `tests/` holds
-/// `<name>.in` beside `<name>.out`, so mounting the directory whole hands the
-/// submission the answer key — `cat /in/1a.out` prints what it was asked to
-/// compute, and the run still looks like an ordinary correct solution.
-///
-/// That was the arrangement until 2026-08-09. The only thing standing in front
-/// of it was the forbidden-word dictionary catching `fopen`, `ifstream` and
-/// `open`; `docs/SECURITY.md` §4 states that the dictionary is a **policy**
-/// control and that every rule in it is expected to be bypassable. An answer
-/// key must not rest on a control the project itself calls bypassable.
-///
-/// The program is started as `exec … < /in/<name>.in`, so one file is all it
-/// ever needed. The checker still receives both, because comparing them is its
-/// job and it is not the participant's code.
-fn input_mount(package: &Path, test: &str) -> Mount {
-    Mount::read_only(
-        package.join("tests").join(format!("{test}.in")),
-        format!("{INPUT}/{test}.in"),
-    )
+fn judged_mounts(artefacts: &Path) -> Vec<Mount> {
+    vec![Mount::read_only(artefacts, PROGRAM)]
 }
 
 impl Places {
@@ -221,8 +196,19 @@ pub struct Job<'a> {
     /// file by role and had no use for the name until now.
     pub file_name: &'a str,
     pub source: &'a [u8],
-    /// The unpacked package.
+    /// The unpacked package, in the shared cache and read-only.
+    ///
+    /// **Not a copy of this job's own any more.** It is unpacked once per
+    /// archive and read by every submission to that problem; nothing here
+    /// writes into it, and the judged container is given none of it at all.
     pub package: Places,
+    /// The checker or interactor this package declares, already built.
+    ///
+    /// `None` where it declares neither. A package that declares one and
+    /// arrives here without it is an infrastructure failure: the caller is the
+    /// one that prepares it, under the cache's lock, and nothing is going to
+    /// judge this submission correctly without it.
+    pub judge: Option<&'a Judge>,
     /// Scratch for this job alone, and empty. Removed by the caller afterwards.
     pub work: Places,
     /// Where this job's per-test stdout files go, when that is not the scratch.
@@ -240,16 +226,23 @@ pub struct Job<'a> {
     pub pipes: Option<Places>,
 }
 
-/// The package's checker, built and ready to be run over a test.
+/// The package's checker or interactor, built and ready to be run over a test.
 ///
 /// Carries its image and how it is started rather than assuming both. The
 /// assumption held while `cpp` was the only compiled language there was; it
 /// stopped holding the moment a package could name `cpp17-clang` — or `python3`,
 /// where starting `/program/program` would try to execute a `.py` file.
-struct Built {
-    at: Places,
-    image: String,
-    start: Vec<String>,
+///
+/// **Built once per package and handed in**, rather than built here per job.
+/// Compiling a checker is the same work for every submission to one problem, so
+/// it belongs beside the unpacked package in the shared cache — see
+/// `aj_runner::prepare`. What this type is, is the answer to "where did that
+/// land, and how is it started".
+#[derive(Debug, Clone)]
+pub struct Judge {
+    pub at: Places,
+    pub image: String,
+    pub start: Vec<String>,
 }
 
 /// The program beside the submission, and which of the two things it is.
@@ -259,9 +252,9 @@ struct Built {
 /// run in its own container — and they differ only in what is connected to it.
 /// A checker is handed the answer and asked about it; an interactor is handed
 /// the submission's questions and produces the answers to them.
-enum Aside {
-    Checker(Built),
-    Interactor(Built),
+enum Aside<'a> {
+    Checker(&'a Judge),
+    Interactor(&'a Judge),
 }
 
 /// A submission that was actually judged.
@@ -501,24 +494,21 @@ impl<S: Sandbox> Pipeline<S> {
         }
 
         // ── the checker, which is also untrusted-adjacent ───────────────────
-        // Refused together in `Config::validated`, so at most one arm is taken.
+        //
+        // **Built before this, once for the package, and handed in.** Refused
+        // together in `Config::validated`, so at most one arm is taken; a
+        // package that declares one and arrives without it is the caller having
+        // skipped the preparation, which is an infrastructure failure and not
+        // something to paper over by building it here per submission.
         let aside = match (&job.config.checker, &job.config.interactor) {
-            (Some(declared), _) => Some(Aside::Checker(self.build_checker(job, declared).await?)),
-            (_, Some(declared)) => {
-                Some(Aside::Interactor(self.build_checker(job, declared).await?))
-            }
+            (Some(_), _) => Some(Aside::Checker(job.judge.ok_or(
+                "this package declares a checker and none was prepared for this job",
+            )?)),
+            (_, Some(_)) => Some(Aside::Interactor(job.judge.ok_or(
+                "this package declares an interactor and none was prepared for this job",
+            )?)),
             (None, None) => None,
         };
-
-        // **`tests/` may legitimately not be there**, since an interactive
-        // package may name its tests by a count and ship no files at all — and
-        // a checker's and an interactor's container binds the directory whole.
-        // A bind mount of a missing source is not an error: the daemon makes an
-        // empty directory and the run proceeds against nothing.
-        if aside.is_some() {
-            std::fs::create_dir_all(job.package.here.join("tests"))
-                .map_err(|e| format!("the package's tests/ could not be made: {e}"))?;
-        }
 
         // ── each test, in its own container ─────────────────────────────────
         let mut outcomes = Vec::new();
@@ -619,13 +609,44 @@ impl<S: Sandbox> Pipeline<S> {
                 ),
             };
 
-            // **The submission's own standard input**, and it exists only for an
-            // interactive problem. Everywhere else the input is a file the
-            // package brought, mounted read-only — which is what makes a batch
-            // problem reproducible and is not being changed.
+            // **The submission's own standard input, and it is always in this
+            // directory.** What differs is what is behind it: for an
+            // interactive problem a pipe with the interactor at the far end,
+            // and for every other one a socket the Runner hands a descriptor
+            // over — a sealed copy of `<test>.in`, in memory, which the program
+            // can read, seek in and map privately. Nothing of the package is
+            // mounted into a judged container either way.
             let feeding = match &aside {
                 Some(Aside::Interactor(_)) => Some(channel(&channels.here.join(Pipes::INPUT))?),
                 _ => None,
+            };
+
+            // **Made before the container is started**, so the shim's connect
+            // never waits: it is served by a task holding the listener and the
+            // memory file, and nothing else can reach either.
+            let handing = match &feeding {
+                Some(_) => None,
+                None => {
+                    let at = test.input.as_ref().ok_or_else(|| {
+                        format!(
+                            "test {}: the package ships no {}.in, and only an interactive \
+                             problem judges without one",
+                            test.name, test.name,
+                        )
+                    })?;
+                    let input = aj_sandbox::SealedInput::from_file(at).await.map_err(|e| {
+                        format!("test {}: the input could not be read: {e}", test.name)
+                    })?;
+                    let (socket, listener) =
+                        aj_sandbox::pipes::Socket::make(channels.here.join(Pipes::INPUT), 0o600)
+                            .map_err(|e| {
+                                format!(
+                                    "test {}: the input channel could not be made: {e}",
+                                    test.name
+                                )
+                            })?;
+                    Some((input.hand_over(listener), socket))
+                }
             };
             let beside = Beside::new();
             let reading = relay(
@@ -651,10 +672,7 @@ impl<S: Sandbox> Pipeline<S> {
                 &language.image,
                 language::with_channels(
                     &language.start,
-                    &match &feeding {
-                        Some(_) => format!("{OUTPUT}/{}", Pipes::INPUT),
-                        None => language::test_input(&test.name),
-                    },
+                    &format!("{OUTPUT}/{}", Pipes::INPUT),
                     &format!("{OUTPUT}/{}", Pipes::OUTPUT),
                 ),
             )
@@ -674,14 +692,16 @@ impl<S: Sandbox> Pipeline<S> {
             .cpu_limit(Duration::from_millis(limits.time_ms))
             .pipes(&channels.here, &channels.on_host, OUTPUT);
 
-            let judged = judged_mounts(
-                &artefacts.on_host,
-                &job.package.on_host,
-                &test.name,
-                feeding.is_some(),
-            )
-            .into_iter()
-            .fold(judged, Profile::mount);
+            let judged = match handing.is_some() {
+                // The sandbox has to know, because an image whose shim predates
+                // the arrangement would open the socket as a file and report a
+                // run that measured nothing.
+                true => judged.reading_a_socket(),
+                false => judged,
+            };
+            let judged = judged_mounts(&artefacts.on_host)
+                .into_iter()
+                .fold(judged, Profile::mount);
             let judged = self.pinned(judged);
 
             // **The checker runs beside the submission, not after it.** It is
@@ -713,6 +733,16 @@ impl<S: Sandbox> Pipeline<S> {
             // started will never answer; leaving by a `?` would leak one per
             // failed test for the life of the Runner.
             release(output.path());
+            // **The hand-over is a task, never an arm of the `select!` above.**
+            // It finishes the moment the shim connects, which in the ordinary
+            // case is long before the program does — raced against the run it
+            // would end it, leaving the container, the measurement gate and the
+            // relay thread behind. Aborted here because a container that never
+            // started never connected, and the task would otherwise wait for a
+            // shim that is not coming; the socket goes with `per_test` below.
+            if let Some((handing, _socket)) = handing {
+                handing.abort();
+            }
             if let Some((feeding, stdin)) = feeding {
                 // Nothing is going to write the far end now, and nothing is
                 // going to read this one. Both halves of the thread's wait have
@@ -924,19 +954,58 @@ impl<S: Sandbox> Pipeline<S> {
         })))
     }
 
-    /// Builds the package's checker. Its failure is the **package** being
-    /// broken, which is an infrastructure failure and not a verdict.
+    /// Which image a declared judge is built and run in, and how it is
+    /// started.
+    ///
+    /// Split out of the build so that a caller which finds one **already**
+    /// built — the ordinary case, once a package has been judged once — can
+    /// still say how to run it without compiling anything.
+    pub fn judge_in(
+        &self,
+        declared: &aj_package::config::Source,
+    ) -> Result<(String, Vec<String>), String> {
+        let language = language::for_id(&declared.language, &self.images).ok_or_else(|| {
+            format!(
+                "the checker is in {}, which this Runner does not build",
+                declared.language
+            )
+        })?;
+        Ok((language.image.clone(), language.start.clone()))
+    }
+
+    /// What the runtime calls an image right now.
+    ///
+    /// **Half of what a built judge is filed under in the cache**, so that
+    /// republishing a language image rebuilds it rather than serving a program
+    /// compiled against the image that tag used to name.
+    pub async fn image_id(&self, image: &str) -> Result<String, String> {
+        self.sandbox
+            .image_id(image)
+            .await
+            .map_err(|e| format!("the image {image} could not be read: {e}"))
+    }
+
+    /// Builds the package's checker or interactor into `into`. Its failure is
+    /// the **package** being broken, which is an infrastructure failure and not
+    /// a verdict.
+    ///
+    /// **Called once per package rather than once per submission**, by whoever
+    /// holds the cache entry's lock — compiling a checker is the same work for
+    /// every submission to one problem. `into` is where the result is
+    /// assembled; what a caller hands back to [`Job::judge`] afterwards is the
+    /// published location.
     ///
     /// Hands back the image it was built in as well as where it landed. Running
     /// it used to be hard-coded to the C++ image, which was true only while
     /// there was one — a checker built by Clang and run in the GCC image is a
     /// coincidence away from working, and a Python checker would have been
     /// started as though it were a binary.
-    async fn build_checker(
+    pub async fn build_judge(
         &self,
-        job: &Job<'_>,
         declared: &aj_package::config::Source,
-    ) -> Result<Built, String> {
+        package: &Places,
+        into: &Places,
+    ) -> Result<Judge, String> {
         let language = language::for_id(&declared.language, &self.images).ok_or_else(|| {
             format!(
                 "the checker is in {}, which this Runner does not build",
@@ -944,14 +1013,11 @@ impl<S: Sandbox> Pipeline<S> {
             )
         })?;
 
-        let source = job.work.join("checker-src");
-        let built_into = job.work.join("checker-build");
-        let output = built_into.join("out");
-        for place in [&source, &built_into] {
-            std::fs::create_dir_all(&place.here).map_err(|e| e.to_string())?;
-        }
+        let source = into.join("src");
+        let output = into.join("out");
+        std::fs::create_dir_all(&source.here).map_err(|e| e.to_string())?;
 
-        let declared_at = job.package.here.join(&declared.source);
+        let declared_at = package.here.join(&declared.source);
         let bytes = std::fs::read(&declared_at).map_err(|e| {
             format!(
                 "{} is named as the checker and could not be read: {e}",
@@ -973,7 +1039,11 @@ impl<S: Sandbox> Pipeline<S> {
                         .tmpfs_bytes(BUILD_TMPFS_BYTES)
                         .writable_root()
                         .collect(BUILD_OUTPUT, BUILD_ARTEFACT_BYTES)
-                        .mount(Mount::read_only(&source.on_host, SOURCE)),
+                        // Required: the source it compiles is in the shared
+                        // cache, and an empty `/src` is a checker that does not
+                        // build for a reason the message would blame on its
+                        // author.
+                        .mount(Mount::read_only(&source.on_host, SOURCE).required()),
                 ),
             )
             .await
@@ -985,8 +1055,14 @@ impl<S: Sandbox> Pipeline<S> {
                 String::from_utf8_lossy(&built.stderr),
             ));
         }
-        unpack(&built.collected, &built_into.here)?;
-        Ok(Built {
+        unpack(&built.collected, &into.here)?;
+        // **The source goes, and what was built stays.** This directory is
+        // published into the cache and mounted into a container per test for as
+        // long as the package lives there; a copy of the author's source in it
+        // would be carried by every one of those mounts for nothing.
+        let _ = std::fs::remove_dir_all(&source.here);
+
+        Ok(Judge {
             at: output,
             image: language.image.clone(),
             start: language.start.clone(),
@@ -1016,7 +1092,7 @@ impl<S: Sandbox> Pipeline<S> {
     async fn interact(
         &self,
         job: &Job<'_>,
-        interactor: &Built,
+        interactor: &Judge,
         beside_them: &Places,
         test: &Test,
     ) -> Result<Result<crate::checker::Checked, Broken>, String> {
@@ -1081,17 +1157,29 @@ impl<S: Sandbox> Pipeline<S> {
                 // that even for a pipe. What is in the directory is three
                 // channels the Runner made and nothing else.
                 .mount(Mount::writable(&beside_them.on_host, ANSWER))
-                .mount(Mount::read_only(&interactor.at.on_host, PROGRAM))
-                .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT)),
+                // **Out of the shared cache, and required.** Both were unpacked
+                // or built once for this package; a path the daemon cannot open
+                // would otherwise be an empty directory and an interactor
+                // deciding against nothing.
+                .mount(Mount::read_only(&interactor.at.on_host, PROGRAM).required())
+                .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT).required()),
                 ),
             )
-            .await
-            .map_err(|e| format!("the interactor could not be run: {e}"))?;
+            .await;
 
+        // **Released before the run's own failure is looked at.** An interactor
+        // whose container never starts — a mount the daemon will not make, an
+        // image that is not there — used to return through `?` with the verdict
+        // channel still being read by a blocking thread nothing would ever
+        // write to. That thread outlives the job, and dropping a runtime waits
+        // for it: a Runner told to stop would wait out its grace and be killed,
+        // and a test binary would hang instead of failing. Measured 2026-09-15,
+        // on CI, as fifteen minutes of a suite producing no output at all.
         release(&beside_them.here.join(VERDICT));
         let verdict = reading
             .await
             .map_err(|e| format!("the interactor's verdict was not read: {e}"))?;
+        let run = run.map_err(|e| format!("the interactor could not be run: {e}"))?;
 
         if run.stopped != Stopped::OnItsOwn {
             return Err(format!("the interactor was stopped: {:?}", run.stopped));
@@ -1102,7 +1190,7 @@ impl<S: Sandbox> Pipeline<S> {
     async fn check(
         &self,
         job: &Job<'_>,
-        checker: &Built,
+        checker: &Judge,
         beside_them: &Places,
         test: &Test,
     ) -> Result<Result<crate::checker::Checked, Broken>, String> {
@@ -1136,8 +1224,13 @@ impl<S: Sandbox> Pipeline<S> {
                         // moved from there must keep working untouched.
                         .env(format!("AJ_TEST={test}"))
                         .env(format!("AJ_GROUP={group}"))
-                        .mount(Mount::read_only(&checker.at.on_host, PROGRAM))
-                        .mount(Mount::read_only(job.package.on_host.join("tests"), INPUT))
+                        // **Out of the shared cache, and required**: see the
+                        // interactor's, which says why an empty directory here
+                        // would be worse than a container that does not start.
+                        .mount(Mount::read_only(&checker.at.on_host, PROGRAM).required())
+                        .mount(
+                            Mount::read_only(job.package.on_host.join("tests"), INPUT).required(),
+                        )
                         // **Alongside, and this is the flag that stops a hard
                         // deadlock.** The judged run holds the measurement gate for
                         // its whole length, and on the systemd cgroup driver that
@@ -1735,62 +1828,37 @@ mod tests {
         assert!(shown.iter().all(|line| !line.contains("not listed")));
     }
 
-    /// **An interactive submission is given no input file at all.**
+    /// **No judged submission is given a file of the package at all.**
     ///
-    /// Everything it reads is what the interactor decided to send. Mounting the
-    /// file as well would let it skip the conversation — and where the secret is
-    /// derived from the input, as it is in every guessing problem, it would hand
-    /// over the answer.
+    /// Not the answer key, not its own input, not an empty directory where one
+    /// would be: the program it was compiled into, and nothing else. What it
+    /// reads arrives as a descriptor on a socket — see [`crate::pipeline`]'s
+    /// per-test setup and `aj_sandbox::memfd`.
     ///
     /// **Asserted here rather than in a container**, because from inside there
     /// is no way to look: reading a file needs `fopen` or `ifstream`, and the
     /// forbidden-identifier dictionary refuses a submission both. That
-    /// dictionary is why the hole went unnoticed, and it is also why it is not
-    /// enough — it is a policy control by decision, and a package may turn it
-    /// off.
+    /// dictionary is why the answer key went unnoticed in the mount for so
+    /// long, and it is also why it is not enough — it is a policy control by
+    /// decision, and a package may turn it off. The containerised half is
+    /// `judging.rs::a_judged_submission_cannot_read_the_answer_key`.
     #[test]
-    fn an_interactive_submission_is_given_no_input_file() {
-        let package = std::path::Path::new("/packages/one");
+    fn a_judged_submission_is_given_its_program_and_nothing_else() {
         let artefacts = std::path::Path::new("/work/build/out");
+        let mounts = judged_mounts(artefacts);
 
-        let batch = judged_mounts(artefacts, package, "2a", false);
+        assert_eq!(mounts.len(), 1, "the program, and nothing else: {mounts:?}");
+        assert_eq!(mounts[0].to, PROGRAM);
+        assert!(!mounts[0].writable);
+
+        // The two shapes that leaked, in order: the whole `tests/` directory,
+        // which carries `<test>.out` beside `<test>.in`, and then one input
+        // file — which was correct and is still an inode shared with every
+        // other submission to that problem now that the package is unpacked in
+        // a cache they all read.
         assert!(
-            batch.iter().any(|m| m.to == "/in/2a.in"),
-            "a batch problem's input is a mounted file: {batch:?}",
-        );
-
-        let interactive = judged_mounts(artefacts, package, "2a", true);
-        assert!(
-            !interactive.iter().any(|m| m.to.starts_with("/in")),
-            "an interactive submission was handed the input it is supposed to ask for: \
-             {interactive:?}",
-        );
-        assert_eq!(
-            interactive.len(),
-            1,
-            "the program, and nothing else: {interactive:?}",
-        );
-    }
-
-    /// The answer key is not in the container the submission runs in.
-    ///
-    /// Asserted on the mount rather than by trying to read it from a
-    /// submission, because every way of reading a file is already refused by
-    /// the word dictionary — so a test written that way would pass for the
-    /// wrong reason and keep passing after the dictionary was relaxed.
-    #[test]
-    fn a_running_submission_is_given_its_input_and_not_the_answers() {
-        let mount = input_mount(Path::new("/cache/pkg"), "1a");
-
-        assert_eq!(mount.from, Path::new("/cache/pkg/tests/1a.in"));
-        assert_eq!(mount.to, "/in/1a.in");
-        assert!(!mount.writable);
-
-        // The shape that leaked: the directory itself, which carries `1a.out`.
-        assert_ne!(
-            mount.from,
-            Path::new("/cache/pkg/tests"),
-            "mounting the directory hands over the answer key",
+            !mounts.iter().any(|m| m.to.starts_with(INPUT)),
+            "a judged submission was handed part of the package: {mounts:?}",
         );
     }
 

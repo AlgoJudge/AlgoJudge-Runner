@@ -18,6 +18,10 @@
 /.runner-work/
 /.runner-work-2/
 
+# The package cache both of them share. A directory rather than a named volume
+# because the daemon has to be able to open it — see the compose file.
+/.runner-cache/
+
 # Compose reads this for variable substitution beside the development stack,
 # and it holds the Server admin token. Never committed.
 /.env

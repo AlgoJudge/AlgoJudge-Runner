@@ -38,6 +38,16 @@ pub struct Config {
     pub lease_seconds: u32,
 
     pub cache_path: PathBuf,
+    /// The same directory as the **daemon** sees it.
+    ///
+    /// **A judge's container reads the cache directly**: the package is
+    /// unpacked and its checker built once, in the entry the archive sits in,
+    /// and both are bind-mounted read-only into the container that judges with
+    /// them. A bind mount is resolved by the daemon, so where the Runner is
+    /// itself in a container the two views differ — and the same trap as
+    /// `AJ_Work__HostPath` applies, which is why the Runner probes it at start
+    /// rather than discovering it as an empty `/in`.
+    pub cache_host_path: PathBuf,
     pub cache_max_bytes: u64,
 
     /// Scratch for jobs, in both the views a bind mount needs.
@@ -130,6 +140,7 @@ impl Config {
         }
 
         let work = var("Work__Path").unwrap_or_else(|| "/var/lib/algojudge-runner/work".into());
+        let cache = var("Cache__Path").unwrap_or_else(|| "/var/cache/algojudge-runner".into());
 
         Ok(Self {
             base_url,
@@ -163,9 +174,8 @@ impl Config {
 
             lease_seconds: number("Lease__RequestSeconds", 600) as u32,
 
-            cache_path: var("Cache__Path")
-                .unwrap_or_else(|| "/var/cache/algojudge-runner".into())
-                .into(),
+            cache_path: cache.clone().into(),
+            cache_host_path: var("Cache__HostPath").unwrap_or(cache).into(),
             cache_max_bytes: number("Cache__MaxBytes", 10 * 1024 * 1024 * 1024),
 
             work_path: work.clone().into(),

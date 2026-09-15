@@ -119,6 +119,7 @@ run() {
         -e CARGO_TERM_COLOR=always \
         -e AJ_TEST_SERVER \
         -e AJ_ADMIN_TOKEN \
+        -e AJ_TEST_RUNNER_CONTAINER \
         -e AJ_SANDBOX_ALLOW_CGROUP_V1 \
         -e RUST_LOG \
         -e "AJ_HOST_WORKDIR=$HOST_DIR" \

@@ -22,7 +22,7 @@ pub mod stopping;
 pub mod wire;
 
 pub use backoff::Backoff;
-pub use cache::Cache;
+pub use cache::{Cache, Entry, Locked};
 pub use client::Server;
 pub use error::{Error, Result};
 pub use identity::Identity;
