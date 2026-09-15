@@ -61,7 +61,7 @@ pub async fn measure<S: Sandbox>(
         let mine = work.join(&format!("model-{index}"));
 
         let evaluated = pipeline
-            .evaluate(&Job {
+            .evaluate_one_at_a_time(&Job {
                 config,
                 tests,
                 language: &model.language,

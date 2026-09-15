@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aj_package::{Config, Test, TestSet};
+use futures_util::StreamExt as _;
 use aj_sandbox::pipes::{open_for_writing, release, release_writer, Fifo};
 use aj_sandbox::{Beside, Enough, Mount, Pipes, Profile, Sandbox, Stopped};
 
@@ -275,9 +276,112 @@ pub enum Evaluated {
     Failed(String),
 }
 
+/// The lanes this Runner judges in, and which of them nobody is holding.
+///
+/// One lane is one place a test can be judged: a piece of the Runner's
+/// processors and a measurement home of its own. There are as many as an
+/// operator asked for tests at once, for the life of the Runner.
+struct Lanes {
+    /// The processors each lane may use, in lane order. `None` in a lane is a
+    /// Runner that was given the whole machine -- see `aj_sandbox::affinity`.
+    cpus: Vec<Option<String>>,
+    /// One permit per lane.
+    free: tokio::sync::Semaphore,
+    /// Which lanes nobody holds. A `std` mutex because it is never held across
+    /// an await, and because a permit has already decided there is one to take.
+    idle: std::sync::Mutex<Vec<usize>>,
+}
+
+/// One lane, held for the length of one test.
+///
+/// **Not `Clone`, and that is the whole of the rule that a test's judge runs
+/// where the test runs.** Exactly one of these is in scope inside a test, and
+/// it is the only thing in this file that can confine a container to anything
+/// narrower than the whole Runner -- so a checker cannot be given a different
+/// one without somebody deliberately taking a second lane, which would
+/// serialise the fan-out and show up the moment it was measured.
+struct Lane<'a> {
+    pool: &'a Lanes,
+    index: usize,
+    _permit: tokio::sync::SemaphorePermit<'a>,
+}
+
+impl Lanes {
+    fn new(cpus: Vec<Option<String>>) -> Self {
+        Self {
+            free: tokio::sync::Semaphore::new(cpus.len()),
+            // Reversed, so that the first lane taken is lane zero: a Runner
+            // judging one test at a time then measures where it always did.
+            idle: std::sync::Mutex::new((0..cpus.len()).rev().collect()),
+            cpus,
+        }
+    }
+
+    fn width(&self) -> usize {
+        self.cpus.len()
+    }
+
+    /// Waits for a lane nobody is in, and holds it until the value is dropped.
+    async fn take(&self) -> Lane<'_> {
+        let permit = self
+            .free
+            .acquire()
+            .await
+            .expect("the lanes are never closed");
+        let index = self
+            .idle
+            .lock()
+            .expect("a lane is never held across a panic")
+            .pop()
+            .expect("a permit is a lane nobody holds");
+        Lane {
+            pool: self,
+            index,
+            _permit: permit,
+        }
+    }
+}
+
+impl Lane<'_> {
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn cpus(&self) -> Option<&str> {
+        self.pool.cpus.get(self.index).and_then(Option::as_deref)
+    }
+}
+
+impl Drop for Lane<'_> {
+    /// **The index goes back before the permit does.** A value's own `drop`
+    /// runs before its fields are dropped, and the permit is a field -- so the
+    /// waiter this releases finds a lane in `idle` rather than a `pop` on an
+    /// empty list.
+    fn drop(&mut self) {
+        if let Ok(mut idle) = self.pool.idle.lock() {
+            idle.push(self.index);
+        }
+    }
+}
+
+/// Where a container this pipeline starts is placed.
+enum On<'a> {
+    /// **The whole of what this Runner was given, and only for the builds.** A
+    /// build is not the step being timed, nothing else of this job is running
+    /// while it happens, and it is the one step that gains from every processor
+    /// there is -- cutting a compile into one lane would make it N times slower
+    /// to buy nothing.
+    TheWholeRunner,
+    /// A judged run, and whatever is judging beside it. Both go in the same
+    /// lane, because they are one test.
+    Lane(&'a Lane<'a>),
+}
+
 pub struct Pipeline<S> {
     sandbox: S,
     images: Images,
+    /// The lanes this Runner judges in, as many as its sandbox has homes for.
+    lanes: Lanes,
     /// The processors a timed run may use, taken once from this Runner's own
     /// affinity.
     ///
@@ -293,6 +397,10 @@ pub struct Pipeline<S> {
 impl<S: Sandbox> Pipeline<S> {
     pub fn new(sandbox: S, images: Images) -> Self {
         Self {
+            // One number, and it lives on the sandbox: a pipeline that fanned
+            // out wider than the sandbox has measurement homes would have two
+            // tests sharing one reading.
+            lanes: Lanes::new(aj_sandbox::affinity::cut(sandbox.lanes())),
             sandbox,
             images,
             cpus: aj_sandbox::affinity::allowed(),
@@ -324,18 +432,33 @@ impl<S: Sandbox> Pipeline<S> {
     ///
     /// The two builds are the ones that mattered most: a compiler is the most
     /// processor-hungry thing here, and a checker mostly waits on a pipe.
-    fn pinned(&self, profile: Profile) -> Profile {
-        pin(profile, self.cpus.as_deref())
+    fn pinned(&self, on: On<'_>, profile: Profile) -> Profile {
+        placed(profile, on, self.cpus.as_deref())
     }
 
     pub async fn evaluate(&self, job: &Job<'_>) -> Evaluated {
-        match self.attempt(job).await {
+        self.judged(job, self.lanes.width()).await
+    }
+
+    /// One submission, judged one test at a time.
+    ///
+    /// **What a trial uses, and it is not a preference.** The limits a trial
+    /// derives are written into the package and paid by every future submission
+    /// to it -- so a limit inflated by contention this Runner inflicted on
+    /// itself would be permanent, and nobody reading the number afterwards
+    /// could tell. A trial is slower than judging on the same host, on purpose.
+    pub async fn evaluate_one_at_a_time(&self, job: &Job<'_>) -> Evaluated {
+        self.judged(job, 1).await
+    }
+
+    async fn judged(&self, job: &Job<'_>, width: usize) -> Evaluated {
+        match self.attempt(job, width).await {
             Ok(evaluated) => evaluated,
             Err(reason) => Evaluated::Failed(reason),
         }
     }
 
-    async fn attempt(&self, job: &Job<'_>) -> Result<Evaluated, String> {
+    async fn attempt(&self, job: &Job<'_>, width: usize) -> Result<Evaluated, String> {
         let language = language::for_id(job.language, &self.images)
             .ok_or_else(|| format!("this Runner does not evaluate {}", job.language))?;
 
@@ -450,6 +573,7 @@ impl<S: Sandbox> Pipeline<S> {
                 .sandbox
                 .run(
                     &self.pinned(
+                        On::TheWholeRunner,
                         Profile::new(&language.image, command)
                             .memory_bytes(512 * 1024 * 1024)
                             .pids(128)
@@ -510,439 +634,46 @@ impl<S: Sandbox> Pipeline<S> {
             (None, None) => None,
         };
 
-        // ── each test, in its own container ─────────────────────────────────
-        let mut outcomes = Vec::new();
-        for test in job.tests.iter() {
-            let limits = job.config.effective(test.group, &language.keys());
-
-            // **Where this test's stdout goes, instead of the daemon's log.**
-            // One directory per test, made by the Runner and root's, so the
-            // submission — which runs as `nobody` — cannot create, rename or
-            // read anything in it. The shim opens the file inside it before it
-            // drops privileges and hands over the descriptor alone.
-            let per_test = job
-                .pipes
-                .clone()
-                .unwrap_or_else(|| job.work.join("out"))
-                .join(&test.name);
-
-            // **Two directories and not one, because two containers.** The
-            // submission's own channels are in `run/`; anything a checker is
-            // given is in `beside/`. Both run as the same unprivileged user, so
-            // a single directory would be a place each could reach the other's
-            // — and the submission could then read the answer it is being
-            // compared against, or write into it.
-            let channels = per_test.join("run");
-            let beside_them = per_test.join("beside");
-            for at in [&channels.here, &beside_them.here] {
-                std::fs::create_dir_all(at).map_err(|e| {
-                    format!(
-                        "test {}: the channel directory could not be made: {e}",
-                        test.name
-                    )
-                })?;
-            }
-            // **A pipe, and the whole change is in that word.** The bytes go
-            // from the program to this process and stop there: nothing is
-            // written down, nothing is collected, and the answer is known while
-            // the program is still running rather than after it has finished
-            // producing an answer that was wrong at its first token.
-            //
-            // Made here, because the shim creates nothing — it opens what it is
-            // given, so a channel that is not there is the Runner's failure to
-            // prepare rather than something for the far end to invent.
-            let output = Fifo::make(channels.here.join(Pipes::OUTPUT), 0o600).map_err(|e| {
-                format!(
-                    "test {}: the output channel could not be made: {e}",
-                    test.name
-                )
-            })?;
-
-            // **Who compares decides what the relay does with the bytes**, and
-            // in both arms nothing is stored. With no checker the Runner
-            // tokenises them itself; with one it passes them straight on to a
-            // second pipe the checker is reading.
-            //
-            // 0666, where the submission's own channels are 0600: whatever is
-            // beside it runs unprivileged and has to open these, and there is
-            // nothing in them to hide from the program on the other end.
-            let channel = |at: &std::path::Path| {
-                Fifo::make(at, 0o666)
-                    .map_err(|e| format!("test {}: a channel could not be made: {e}", test.name))
-            };
-
-            // What the far side is given, by role. A checker reads one channel
-            // and is done; an interactor reads one, writes another, and says
-            // what it decided on a third.
-            let beside_channels = match &aside {
-                Some(Aside::Checker(_)) => vec![channel(
-                    &beside_them.here.join(format!("{}.out", test.name)),
-                )?],
-                Some(Aside::Interactor(_)) => vec![
-                    channel(&beside_them.here.join(TO_THE_JUDGE))?,
-                    channel(&beside_them.here.join(FROM_THE_JUDGE))?,
-                    channel(&beside_them.here.join(VERDICT))?,
-                ],
-                None => Vec::new(),
-            };
-
-            let watching = match &aside {
-                Some(_) => Watching::Relay(beside_channels[0].path().to_path_buf()),
-                // **Unreachable without a `.out`, and the reader is what makes
-                // that so.** `TestSet::read` refuses a package that has neither
-                // a judge nor an expected output, so arriving here with `None`
-                // means the two have disagreed — an infrastructure failure and
-                // not a verdict, because nothing about it is the submission's.
-                None => Watching::Against(
-                    String::from_utf8_lossy(&match &test.expected {
-                        Some(at) => std::fs::read(at)
-                            .map_err(|e| format!("test {}: the expected output: {e}", test.name))?,
-                        None => {
-                            return Err(format!(
-                                "test {}: nothing decides this test — the package declares \
-                                 no checker and no interactor, and ships no expected output",
-                                test.name
-                            ))
-                        }
-                    })
-                    .into_owned(),
-                ),
-            };
-
-            // **The submission's own standard input, and it is always in this
-            // directory.** What differs is what is behind it: for an
-            // interactive problem a pipe with the interactor at the far end,
-            // and for every other one a socket the Runner hands a descriptor
-            // over — a sealed copy of `<test>.in`, in memory, which the program
-            // can read, seek in and map privately. Nothing of the package is
-            // mounted into a judged container either way.
-            let feeding = match &aside {
-                Some(Aside::Interactor(_)) => Some(channel(&channels.here.join(Pipes::INPUT))?),
-                _ => None,
-            };
-
-            // **Made before the container is started**, so the shim's connect
-            // never waits: it is served by a task holding the listener and the
-            // memory file, and nothing else can reach either.
-            let handing = match &feeding {
-                Some(_) => None,
-                None => {
-                    let at = test.input.as_ref().ok_or_else(|| {
-                        format!(
-                            "test {}: the package ships no {}.in, and only an interactive \
-                             problem judges without one",
-                            test.name, test.name,
-                        )
-                    })?;
-                    let input = aj_sandbox::SealedInput::from_file(at).await.map_err(|e| {
-                        format!("test {}: the input could not be read: {e}", test.name)
-                    })?;
-                    let (socket, listener) =
-                        aj_sandbox::pipes::Socket::make(channels.here.join(Pipes::INPUT), 0o600)
-                            .map_err(|e| {
-                                format!(
-                                    "test {}: the input channel could not be made: {e}",
-                                    test.name
-                                )
-                            })?;
-                    Some((input.hand_over(listener), socket))
-                }
-            };
-            let beside = Beside::new();
-            let reading = relay(
-                output.path().to_path_buf(),
-                watching,
-                OUTPUT_CAP,
-                beside.clone(),
-            );
-            let feeding = feeding.map(|stdin| {
-                (
-                    feed(
-                        beside_them.here.join(FROM_THE_JUDGE),
-                        stdin.path().to_path_buf(),
-                        beside.clone(),
-                    ),
-                    stdin,
-                )
-            });
-
-            // Bound rather than passed as a temporary: the future below holds
-            // a reference to it for as long as it runs.
-            let judged = Profile::new(
-                &language.image,
-                language::with_channels(
-                    &language.start,
-                    &format!("{OUTPUT}/{}", Pipes::INPUT),
-                    &format!("{OUTPUT}/{}", Pipes::OUTPUT),
-                ),
-            )
-            .memory_bytes(limits.memory_bytes)
-            .pids(16)
-            // The one step a participant is judged on the time of, and
-            // so the one that goes through the shim.
-            .measured()
-            // **Nothing leaves this container on its stdio.** The
-            // output travels on the pipe and the shim's report on
-            // its own, so the daemon has nothing to write down and
-            // no log driver to write it with.
-            .silent()
-            .wall_clock(reaping_deadline(limits.time_ms))
-            // What the deadline above measures progress against,
-            // and what "plainly past its budget" is measured from.
-            .cpu_limit(Duration::from_millis(limits.time_ms))
-            .pipes(&channels.here, &channels.on_host, OUTPUT);
-
-            let judged = match handing.is_some() {
-                // The sandbox has to know, because an image whose shim predates
-                // the arrangement would open the socket as a file and report a
-                // run that measured nothing.
-                true => judged.reading_a_socket(),
-                false => judged,
-            };
-            let judged = judged_mounts(&artefacts.on_host)
-                .into_iter()
-                .fold(judged, Profile::mount);
-            let judged = self.pinned(judged);
-
-            // **The checker runs beside the submission, not after it.** It is
-            // reading the answer as the program writes it, which is what makes
-            // the pipe worth having: the checker's exit is the only thing a
-            // separate program can say *while* it is running, and the closed
-            // pipe that exit produces is what stops the submission.
-            //
-            // The pair is `join`ed rather than raced. Both have their own wall
-            // clock, both are removed by the sandbox on every path out, and a
-            // failure in either has to be reported rather than abandoned.
-            let running = self.sandbox.run_beside(&judged, &beside);
-            let (run, said) = match &aside {
-                Some(Aside::Checker(built)) => {
-                    let checking = self.check(job, built, &beside_them, test);
-                    let (run, said) = tokio::join!(running, checking);
-                    (run, Some(said))
-                }
-                Some(Aside::Interactor(built)) => {
-                    let interacting = self.interact(job, built, &beside_them, test);
-                    let (run, said) = tokio::join!(running, interacting);
-                    (run, Some(said))
-                }
-                None => (running.await, None),
-            };
-
-            // **Before either error, and that is not a preference.** The relay
-            // is a thread blocked on an open that a container which never
-            // started will never answer; leaving by a `?` would leak one per
-            // failed test for the life of the Runner.
-            release(output.path());
-            // **The hand-over is a task, never an arm of the `select!` above.**
-            // It finishes the moment the shim connects, which in the ordinary
-            // case is long before the program does — raced against the run it
-            // would end it, leaving the container, the measurement gate and the
-            // relay thread behind. Aborted here because a container that never
-            // started never connected, and the task would otherwise wait for a
-            // shim that is not coming; the socket goes with `per_test` below.
-            if let Some((handing, _socket)) = handing {
-                handing.abort();
-            }
-            if let Some((feeding, stdin)) = feeding {
-                // Nothing is going to write the far end now, and nothing is
-                // going to read this one. Both halves of the thread's wait have
-                // to be ended, or it is a thread held for the life of the
-                // Runner.
-                release(&beside_them.here.join(FROM_THE_JUDGE));
-                release_writer(stdin.path());
-                let _ = feeding.await;
-            }
-            let produced = reading
-                .await
-                .map_err(|e| format!("test {}: the output was not read: {e}", test.name))?;
-            let run = run.map_err(|e| format!("a test could not be run: {e}"))?;
-
-            // The channels go with it; nothing in here outlives a test.
-            let _ = std::fs::remove_dir_all(&per_test.here);
-            let measured = Measured::of(&run).map_err(|e| format!("test {}: {e}", test.name))?;
-            let time_ms = measured.time_ms;
-
-            // **The wall clock survives here and nowhere else.** It is not
-            // reported and it decides nothing, but the gap between the two is
-            // the container's own start — the one number that explains why a
-            // participant waited longer than their program ran, and the first
-            // thing anybody diagnosing a slow judge wants.
-            tracing::debug!(
-                test = %test.name,
-                cpu_ms = time_ms,
-                wall_ms = run.wall_time.as_millis() as u64,
-                limit_ms = limits.time_ms,
-                "judged a test",
-            );
-
-            // What the machinery did to it comes first: none of these is the
-            // program having answered wrongly.
-            // **Not a verdict, so it never becomes one.** No processor time
-            // was ever recorded against this run, which makes it a statement
-            // about the host and not about the submission — the same class as a
-            // test that could not be run at all.
-            if run.stopped == Stopped::NeverStarted {
-                return Err(format!(
-                    "test {}: the program never started; the sandbox recorded no \
-                     processor time for it before the deadline",
-                    test.name
-                ));
-            }
-
-            let stopped = match run.stopped {
-                // Stopped for being plainly past its budget rather than left to
-                // run. An ordinary time limit, and it reads as one: what it
-                // spent is measured and shown beside the limit like any other.
-                Stopped::TimeLimit => Some(("Time limit exceeded".to_owned(), Reason::TimeLimit)),
-
-                // **Reaped rather than over its limit, and the note says so.**
-                // The deadline is four times the limit and four seconds
-                // **without the processor time growing**, so a program that
-                // reaches it has stopped spending any — waiting, or wedged in
-                // an uninterruptible call.
-                // The table would otherwise read "Time limit exceeded — 4 ms of
-                // 1000 ms" and teach a participant nothing. The verdict and the
-                // `reason` are deliberately the same: the vocabulary is shared
-                // with the Client, the documentation and every package on disk,
-                // and a program stopped here has failed a time limit whether it
-                // spent the time computing or not.
-                Stopped::WallClock => Some((
-                    format!(
-                        "Time limit exceeded: no processor time for {:.1} s",
-                        reaping_deadline(limits.time_ms).as_secs_f64()
-                    ),
-                    Reason::TimeLimit,
-                )),
-                // **The other deadline, and it says something else.** This
-                // run never stopped spending processor time; it simply never
-                // finished, waking for a moment in every window it was given.
-                // No figure here: the cap is the sandbox's arithmetic, and
-                // restating it would be a second copy to drift.
-                Stopped::Overall => Some((
-                    "Time limit exceeded: the program kept running without finishing".to_owned(),
-                    Reason::TimeLimit,
-                )),
-                // Refused above, before this match, because it is a statement
-                // about the host rather than a verdict about a submission.
-                Stopped::NeverStarted => unreachable!("a run that never started is not judged"),
-                // **Stopped because the answer was already known**, which is
-                // not a failure of anything and so has no note of its own. What
-                // it does change is the ordering below: a run stopped in the
-                // middle of a `write` has an exit code that says nothing about
-                // the program, so that check has to skip it.
-                Stopped::Decided => None,
-
-                Stopped::Memory => Some(("Memory limit exceeded".to_owned(), Reason::MemoryLimit)),
-                Stopped::Output => Some(("Output limit exceeded".to_owned(), Reason::OutputLimit)),
-
-                // **The limit is processor time**, decided here, on the
-                // measurement (2026-09-02). It was the wall clock until then,
-                // which charged the participant for the container's own start
-                // and was the one arrangement no other judge in this space
-                // uses; `docs/audits/TIME_LIMIT_QUANTITY_2026-09-02.md` in the
-                // workspace is the whole of that history.
-                //
-                // The comparison is against `Measured::time_ms`, which is
-                // rounded up, so the number a participant reads is exactly the
-                // number this compared — with truncation the two could disagree
-                // at the boundary and the table would look like a lie.
-                Stopped::OnItsOwn if time_ms > limits.time_ms => {
-                    Some(("Time limit exceeded".to_owned(), Reason::TimeLimit))
-                }
-                Stopped::OnItsOwn => None,
-            };
-            if let Some((note, reason)) = stopped {
-                outcomes.push(failed(test, Some(measured), &note, reason));
-                continue;
-            }
-
-            // **After the sandbox's own findings and before the exit code.** A
-            // memory limit outranks this — the program was stopped by the kernel
-            // for a reason the participant can act on — but flooding then
-            // exiting non-zero is flooding, and the non-zero is a consequence of
-            // being cut off.
-            if produced.capped {
-                outcomes.push(failed(
-                    test,
-                    Some(measured),
-                    "Output limit exceeded",
-                    Reason::OutputLimit,
-                ));
-                continue;
-            }
-
-            // **A decided run's exit code is not evidence.** It was stopped
-            // mid-write, so it died of a signal it was given rather than one it
-            // earned, and reading that as a runtime error would turn every early
-            // wrong answer into a crash. A run that finished **on its own** and
-            // then reported a failure is a different matter, and still outranks
-            // whatever the comparison found: wrong output followed by a segfault
-            // is a segfault.
-            if run.stopped != Stopped::Decided && run.exit_code != 0 {
-                outcomes.push(failed(
-                    test,
-                    Some(measured),
-                    &how_it_died(run.exit_code),
-                    Reason::RuntimeError,
-                ));
-                continue;
-            }
-
-            let (status, percentage, note) = match said {
-                Some(said) => {
-                    match said? {
-                        Ok(said) => (
-                            if said.accepted {
-                                Status::Ok
-                            } else {
-                                Status::Error
-                            },
-                            said.percentage,
-                            said.comment,
-                        ),
-                        // The load-bearing rule: a checker that exited non-zero
-                        // means the **system** failed. Reporting it as a wrong
-                        // answer turns a bug in the checker into a rejected
-                        // submission.
-                        Err(broken) => return Err(broken.to_string()),
+        // ── each test, in a lane of its own ─────────────────────────────────
+        //
+        // **Nothing is ever dropped, and that is what `scheduling` is for.** A
+        // test whose machinery failed must not be answered by dropping the
+        // tests beside it: a run future dropped inside `run_beside` leaves the
+        // container alive, the measurement gate held and the relay thread
+        // blocked on an open that nothing will answer -- sixteen minutes of a
+        // CI suite producing no output, measured 2026-09-15. So what stops is
+        // the *scheduling*. A test that has not begun returns at once, a test
+        // that has begun runs to its end, and the caller is told the first
+        // failure in test order.
+        let scheduling = std::sync::atomic::AtomicBool::new(true);
+        let done: Vec<(usize, Result<Option<TestOutcome>, String>)> =
+            futures_util::stream::iter(job.tests.iter().enumerate().map(|(at, test)| {
+                let scheduling = &scheduling;
+                let language = &language;
+                let artefacts = &artefacts;
+                let aside = &aside;
+                async move {
+                    if !scheduling.load(std::sync::atomic::Ordering::Relaxed) {
+                        return (at, Ok(None));
                     }
-                }
-                None => {
-                    // Settled while the program was running, and possibly long
-                    // before it stopped. Nothing is compared here.
-                    let found = produced
-                        .found
-                        .expect("with no checker the relay is the one comparing");
-                    if found.equal() {
-                        (Status::Ok, 100, String::new())
-                    } else {
-                        (Status::Error, 0, found.note())
+                    // **Taken before anything is made**, so that the channels,
+                    // the sealed input and the blocking threads of a test are
+                    // bounded by the lanes exactly as its containers are.
+                    let lane = self.lanes.take().await;
+                    let outcome = self
+                        .one_test(job, language, artefacts, aside, test, &lane)
+                        .await;
+                    if outcome.is_err() {
+                        scheduling.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
+                    (at, outcome.map(Some))
                 }
-            };
+            }))
+            .buffer_unordered(width.max(1))
+            .collect()
+            .await;
 
-            outcomes.push(TestOutcome {
-                name: test.name.clone(),
-                group: test.group,
-                status,
-                percentage,
-                time_ms,
-                // From the cgroup holding the submission alone, and **absent
-                // when the host gave the Runner nowhere to measure from** —
-                // which is the answer `PACKAGE_FORMAT.md` asks for rather than
-                // a number that is sometimes wrong. **No container floor is in
-                // it since 2026-09-06**; what is left is the image's own
-                // resident pages — about 1 MiB for a compiled binary, 4 MiB for
-                // CPython, 24 MiB for PyPy — and that is not corrected for
-                // either, because a model solution's measurement carries the
-                // same floor and it cancels.
-                memory_bytes: measured.memory_bytes,
-                note,
-                // Everything the machinery could do to it was handled above, so
-                // a failure this far down is the answer itself.
-                reason: (!status.passed()).then_some(Reason::WrongAnswer),
-            });
-        }
+        let outcomes = in_test_order(done)?;
 
         let judgement = judge(job.config, job.tests, &outcomes);
         let details = Details::of(&judgement, limits_of(job, &language), compiled());
@@ -952,6 +683,456 @@ impl<S: Sandbox> Pipeline<S> {
             details,
             log,
         })))
+    }
+
+
+    /// One test, from its channels to its outcome.
+    ///
+    /// **Every path out of here releases what it made.** That was already true
+    /// when this was the body of a loop -- it is why `release(output.path())`
+    /// comes before either error rather than after it. What is new is that
+    /// several of these are in flight at once, so a path that leaked would leak
+    /// one per test rather than one.
+    ///
+    /// A `TestOutcome` is what the program deserved, including every way it can
+    /// fail; an `Err` is the machinery having failed instead, which is nobody's
+    /// verdict and abandons the job.
+    #[allow(clippy::too_many_arguments)]
+    async fn one_test(
+        &self,
+        job: &Job<'_>,
+        language: &crate::language::Language,
+        artefacts: &Places,
+        aside: &Option<Aside<'_>>,
+        test: &Test,
+        lane: &Lane<'_>,
+    ) -> Result<TestOutcome, String> {
+        let limits = job.config.effective(test.group, &language.keys());
+
+        // **Where this test's stdout goes, instead of the daemon's log.**
+        // One directory per test, made by the Runner and root's, so the
+        // submission — which runs as `nobody` — cannot create, rename or
+        // read anything in it. The shim opens the file inside it before it
+        // drops privileges and hands over the descriptor alone.
+        let per_test = job
+            .pipes
+            .clone()
+            .unwrap_or_else(|| job.work.join("out"))
+            .join(&test.name);
+
+        // **Two directories and not one, because two containers.** The
+        // submission's own channels are in `run/`; anything a checker is
+        // given is in `beside/`. Both run as the same unprivileged user, so
+        // a single directory would be a place each could reach the other's
+        // — and the submission could then read the answer it is being
+        // compared against, or write into it.
+        let channels = per_test.join("run");
+        let beside_them = per_test.join("beside");
+        for at in [&channels.here, &beside_them.here] {
+            std::fs::create_dir_all(at).map_err(|e| {
+                format!(
+                    "test {}: the channel directory could not be made: {e}",
+                    test.name
+                )
+            })?;
+        }
+        // **A pipe, and the whole change is in that word.** The bytes go
+        // from the program to this process and stop there: nothing is
+        // written down, nothing is collected, and the answer is known while
+        // the program is still running rather than after it has finished
+        // producing an answer that was wrong at its first token.
+        //
+        // Made here, because the shim creates nothing — it opens what it is
+        // given, so a channel that is not there is the Runner's failure to
+        // prepare rather than something for the far end to invent.
+        let output = Fifo::make(channels.here.join(Pipes::OUTPUT), 0o600).map_err(|e| {
+            format!(
+                "test {}: the output channel could not be made: {e}",
+                test.name
+            )
+        })?;
+
+        // **Who compares decides what the relay does with the bytes**, and
+        // in both arms nothing is stored. With no checker the Runner
+        // tokenises them itself; with one it passes them straight on to a
+        // second pipe the checker is reading.
+        //
+        // 0666, where the submission's own channels are 0600: whatever is
+        // beside it runs unprivileged and has to open these, and there is
+        // nothing in them to hide from the program on the other end.
+        let channel = |at: &std::path::Path| {
+            Fifo::make(at, 0o666)
+                .map_err(|e| format!("test {}: a channel could not be made: {e}", test.name))
+        };
+
+        // What the far side is given, by role. A checker reads one channel
+        // and is done; an interactor reads one, writes another, and says
+        // what it decided on a third.
+        let beside_channels = match &aside {
+            Some(Aside::Checker(_)) => vec![channel(
+                &beside_them.here.join(format!("{}.out", test.name)),
+            )?],
+            Some(Aside::Interactor(_)) => vec![
+                channel(&beside_them.here.join(TO_THE_JUDGE))?,
+                channel(&beside_them.here.join(FROM_THE_JUDGE))?,
+                channel(&beside_them.here.join(VERDICT))?,
+            ],
+            None => Vec::new(),
+        };
+
+        let watching = match &aside {
+            Some(_) => Watching::Relay(beside_channels[0].path().to_path_buf()),
+            // **Unreachable without a `.out`, and the reader is what makes
+            // that so.** `TestSet::read` refuses a package that has neither
+            // a judge nor an expected output, so arriving here with `None`
+            // means the two have disagreed — an infrastructure failure and
+            // not a verdict, because nothing about it is the submission's.
+            None => Watching::Against(
+                String::from_utf8_lossy(&match &test.expected {
+                    Some(at) => std::fs::read(at)
+                        .map_err(|e| format!("test {}: the expected output: {e}", test.name))?,
+                    None => {
+                        return Err(format!(
+                            "test {}: nothing decides this test — the package declares \
+                             no checker and no interactor, and ships no expected output",
+                            test.name
+                        ))
+                    }
+                })
+                .into_owned(),
+            ),
+        };
+
+        // **The submission's own standard input, and it is always in this
+        // directory.** What differs is what is behind it: for an
+        // interactive problem a pipe with the interactor at the far end,
+        // and for every other one a socket the Runner hands a descriptor
+        // over — a sealed copy of `<test>.in`, in memory, which the program
+        // can read, seek in and map privately. Nothing of the package is
+        // mounted into a judged container either way.
+        let feeding = match &aside {
+            Some(Aside::Interactor(_)) => Some(channel(&channels.here.join(Pipes::INPUT))?),
+            _ => None,
+        };
+
+        // **Made before the container is started**, so the shim's connect
+        // never waits: it is served by a task holding the listener and the
+        // memory file, and nothing else can reach either.
+        let handing = match &feeding {
+            Some(_) => None,
+            None => {
+                let at = test.input.as_ref().ok_or_else(|| {
+                    format!(
+                        "test {}: the package ships no {}.in, and only an interactive \
+                         problem judges without one",
+                        test.name, test.name,
+                    )
+                })?;
+                let input = aj_sandbox::SealedInput::from_file(at).await.map_err(|e| {
+                    format!("test {}: the input could not be read: {e}", test.name)
+                })?;
+                let (socket, listener) =
+                    aj_sandbox::pipes::Socket::make(channels.here.join(Pipes::INPUT), 0o600)
+                        .map_err(|e| {
+                            format!(
+                                "test {}: the input channel could not be made: {e}",
+                                test.name
+                            )
+                        })?;
+                Some((input.hand_over(listener), socket))
+            }
+        };
+        let beside = Beside::new();
+        let reading = relay(
+            output.path().to_path_buf(),
+            watching,
+            OUTPUT_CAP,
+            beside.clone(),
+        );
+        let feeding = feeding.map(|stdin| {
+            (
+                feed(
+                    beside_them.here.join(FROM_THE_JUDGE),
+                    stdin.path().to_path_buf(),
+                    beside.clone(),
+                ),
+                stdin,
+            )
+        });
+
+        // Bound rather than passed as a temporary: the future below holds
+        // a reference to it for as long as it runs.
+        let judged = Profile::new(
+            &language.image,
+            language::with_channels(
+                &language.start,
+                &format!("{OUTPUT}/{}", Pipes::INPUT),
+                &format!("{OUTPUT}/{}", Pipes::OUTPUT),
+            ),
+        )
+        .memory_bytes(limits.memory_bytes)
+        .pids(16)
+        // The one step a participant is judged on the time of, and
+        // so the one that goes through the shim.
+        .measured()
+        // **Nothing leaves this container on its stdio.** The
+        // output travels on the pipe and the shim's report on
+        // its own, so the daemon has nothing to write down and
+        // no log driver to write it with.
+        .silent()
+        .wall_clock(reaping_deadline(limits.time_ms))
+        // What the deadline above measures progress against,
+        // and what "plainly past its budget" is measured from.
+        .cpu_limit(Duration::from_millis(limits.time_ms))
+        .pipes(&channels.here, &channels.on_host, OUTPUT);
+
+        let judged = match handing.is_some() {
+            // The sandbox has to know, because an image whose shim predates
+            // the arrangement would open the socket as a file and report a
+            // run that measured nothing.
+            true => judged.reading_a_socket(),
+            false => judged,
+        };
+        let judged = judged_mounts(&artefacts.on_host)
+            .into_iter()
+            .fold(judged, Profile::mount);
+        let judged = self.pinned(On::Lane(lane), judged);
+
+        // **The checker runs beside the submission, not after it.** It is
+        // reading the answer as the program writes it, which is what makes
+        // the pipe worth having: the checker's exit is the only thing a
+        // separate program can say *while* it is running, and the closed
+        // pipe that exit produces is what stops the submission.
+        //
+        // The pair is `join`ed rather than raced. Both have their own wall
+        // clock, both are removed by the sandbox on every path out, and a
+        // failure in either has to be reported rather than abandoned.
+        let running = self.sandbox.run_beside(&judged, &beside);
+        let (run, said) = match &aside {
+            Some(Aside::Checker(built)) => {
+                let checking = self.check(lane, job, built, &beside_them, test);
+                let (run, said) = tokio::join!(running, checking);
+                (run, Some(said))
+            }
+            Some(Aside::Interactor(built)) => {
+                let interacting = self.interact(lane, job, built, &beside_them, test);
+                let (run, said) = tokio::join!(running, interacting);
+                (run, Some(said))
+            }
+            None => (running.await, None),
+        };
+
+        // **Before either error, and that is not a preference.** The relay
+        // is a thread blocked on an open that a container which never
+        // started will never answer; leaving by a `?` would leak one per
+        // failed test for the life of the Runner.
+        release(output.path());
+        // **The hand-over is a task, never an arm of the `select!` above.**
+        // It finishes the moment the shim connects, which in the ordinary
+        // case is long before the program does — raced against the run it
+        // would end it, leaving the container, the measurement gate and the
+        // relay thread behind. Aborted here because a container that never
+        // started never connected, and the task would otherwise wait for a
+        // shim that is not coming; the socket goes with `per_test` below.
+        if let Some((handing, _socket)) = handing {
+            handing.abort();
+        }
+        if let Some((feeding, stdin)) = feeding {
+            // Nothing is going to write the far end now, and nothing is
+            // going to read this one. Both halves of the thread's wait have
+            // to be ended, or it is a thread held for the life of the
+            // Runner.
+            release(&beside_them.here.join(FROM_THE_JUDGE));
+            release_writer(stdin.path());
+            let _ = feeding.await;
+        }
+        let produced = reading
+            .await
+            .map_err(|e| format!("test {}: the output was not read: {e}", test.name))?;
+        let run = run.map_err(|e| format!("a test could not be run: {e}"))?;
+
+        // The channels go with it; nothing in here outlives a test.
+        let _ = std::fs::remove_dir_all(&per_test.here);
+        let measured = Measured::of(&run).map_err(|e| format!("test {}: {e}", test.name))?;
+        let time_ms = measured.time_ms;
+
+        // **The wall clock survives here and nowhere else.** It is not
+        // reported and it decides nothing, but the gap between the two is
+        // the container's own start — the one number that explains why a
+        // participant waited longer than their program ran, and the first
+        // thing anybody diagnosing a slow judge wants.
+        tracing::debug!(
+            test = %test.name,
+            cpu_ms = time_ms,
+            wall_ms = run.wall_time.as_millis() as u64,
+            limit_ms = limits.time_ms,
+            "judged a test",
+        );
+
+        // What the machinery did to it comes first: none of these is the
+        // program having answered wrongly.
+        // **Not a verdict, so it never becomes one.** No processor time
+        // was ever recorded against this run, which makes it a statement
+        // about the host and not about the submission — the same class as a
+        // test that could not be run at all.
+        if run.stopped == Stopped::NeverStarted {
+            return Err(format!(
+                "test {}: the program never started; the sandbox recorded no \
+                 processor time for it before the deadline",
+                test.name
+            ));
+        }
+
+        let stopped = match run.stopped {
+            // Stopped for being plainly past its budget rather than left to
+            // run. An ordinary time limit, and it reads as one: what it
+            // spent is measured and shown beside the limit like any other.
+            Stopped::TimeLimit => Some(("Time limit exceeded".to_owned(), Reason::TimeLimit)),
+
+            // **Reaped rather than over its limit, and the note says so.**
+            // The deadline is four times the limit and four seconds
+            // **without the processor time growing**, so a program that
+            // reaches it has stopped spending any — waiting, or wedged in
+            // an uninterruptible call.
+            // The table would otherwise read "Time limit exceeded — 4 ms of
+            // 1000 ms" and teach a participant nothing. The verdict and the
+            // `reason` are deliberately the same: the vocabulary is shared
+            // with the Client, the documentation and every package on disk,
+            // and a program stopped here has failed a time limit whether it
+            // spent the time computing or not.
+            Stopped::WallClock => Some((
+                format!(
+                    "Time limit exceeded: no processor time for {:.1} s",
+                    reaping_deadline(limits.time_ms).as_secs_f64()
+                ),
+                Reason::TimeLimit,
+            )),
+            // **The other deadline, and it says something else.** This
+            // run never stopped spending processor time; it simply never
+            // finished, waking for a moment in every window it was given.
+            // No figure here: the cap is the sandbox's arithmetic, and
+            // restating it would be a second copy to drift.
+            Stopped::Overall => Some((
+                "Time limit exceeded: the program kept running without finishing".to_owned(),
+                Reason::TimeLimit,
+            )),
+            // Refused above, before this match, because it is a statement
+            // about the host rather than a verdict about a submission.
+            Stopped::NeverStarted => unreachable!("a run that never started is not judged"),
+            // **Stopped because the answer was already known**, which is
+            // not a failure of anything and so has no note of its own. What
+            // it does change is the ordering below: a run stopped in the
+            // middle of a `write` has an exit code that says nothing about
+            // the program, so that check has to skip it.
+            Stopped::Decided => None,
+
+            Stopped::Memory => Some(("Memory limit exceeded".to_owned(), Reason::MemoryLimit)),
+            Stopped::Output => Some(("Output limit exceeded".to_owned(), Reason::OutputLimit)),
+
+            // **The limit is processor time**, decided here, on the
+            // measurement (2026-09-02). It was the wall clock until then,
+            // which charged the participant for the container's own start
+            // and was the one arrangement no other judge in this space
+            // uses; `docs/audits/TIME_LIMIT_QUANTITY_2026-09-02.md` in the
+            // workspace is the whole of that history.
+            //
+            // The comparison is against `Measured::time_ms`, which is
+            // rounded up, so the number a participant reads is exactly the
+            // number this compared — with truncation the two could disagree
+            // at the boundary and the table would look like a lie.
+            Stopped::OnItsOwn if time_ms > limits.time_ms => {
+                Some(("Time limit exceeded".to_owned(), Reason::TimeLimit))
+            }
+            Stopped::OnItsOwn => None,
+        };
+        if let Some((note, reason)) = stopped {
+            return Ok(failed(test, Some(measured), &note, reason));
+        }
+
+        // **After the sandbox's own findings and before the exit code.** A
+        // memory limit outranks this — the program was stopped by the kernel
+        // for a reason the participant can act on — but flooding then
+        // exiting non-zero is flooding, and the non-zero is a consequence of
+        // being cut off.
+        if produced.capped {
+            return Ok(failed(
+                test,
+                Some(measured),
+                "Output limit exceeded",
+                Reason::OutputLimit,
+            ));
+        }
+
+        // **A decided run's exit code is not evidence.** It was stopped
+        // mid-write, so it died of a signal it was given rather than one it
+        // earned, and reading that as a runtime error would turn every early
+        // wrong answer into a crash. A run that finished **on its own** and
+        // then reported a failure is a different matter, and still outranks
+        // whatever the comparison found: wrong output followed by a segfault
+        // is a segfault.
+        if run.stopped != Stopped::Decided && run.exit_code != 0 {
+            return Ok(failed(
+                test,
+                Some(measured),
+                &how_it_died(run.exit_code),
+                Reason::RuntimeError,
+            ));
+        }
+
+        let (status, percentage, note) = match said {
+            Some(said) => {
+                match said? {
+                    Ok(said) => (
+                        if said.accepted {
+                            Status::Ok
+                        } else {
+                            Status::Error
+                        },
+                        said.percentage,
+                        said.comment,
+                    ),
+                    // The load-bearing rule: a checker that exited non-zero
+                    // means the **system** failed. Reporting it as a wrong
+                    // answer turns a bug in the checker into a rejected
+                    // submission.
+                    Err(broken) => return Err(broken.to_string()),
+                }
+            }
+            None => {
+                // Settled while the program was running, and possibly long
+                // before it stopped. Nothing is compared here.
+                let found = produced
+                    .found
+                    .expect("with no checker the relay is the one comparing");
+                if found.equal() {
+                    (Status::Ok, 100, String::new())
+                } else {
+                    (Status::Error, 0, found.note())
+                }
+            }
+        };
+
+        Ok(TestOutcome {
+            name: test.name.clone(),
+            group: test.group,
+            status,
+            percentage,
+            time_ms,
+            // From the cgroup holding the submission alone, and **absent
+            // when the host gave the Runner nowhere to measure from** —
+            // which is the answer `PACKAGE_FORMAT.md` asks for rather than
+            // a number that is sometimes wrong. **No container floor is in
+            // it since 2026-09-06**; what is left is the image's own
+            // resident pages — about 1 MiB for a compiled binary, 4 MiB for
+            // CPython, 24 MiB for PyPy — and that is not corrected for
+            // either, because a model solution's measurement carries the
+            // same floor and it cancels.
+            memory_bytes: measured.memory_bytes,
+            note,
+            // Everything the machinery could do to it was handled above, so
+            // a failure this far down is the answer itself.
+            reason: (!status.passed()).then_some(Reason::WrongAnswer),
+        })
     }
 
     /// Which image a declared judge is built and run in, and how it is
@@ -1030,6 +1211,7 @@ impl<S: Sandbox> Pipeline<S> {
             .sandbox
             .run(
                 &self.pinned(
+                    On::TheWholeRunner,
                     Profile::new(&language.image, language.build.clone().unwrap_or_default())
                         .memory_bytes(512 * 1024 * 1024)
                         .pids(128)
@@ -1091,6 +1273,7 @@ impl<S: Sandbox> Pipeline<S> {
     /// output cap and the early kill in trusted code.
     async fn interact(
         &self,
+        lane: &Lane<'_>,
         job: &Job<'_>,
         interactor: &Judge,
         beside_them: &Places,
@@ -1118,6 +1301,7 @@ impl<S: Sandbox> Pipeline<S> {
             .sandbox
             .run(
                 &self.pinned(
+                    On::Lane(lane),
                     Profile::new(
                     &interactor.image,
                     vec![
@@ -1189,6 +1373,7 @@ impl<S: Sandbox> Pipeline<S> {
 
     async fn check(
         &self,
+        lane: &Lane<'_>,
         job: &Job<'_>,
         checker: &Judge,
         beside_them: &Places,
@@ -1207,6 +1392,7 @@ impl<S: Sandbox> Pipeline<S> {
             .sandbox
             .run(
                 &self.pinned(
+                    On::Lane(lane),
                     Profile::new(&checker.image, command)
                         .memory_bytes(256 * 1024 * 1024)
                         .pids(16)
@@ -1540,6 +1726,39 @@ fn reaping_deadline(time_ms: u64) -> Duration {
 /// A function of its argument rather than of the process, so the decision this
 /// makes is testable without a machine that has been divided up.
 /// `aj_sandbox::affinity` decides which of the two a Runner is in.
+/// Where a container goes, as a function of its arguments, so that every case
+/// of it is testable without a daemon.
+fn placed(profile: Profile, on: On<'_>, whole: Option<&str>) -> Profile {
+    match on {
+        On::TheWholeRunner => pin(profile, whole),
+        // The processors and the measurement home together: a run placed on one
+        // lane's processors and measured in another's would be a reading taken
+        // where a second run was also making one.
+        On::Lane(lane) => pin(profile, lane.cpus()).lane(lane.index()),
+    }
+}
+
+/// A job's outcomes in the order its tests are declared, or the first failure
+/// in that same order.
+///
+/// **Not the order they finished in.** `judge` keeps the order it is given
+/// within a group and `verdict` names the first thing that went wrong in it, so
+/// a table assembled as tests completed would give one submission different
+/// verdicts on different days -- and the table is what a participant reads. A
+/// test that never began carries no outcome and is not one.
+fn in_test_order(
+    mut done: Vec<(usize, Result<Option<TestOutcome>, String>)>,
+) -> Result<Vec<TestOutcome>, String> {
+    done.sort_by_key(|(at, _)| *at);
+    let mut outcomes = Vec::with_capacity(done.len());
+    for (_, outcome) in done {
+        if let Some(outcome) = outcome? {
+            outcomes.push(outcome);
+        }
+    }
+    Ok(outcomes)
+}
+
 fn pin(profile: Profile, cpus: Option<&str>) -> Profile {
     match cpus {
         Some(cpus) => profile.cpuset(cpus),
@@ -1981,5 +2200,125 @@ mod tests {
             cpu_time,
             collected: None,
         }
+    }
+
+    fn an_outcome(name: &str) -> TestOutcome {
+        TestOutcome {
+            name: name.to_owned(),
+            group: 1,
+            status: Status::Ok,
+            percentage: 100,
+            time_ms: 1,
+            memory_bytes: None,
+            note: String::new(),
+            reason: None,
+        }
+    }
+
+    /// **A lane carries both halves of where a run goes**: the processors it is
+    /// confined to and the home its reading comes out of. A run given one lane's
+    /// processors and another's home would be a reading taken where a second run
+    /// was also making one.
+    #[tokio::test]
+    async fn a_run_placed_in_a_lane_takes_its_processors_and_its_home() {
+        let lanes = Lanes::new(vec![Some("0,1".to_owned()), Some("2,3".to_owned())]);
+        let first = lanes.take().await;
+        let second = lanes.take().await;
+
+        let run = placed(a_run(), On::Lane(&second), Some("0-3"));
+        assert_eq!(run.cpuset, Some("2,3".to_owned()));
+        assert_eq!(run.lane, 1);
+        assert_eq!(first.index(), 0);
+
+        // A build is not the step being timed and gets the whole of what the
+        // Runner was given, measured in the first home like everything that
+        // names no lane.
+        let build = placed(a_run(), On::TheWholeRunner, Some("0-3"));
+        assert_eq!(build.cpuset, Some("0-3".to_owned()));
+        assert_eq!(build.lane, 0);
+    }
+
+    /// **The judge of a test runs in the test's own lane.** A source check, for
+    /// the reason the pin gate above is one: the property is only observable on
+    /// a divided host. The type carries the other half -- a `Lane` is not
+    /// `Clone`, and exactly one is in scope inside a test.
+    #[test]
+    fn a_test_and_the_judge_beside_it_are_confined_to_one_lane() {
+        let source = include_str!("pipeline.rs");
+        let production = &source[..source.find("#[cfg(test)]").expect("a test module")];
+
+        assert_eq!(
+            production.matches("On::Lane(").count(),
+            production.matches("On::Lane(lane)").count(),
+            "a container placed in a lane takes the one its test is holding, and              there is only ever one of those in scope to take",
+        );
+        // The judged run, the interactor and the checker -- and the arm of
+        // `placed` that puts them there.
+        assert_eq!(production.matches("On::Lane(lane)").count(), 4);
+        // The two builds, and the arm of `placed` that gives them the whole of
+        // what the Runner was given. A timed step here would escape its lane.
+        assert_eq!(production.matches("On::TheWholeRunner").count(), 3);
+    }
+
+    /// **A lane comes back when the test that had it ends**, or the second
+    /// submission to a Runner waits for ever.
+    #[tokio::test]
+    async fn a_lane_is_given_back_when_the_test_that_had_it_ends() {
+        let lanes = Lanes::new(vec![Some("0".to_owned()), Some("1".to_owned())]);
+        let first = lanes.take().await;
+        let second = lanes.take().await;
+        assert_eq!((first.index(), second.index()), (0, 1));
+        drop(second);
+
+        // **The index is back before the permit is**, which is what this asks:
+        // a waiter released by the permit finds a lane in `idle` rather than a
+        // `pop` on an empty list.
+        let third = lanes.take().await;
+        assert_eq!(third.index(), 1);
+        assert_eq!(third.cpus(), Some("1"));
+    }
+
+    /// The order a participant reads, which is the order the tests are
+    /// declared in -- never the order they happened to finish in.
+    #[test]
+    fn results_are_read_back_in_test_order() {
+        let done = vec![
+            (2, Ok(Some(an_outcome("1c")))),
+            (0, Ok(Some(an_outcome("1a")))),
+            (1, Ok(Some(an_outcome("1b")))),
+        ];
+        let names: Vec<String> = in_test_order(done)
+            .expect("no failure")
+            .into_iter()
+            .map(|outcome| outcome.name)
+            .collect();
+        assert_eq!(names, ["1a", "1b", "1c"]);
+    }
+
+    /// **The first failure in test order**, and not the first to arrive: a
+    /// submission whose machinery failed twice must be reported the same way
+    /// whichever test was slower.
+    #[test]
+    fn the_first_failure_in_test_order_is_the_one_reported() {
+        let done = vec![
+            (2, Err("the third".to_owned())),
+            (0, Ok(Some(an_outcome("1a")))),
+            (1, Err("the second".to_owned())),
+        ];
+        assert_eq!(in_test_order(done).unwrap_err(), "the second");
+    }
+
+    /// A test that never began is not an outcome. Scoring one would mark a
+    /// submission on tests nobody ran.
+    #[test]
+    fn a_test_that_never_began_is_not_an_outcome() {
+        let done = vec![
+            (0, Ok(Some(an_outcome("1a")))),
+            (1, Ok(None)),
+            (2, Ok(Some(an_outcome("1c")))),
+        ];
+        let outcomes = in_test_order(done).expect("no failure");
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[1].name, "1c");
     }
 }
