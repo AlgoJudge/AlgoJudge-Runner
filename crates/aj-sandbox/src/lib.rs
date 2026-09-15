@@ -82,6 +82,19 @@ pub trait Sandbox: Send + Sync {
         Ok(image.to_owned())
     }
 
+    /// How many measured runs this sandbox can have in flight at once, each in
+    /// a measurement home of its own.
+    ///
+    /// **A caller that starts more than this has two runs sharing one
+    /// reading**, and under the `systemd` cgroup driver that reading is a
+    /// difference across a shared slice -- so the two would be charged each
+    /// other's processor time and peak memory, with no error anywhere. One
+    /// unless a mechanism says otherwise, because one is what every mechanism
+    /// could always do.
+    fn lanes(&self) -> usize {
+        1
+    }
+
     /// Runs it with nothing beside it, which is what most callers want.
     async fn run(&self, profile: &Profile) -> Result<Outcome> {
         self.run_beside(profile, &Beside::alone()).await

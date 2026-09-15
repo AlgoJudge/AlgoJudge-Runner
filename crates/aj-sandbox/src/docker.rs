@@ -71,6 +71,13 @@ pub struct Docker {
     /// way. Absent is then the honest answer rather than a guess.
     ///
     /// Resolved by [`Self::preflight`], because deciding it needs the daemon.
+    /// How many tests this Runner judges at once, and so how many measurement
+    /// homes [`Self::preflight`] makes and proves.
+    ///
+    /// Decided before preflight because preflight is what creates them; one
+    /// unless [`Self::across`] said otherwise, which is what keeps a Runner
+    /// nobody widened on exactly the arrangement it had before lanes existed.
+    lanes: usize,
     cgroups: std::sync::OnceLock<Option<Cgroups>>,
     /// What each image's measuring shim can do, asked once.
     ///
@@ -113,9 +120,22 @@ impl Docker {
         Ok(Self {
             client: bollard::Docker::connect_with_local_defaults()?,
             instance: instance.into(),
+            lanes: 1,
             cgroups: std::sync::OnceLock::new(),
             shims: tokio::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Judges this many tests at once, each in a measurement home of its own.
+    ///
+    /// A builder and not an argument to [`Self::connect`], so that a caller who
+    /// judges one thing at a time -- every test suite here, and a Runner nobody
+    /// widened -- goes on saying nothing about lanes.
+    pub fn across(mut self, lanes: usize) -> Self {
+        // Zero would be a Runner that starts, registers and then never judges
+        // anything: the fan-out it feeds yields nothing at width zero.
+        self.lanes = lanes.max(1);
+        self
     }
 
     /// What [`Self::preflight`] decided, for a log and for a suite that has to
@@ -584,6 +604,10 @@ impl Docker {
 impl Sandbox for Docker {
     fn name(&self) -> &'static str {
         "docker"
+    }
+
+    fn lanes(&self) -> usize {
+        self.lanes
     }
 
     /// **Asked every time, and cheap**: it is a local call, and it is the only
