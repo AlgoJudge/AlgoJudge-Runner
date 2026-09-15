@@ -183,9 +183,11 @@ services:
       - algojudge_runner_dev_identity:/var/lib/algojudge-runner
       # **A directory and not a named volume**, because the daemon has to be
       # able to open it: a judge's container mounts the unpacked package and the
-      # program built from it straight out of here. It also needs `flock` and an
-      # atomic rename, which a bind of a Windows or macOS directory does not
-      # give — so a developer on either runs this stack from a Linux path.
+      # program built from it straight out of here.
+      #
+      # It also has to support `flock` and an atomic rename, which is what keeps
+      # two Runners out of one preparation. Measured 2026-09-15 on Docker
+      # Desktop with this checkout on a Windows drive: both work.
       - ${PWD}/.runner-cache:/var/cache/algojudge-runner
       - ${PWD}/.runner-work:/var/lib/algojudge-runner/work
       # **Writable, and judging needs it.** Each job container is started under

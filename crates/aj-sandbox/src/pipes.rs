@@ -247,8 +247,8 @@ impl Socket {
                 why.kind(),
                 format!(
                     "could not make the socket {}: {why}. It has to be on a \
-                     filesystem that supports one — a bind mount of a Windows or \
-                     macOS directory does not",
+                     filesystem that supports one, which is what AJ_Pipes__Path \
+                     is for",
                     at.display()
                 ),
             )
