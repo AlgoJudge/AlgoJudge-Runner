@@ -1025,6 +1025,40 @@ impl<S: Sandbox> Pipeline<S> {
             ));
         }
 
+        // **The judge's own answer, taken before the machinery's findings**,
+        // because two of the things it can say outrank them.
+        let said = match said {
+            // **A judge that broke its contract is a system failure**, and
+            // saying so outranks whatever stopped the run. Asked here rather
+            // than below because a stopped run would otherwise report a judge
+            // that exited non-zero to a participant as a time limit.
+            Some(Err(broken)) => return Err(broken.to_string()),
+            Some(Ok(said)) => Some(said),
+            None => None,
+        };
+
+        // **A judge that refused outranks what stopped the run. One that
+        // accepted does not.**
+        //
+        // A submission has to end by itself to be accepted, so being stopped
+        // takes an `OK` away and that is deliberate. But where the judge has
+        // already said *why* the answer is wrong, that sentence is worth more
+        // to a participant than "Output limit exceeded" — and on an
+        // interactive problem it is the only feedback there is, because there
+        // is no expected output to be shown a difference against.
+        //
+        // **Two stops it does not outrank, because they know something the
+        // judge could not.** A deadlock is the case: a submission holding its
+        // question in an unflushed buffer makes the judge refuse for want of
+        // anything to read, so the judge's *stopped asking* is a description of
+        // the silence rather than of the answer — while "no processor time
+        // for 12 s" is the one sentence that tells a participant their program
+        // is stuck rather than slow. The kernel's memory kill is the other, and
+        // for the same reason: it names a cause the judge only saw the shadow
+        // of.
+        let refused = said.as_ref().is_some_and(|said| !said.accepted)
+            && !matches!(run.stopped, Stopped::WallClock | Stopped::Memory);
+
         let stopped = match run.stopped {
             // Stopped for being plainly past its budget rather than left to
             // run. An ordinary time limit, and it reads as one: what it
@@ -1087,7 +1121,7 @@ impl<S: Sandbox> Pipeline<S> {
             }
             Stopped::OnItsOwn => None,
         };
-        if let Some((note, reason)) = stopped {
+        if let Some((note, reason)) = stopped.filter(|_| !refused) {
             return Ok(failed(test, Some(measured), &note, reason));
         }
 
@@ -1096,7 +1130,7 @@ impl<S: Sandbox> Pipeline<S> {
         // for a reason the participant can act on — but flooding then
         // exiting non-zero is flooding, and the non-zero is a consequence of
         // being cut off.
-        if produced.capped {
+        if produced.capped && !refused {
             return Ok(failed(
                 test,
                 Some(measured),
@@ -1105,14 +1139,19 @@ impl<S: Sandbox> Pipeline<S> {
             ));
         }
 
-        // **A decided run's exit code is not evidence.** It was stopped
-        // mid-write, so it died of a signal it was given rather than one it
-        // earned, and reading that as a runtime error would turn every early
-        // wrong answer into a crash. A run that finished **on its own** and
-        // then reported a failure is a different matter, and still outranks
-        // whatever the comparison found: wrong output followed by a segfault
-        // is a segfault.
-        if run.stopped != Stopped::Decided && run.exit_code != 0 {
+        // **Only a run that ended by itself has an exit code worth reading.**
+        // Anything the sandbox stopped died of a signal it was given rather
+        // than one it earned, and reading that as a runtime error would turn
+        // every early wrong answer into a crash. A run that finished on its own
+        // and then reported a failure is a different matter, and still outranks
+        // whatever the comparison found: wrong output followed by a segfault is
+        // a segfault.
+        //
+        // **Written as `== OnItsOwn` rather than `!= Decided`**, which said the
+        // same thing only while `Decided` was the sole stop that could reach
+        // here. A judge's refusal now carries a stopped run this far, and its
+        // `SIGKILL` is exactly the exit code this paragraph is about.
+        if run.stopped == Stopped::OnItsOwn && run.exit_code != 0 {
             return Ok(failed(
                 test,
                 Some(measured),
@@ -1122,24 +1161,17 @@ impl<S: Sandbox> Pipeline<S> {
         }
 
         let (status, percentage, note) = match said {
-            Some(said) => {
-                match said {
-                    Ok(said) => (
-                        if said.accepted {
-                            Status::Ok
-                        } else {
-                            Status::Error
-                        },
-                        said.percentage,
-                        said.comment,
-                    ),
-                    // The load-bearing rule: a checker that exited non-zero
-                    // means the **system** failed. Reporting it as a wrong
-                    // answer turns a bug in the checker into a rejected
-                    // submission.
-                    Err(broken) => return Err(broken.to_string()),
-                }
-            }
+            // A broken judge was already refused above, so what is left here is
+            // an answer.
+            Some(said) => (
+                if said.accepted {
+                    Status::Ok
+                } else {
+                    Status::Error
+                },
+                said.percentage,
+                said.comment,
+            ),
             None => {
                 // Settled while the program was running, and possibly long
                 // before it stopped. Nothing is compared here.
@@ -1656,22 +1688,38 @@ fn relay(
                                 beside.enough(Enough::Decided);
                             }
                         }
-                        // **A checker that has stopped reading has decided.** It is
-                        // the only signal there is: a checker says what it thinks
-                        // with an exit code, so the moment it exits its end of the
-                        // pipe closes and this write fails. That is the same early
-                        // kill the built-in comparison gets, reached by the only
-                        // road a separate program leaves open.
+                        // **A judge that has stopped reading is done with this
+                        // run, and that is not a reason to stop the run.**
+                        //
+                        // It used to be, until 2026-09-16, and the reason it
+                        // changed is that it made the verdict depend on
+                        // scheduling. Both endings live in this one loop: the
+                        // chunk that crosses the cap and the chunk whose write
+                        // fails. Measured on that day, a submission that prints
+                        // its answer and then floods was stopped by the judge
+                        // after a median 59 ms idle and by the cap after 142 ms
+                        // under load — so 24% of loaded runs said *output limit*
+                        // and every idle run said *accepted*, for the same
+                        // program. The same submission earned two verdicts.
+                        //
+                        // **A submission has to end by itself to be accepted.**
+                        // Nothing here stops it any more: the far end is dropped,
+                        // the bytes go on being drained and counted, and whatever
+                        // limit the program reaches is what ends it. One that
+                        // keeps writing reaches the cap; one that waits for input
+                        // that will never come reaches the reaper. Both are the
+                        // same answer every time, which is the whole point.
                         (None, Some(open)) => {
                             use std::io::Write as _;
                             if open.write_all(chunk).is_err() {
-                                beside.enough(Enough::Decided);
                                 far = None;
                             }
                         }
-                        // Nothing is listening any more — the checker exited, or
+                        // Nothing is listening any more — the judge exited, or
                         // the cap closed its end. Draining is still what keeps the
-                        // program out of a blocking `write` until it is stopped.
+                        // program out of a blocking `write` until it is stopped,
+                        // and it is now also what lets a submission that will not
+                        // end run into a limit of its own.
                         (None, None) => {}
                     }
                 }
