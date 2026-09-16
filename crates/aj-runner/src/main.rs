@@ -126,7 +126,25 @@ async fn started() -> anyhow::Result<()> {
     // The fingerprint names this Runner's own containers, so a second Runner on
     // the host sweeps its orphans and not this one's evaluations. It is on disk
     // and survives a restart, which is the case the sweep exists for.
-    let sandbox = aj_sandbox::Docker::connect(identity.fingerprint())?.across(config.tests_at_once);
+    // **Where a volume was named, the daemon is told the name and not a path.**
+    // Built from the Runner's own paths, which is what a volume makes possible:
+    // there is no second spelling of the same directory to keep in step.
+    let roots: Vec<aj_sandbox::Root> = [
+        (config.cache_volume.clone(), Some(config.cache_path.clone())),
+        (config.work_volume.clone(), Some(config.work_path.clone())),
+        (config.pipes_volume.clone(), config.pipes_path.clone()),
+    ]
+    .into_iter()
+    .filter_map(|(volume, here)| {
+        Some(aj_sandbox::Root {
+            here: here?,
+            volume: volume?,
+        })
+    })
+    .collect();
+    let sandbox = aj_sandbox::Docker::connect(identity.fingerprint())?
+        .across(config.tests_at_once)
+        .rooted(roots);
     if let Err(e) = sandbox.preflight().await {
         if !below_specification(&e, config.allow_unmeasured) {
             return Err(e.into());

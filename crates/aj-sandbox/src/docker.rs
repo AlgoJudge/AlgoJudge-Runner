@@ -36,6 +36,92 @@ use std::path::{Path, PathBuf};
 use crate::profile::{Outcome, Pipes, Profile, Stopped, SHIM};
 use crate::{pipes::release, Beside, Enough, Error, Result, Sandbox};
 
+/// Where a path lives, if it lives in a volume: the root, and what is left of
+/// the path under it.
+///
+/// **The longest root wins**, so a scratch directory inside a cache would travel
+/// in its own volume rather than in the one it happens to sit under. Nothing
+/// nests them today; a rule that breaks silently when somebody does is not worth
+/// having.
+fn rooted_at<'a>(roots: &'a [Root], from: &Path) -> Option<(&'a Root, Option<String>)> {
+    roots
+        .iter()
+        .filter_map(|root| {
+            from.strip_prefix(&root.here).ok().map(|under| {
+                let under = under.to_string_lossy();
+                (root, (!under.is_empty()).then(|| under.into_owned()))
+            })
+        })
+        .max_by_key(|(root, _)| root.here.as_os_str().len())
+}
+
+/// One mount, as the daemon should be told about it.
+fn placed(roots: &[Root], from: &Path, to: &str, writable: bool) -> bollard::models::Mount {
+    match rooted_at(roots, from) {
+        Some((root, subpath)) => bollard::models::Mount {
+            typ: Some(bollard::models::MountTypeEnum::VOLUME),
+            source: Some(root.volume.clone()),
+            target: Some(to.to_owned()),
+            read_only: Some(!writable),
+            volume_options: Some(bollard::models::MountVolumeOptions {
+                subpath,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        None => bollard::models::Mount {
+            typ: Some(bollard::models::MountTypeEnum::BIND),
+            source: Some(from.display().to_string()),
+            target: Some(to.to_owned()),
+            read_only: Some(!writable),
+            ..Default::default()
+        },
+    }
+}
+
+/// Everything a profile asks for that is not one of the mounts which must
+/// exist: the ordinary mounts, and the channels directory.
+///
+/// **The channels are added here rather than by the caller, so they cannot be
+/// forgotten.** A profile that names a stdout directory and does not mount it
+/// would have the shim fail to open the file, which is a run that produced
+/// nothing rather than a configuration mistake anybody could see.
+fn ordinary(profile: &Profile) -> impl Iterator<Item = (PathBuf, String, bool)> + '_ {
+    profile
+        .mounts
+        .iter()
+        .filter(|m| !m.required)
+        .map(|m| (m.from.clone(), m.to.clone(), m.writable))
+        .chain(
+            profile
+                .pipes
+                .iter()
+                .map(|out| (out.on_host.clone(), out.at.clone(), true)),
+        )
+}
+
+/// A directory the Runner writes, as the **daemon** can reach it.
+///
+/// **A named volume needs no second path, and that is the whole point.** A bind
+/// is resolved by the daemon, so anything the Runner hands a job container has
+/// to be said twice -- once as this process sees it and once as the daemon does
+/// -- and the two disagreeing is a container that starts with an empty
+/// directory and a submission judged against nothing. A volume is said once, by
+/// name, and the subdirectory travels as `subpath`.
+///
+/// It also decides where the bytes may live. Measured on Docker Desktop
+/// 2026-09-16: a bind of the Windows share answers `Input/output error` on a
+/// freshly made deep directory, and `/var` inside the daemon's own virtual
+/// machine is `noexec`, so a judge built there cannot be executed. A volume's
+/// storage is neither.
+#[derive(Debug, Clone)]
+pub struct Root {
+    /// The directory as this process sees it.
+    pub here: PathBuf,
+    /// The volume the daemon knows it by.
+    pub volume: String,
+}
+
 pub struct Docker {
     client: bollard::Docker,
     /// Whose containers these are.
@@ -78,6 +164,11 @@ pub struct Docker {
     /// unless [`Self::across`] said otherwise, which is what keeps a Runner
     /// nobody widened on exactly the arrangement it had before lanes existed.
     lanes: usize,
+    /// Directories the daemon reaches by **volume name** rather than by path.
+    ///
+    /// Empty is every installation that says nothing, and then every mount is
+    /// the bind it has always been.
+    roots: Vec<Root>,
     cgroups: std::sync::OnceLock<Option<Homes>>,
     /// What each image's measuring shim can do, asked once.
     ///
@@ -121,6 +212,7 @@ impl Docker {
             client: bollard::Docker::connect_with_local_defaults()?,
             instance: instance.into(),
             lanes: 1,
+            roots: Vec::new(),
             cgroups: std::sync::OnceLock::new(),
             shims: tokio::sync::Mutex::new(HashMap::new()),
         })
@@ -131,6 +223,16 @@ impl Docker {
     /// A builder and not an argument to [`Self::connect`], so that a caller who
     /// judges one thing at a time -- every test suite here, and a Runner nobody
     /// widened -- goes on saying nothing about lanes.
+    /// Directories the daemon should reach by volume name.
+    ///
+    /// **Nothing is checked here**; a volume that does not exist, or a daemon
+    /// too old to take a `subpath`, is refused by [`Self::preflight`] where
+    /// there is a sentence to say it in.
+    pub fn rooted(mut self, roots: Vec<Root>) -> Self {
+        self.roots = roots;
+        self
+    }
+
     pub fn across(mut self, lanes: usize) -> Self {
         // Zero would be a Runner that starts, registers and then never judges
         // anything: the fan-out it feeds yields nothing at width zero.
@@ -283,13 +385,15 @@ impl Docker {
                     image: Some(image.to_owned()),
                     labels: Some(self.labels()),
                     host_config: Some(HostConfig {
-                        mounts: Some(vec![bollard::models::Mount {
-                            typ: Some(bollard::models::MountTypeEnum::BIND),
-                            source: Some(at.display().to_string()),
-                            target: Some("/probe".to_owned()),
-                            read_only: Some(true),
-                            ..Default::default()
-                        }]),
+                        // **Through the same translation as a judged run's
+                        // mounts, or it proves the wrong thing.** This asks
+                        // whether the daemon can open what the Runner writes;
+                        // asking it as a bind while jobs are given a volume
+                        // would answer about a path nobody uses -- and where a
+                        // volume root is in force that path does not exist on
+                        // the host at all, so the probe fails and the Runner
+                        // refuses to start for the one arrangement that works.
+                        mounts: Some(vec![placed(&self.roots, at, "/probe", false)]),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -404,6 +508,7 @@ impl Docker {
         cgroup_parent: Option<&str>,
         shim: bool,
         bound: Option<&str>,
+        roots: &[Root],
     ) -> HostConfig {
         // **What the container is held to, which is not what the submission is
         // held to.** Where `bound` names a cgroup, the submission is in it and
@@ -500,25 +605,12 @@ impl Docker {
                 },
             ]),
 
-            binds: Some(
-                profile
-                    .mounts
-                    .iter()
-                    // The ones that must exist are typed mounts below, which
-                    // refuse a source the daemon cannot open.
-                    .filter(|m| !m.required)
-                    .map(|m| (m.from.clone(), m.to.clone(), m.writable))
-                    // **Added here rather than by the caller, so it cannot be
-                    // forgotten.** A profile that names a stdout directory and
-                    // does not mount it would have the shim fail to open the
-                    // file, which is a run that produced nothing rather than a
-                    // configuration mistake anybody could see.
-                    .chain(
-                        profile
-                            .pipes
-                            .iter()
-                            .map(|out| (out.on_host.clone(), out.at.clone(), true)),
-                    )
+            binds: {
+                // **What is left after the volumes have taken theirs.** A bind
+                // string cannot carry a `subpath`, so anything under a volume
+                // root is a typed mount below whether or not it said `required`.
+                let legacy: Vec<String> = ordinary(profile)
+                    .filter(|(from, _, _)| rooted_at(roots, from).is_none())
                     .map(|(from, to, writable)| {
                         format!(
                             "{}:{}:{}",
@@ -527,8 +619,9 @@ impl Docker {
                             if writable { "rw" } else { "ro" }
                         )
                     })
-                    .collect(),
-            ),
+                    .collect();
+                (!legacy.is_empty()).then_some(legacy)
+            },
 
             // **A mount and not a bind, and the difference is the safety.**
             // The legacy bind creates a missing source as a directory, and a
@@ -551,15 +644,22 @@ impl Docker {
                 // reason the cgroup mount above gives: a path this Runner and
                 // the daemon disagree about has to be a container that does not
                 // start, not an empty directory a submission is judged against.
-                typed.extend(profile.mounts.iter().filter(|m| m.required).map(|m| {
-                    bollard::models::Mount {
-                        typ: Some(bollard::models::MountTypeEnum::BIND),
-                        source: Some(m.from.display().to_string()),
-                        target: Some(m.to.clone()),
-                        read_only: Some(!m.writable),
-                        ..Default::default()
-                    }
-                }));
+                typed.extend(
+                    profile
+                        .mounts
+                        .iter()
+                        .filter(|m| m.required)
+                        .map(|m| placed(roots, &m.from, &m.to, m.writable)),
+                );
+                // **And whatever a volume root claimed from the binds above.**
+                // These gain what a typed mount gives and a bind does not: a
+                // source the daemon cannot open refuses the container rather
+                // than being invented as an empty directory.
+                typed.extend(
+                    ordinary(profile)
+                        .filter(|(from, _, _)| rooted_at(roots, from).is_some())
+                        .map(|(from, to, writable)| placed(roots, &from, &to, writable)),
+                );
                 (!typed.is_empty()).then_some(typed)
             },
 
@@ -655,6 +755,48 @@ impl Sandbox for Docker {
             kernel = version.kernel_version.as_deref().unwrap_or("?"),
             "container runtime reached",
         );
+
+        // **A volume root asks two things of the daemon, and both are refused
+        // here rather than at the first job.** `subpath` arrived in API 1.45
+        // (Docker 26, April 2024), and a volume that is not there would be made
+        // empty on first use -- which is the very failure a volume root exists
+        // to remove, arriving by a different door.
+        if !self.roots.is_empty() {
+            let api = version.api_version.as_deref().unwrap_or("0.0");
+            let (major, minor) = api.split_once('.').unwrap_or(("0", "0"));
+            let (major, minor): (u32, u32) =
+                (major.parse().unwrap_or(0), minor.parse().unwrap_or(0));
+            if (major, minor) < (1, 45) {
+                return Err(Error::Refused(format!(
+                    "this Runner was given volume roots ({}), and a volume's subdirectory                      travels as `subpath`, which the daemon's API {api} does not take -- it                      arrived in 1.45, with Docker 26. Upgrade the daemon, or give the paths                      instead of the volumes",
+                    self.roots
+                        .iter()
+                        .map(|root| root.volume.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )));
+            }
+            for root in &self.roots {
+                self.client
+                    .inspect_volume(&root.volume)
+                    .await
+                    .map_err(|e| {
+                        Error::Refused(format!(
+                            "the volume {} is not there for {}: {e}. A volume the daemon has                              to invent is an empty directory, and a submission judged against                              one",
+                            root.volume,
+                            root.here.display(),
+                        ))
+                    })?;
+            }
+            tracing::info!(
+                roots = ?self
+                    .roots
+                    .iter()
+                    .map(|root| format!("{} = {}", root.here.display(), root.volume))
+                    .collect::<Vec<_>>(),
+                "these directories reach the daemon by volume name, not by path",
+            );
+        }
 
         // cgroup v2 is a hard requirement, and the runtime is the honest place
         // to ask: reading `/sys/fs/cgroup` from inside the Runner's own
@@ -868,6 +1010,7 @@ impl Sandbox for Docker {
                 cgroup.as_ref().map(|(_, parent)| parent.as_str()),
                 shim,
                 bound.as_deref(),
+                &self.roots,
             )),
             ..Default::default()
         };
@@ -2102,7 +2245,7 @@ mod tests {
             Profile::new("image", vec!["true".to_owned()]).measured(),
             Profile::new("image", vec!["true".to_owned()]).alongside(),
         ] {
-            let config = Docker::host_config(&profile, None, false, None);
+            let config = Docker::host_config(&profile, None, false, None, &[]);
             assert!(
                 config.log_config.is_some(),
                 "a profile fell through to the daemon's default",
@@ -2110,15 +2253,137 @@ mod tests {
         }
     }
 
+    fn a_cache_root() -> Vec<Root> {
+        vec![Root {
+            here: PathBuf::from("/var/cache/algojudge-runner"),
+            volume: "algojudge-cache".to_owned(),
+        }]
+    }
+
+    #[test]
+    fn a_path_under_a_volume_root_travels_as_a_subpath() {
+        let mount = placed(
+            &a_cache_root(),
+            Path::new("/var/cache/algojudge-runner/packages/3a/0a/52/x/_extracted/tests"),
+            "/in",
+            false,
+        );
+        assert_eq!(mount.typ, Some(bollard::models::MountTypeEnum::VOLUME));
+        // **The volume by name, and the package under it.** The whole cache is
+        // every problem in the installation, answer keys included, so what a
+        // container may see has to stay the subdirectory it was given.
+        assert_eq!(mount.source.as_deref(), Some("algojudge-cache"));
+        assert_eq!(
+            mount.volume_options.and_then(|o| o.subpath).as_deref(),
+            Some("packages/3a/0a/52/x/_extracted/tests"),
+        );
+        assert_eq!(mount.read_only, Some(true));
+    }
+
+    #[test]
+    fn a_path_outside_every_root_is_the_bind_it_always_was() {
+        let mount = placed(
+            &a_cache_root(),
+            Path::new("/srv/elsewhere/out"),
+            "/program",
+            false,
+        );
+        assert_eq!(mount.typ, Some(bollard::models::MountTypeEnum::BIND));
+        assert_eq!(mount.source.as_deref(), Some("/srv/elsewhere/out"));
+        assert!(mount.volume_options.is_none());
+    }
+
+    #[test]
+    fn the_root_itself_carries_no_subpath() {
+        let mount = placed(
+            &a_cache_root(),
+            Path::new("/var/cache/algojudge-runner"),
+            "/cache",
+            true,
+        );
+        // An empty `subpath` is not the same as none, and the daemon is within
+        // its rights to refuse it.
+        assert_eq!(mount.volume_options.and_then(|o| o.subpath), None);
+        assert_eq!(mount.read_only, Some(false));
+    }
+
+    #[test]
+    fn the_longest_root_wins() {
+        let roots = vec![
+            Root {
+                here: PathBuf::from("/var"),
+                volume: "outer".to_owned(),
+            },
+            Root {
+                here: PathBuf::from("/var/lib/scratch"),
+                volume: "inner".to_owned(),
+            },
+        ];
+        let mount = placed(
+            &roots,
+            Path::new("/var/lib/scratch/job-1/out"),
+            "/work",
+            true,
+        );
+        assert_eq!(
+            mount.source.as_deref(),
+            Some("inner"),
+            "a directory inside another root belongs to the one that names it best",
+        );
+        assert_eq!(
+            mount.volume_options.and_then(|o| o.subpath).as_deref(),
+            Some("job-1/out"),
+        );
+    }
+
+    #[test]
+    fn a_channel_directory_under_a_root_leaves_the_binds_for_a_typed_mount() {
+        let here = PathBuf::from("/var/lib/algojudge-runner/work/job-1/out/1a/run");
+        let profile =
+            Profile::new("image", vec!["true".to_owned()]).pipes(&here, &here, "/aj-pipes");
+        let roots = vec![Root {
+            here: PathBuf::from("/var/lib/algojudge-runner/work"),
+            volume: "algojudge-work".to_owned(),
+        }];
+
+        let config = Docker::host_config(&profile, None, false, None, &roots);
+        // **A bind string cannot carry a subpath**, so the channels have to
+        // leave the binds entirely rather than be said twice.
+        assert!(
+            config.binds.unwrap_or_default().is_empty(),
+            "a path under a volume root must not also be bound by path",
+        );
+        let mounts = config.mounts.expect("the channels are mounted");
+        let channels = mounts
+            .iter()
+            .find(|m| m.target.as_deref() == Some("/aj-pipes"))
+            .expect("the channels reached the daemon");
+        assert_eq!(channels.typ, Some(bollard::models::MountTypeEnum::VOLUME));
+        assert_eq!(channels.source.as_deref(), Some("algojudge-work"));
+        assert_eq!(
+            channels
+                .volume_options
+                .clone()
+                .and_then(|o| o.subpath)
+                .as_deref(),
+            Some("job-1/out/1a/run"),
+        );
+        assert_eq!(
+            channels.read_only,
+            Some(false),
+            "the shim writes into these"
+        );
+    }
+
     /// Silence is the whole of what `none` is for: a run nobody reads.
     #[test]
     fn a_silent_run_keeps_no_log_and_a_read_one_keeps_a_bounded_one() {
         let quiet = Profile::new("image", vec!["true".to_owned()]).silent();
-        let silent = Docker::host_config(&quiet, None, false, None);
+        let silent = Docker::host_config(&quiet, None, false, None, &[]);
         assert_eq!(silent.log_config.unwrap().typ.as_deref(), Some("none"));
 
         let plain = Profile::new("image", vec!["true".to_owned()]);
-        let read = Docker::host_config(&plain, None, false, None);
+        let read = Docker::host_config(&plain, None, false, None, &[]);
         let log = read.log_config.expect("a driver");
         assert_eq!(
             log.typ.as_deref(),

@@ -66,6 +66,12 @@ pub struct Config {
     /// `AJ_Work__HostPath` applies, which is why the Runner probes it at start
     /// rather than discovering it as an empty `/in`.
     pub cache_host_path: PathBuf,
+    /// The volume the daemon knows the cache by, where it is one.
+    ///
+    /// **Set this and `Cache__HostPath` stops mattering**: the cache is reached
+    /// by name, and what a job container is given is a subdirectory under it.
+    /// See `aj_sandbox::Root` for why that is worth the daemon it requires.
+    pub cache_volume: Option<String>,
     pub cache_max_bytes: u64,
 
     /// Scratch for jobs, in both the views a bind mount needs.
@@ -79,6 +85,8 @@ pub struct Config {
     /// alone.
     pub work_path: PathBuf,
     pub work_host_path: PathBuf,
+    /// The volume the daemon knows the scratch by, where it is one.
+    pub work_volume: Option<String>,
 
     /// Where a judged run's channels are made, when the work directory will
     /// not hold them.
@@ -101,6 +109,8 @@ pub struct Config {
     /// container.
     pub pipes_path: Option<PathBuf>,
     pub pipes_host_path: Option<PathBuf>,
+    /// The volume the daemon knows the channels by, where they are in one.
+    pub pipes_volume: Option<String>,
 
     pub images: aj_standard_io::Images,
 
@@ -194,16 +204,35 @@ impl Config {
 
             tests_at_once: number("Runner__TestsAtOnce", 1) as usize,
 
+            // **A volume name takes the place of the host path, it does not
+            // sit beside it.** Where one is given the Runner's own path is what
+            // the daemon is told about, as the subdirectory under that volume --
+            // so there is no second value to get wrong, which is the whole
+            // reason to prefer a volume. A `HostPath` given as well is ignored
+            // rather than reconciled: two answers to one question is the
+            // arrangement being removed.
+            cache_volume: var("Cache__Volume"),
             cache_path: cache.clone().into(),
-            cache_host_path: var("Cache__HostPath").unwrap_or(cache).into(),
+            cache_host_path: match var("Cache__Volume") {
+                Some(_) => cache.clone().into(),
+                None => var("Cache__HostPath").unwrap_or(cache).into(),
+            },
             cache_max_bytes: number("Cache__MaxBytes", 10 * 1024 * 1024 * 1024),
 
+            work_volume: var("Work__Volume"),
             work_path: work.clone().into(),
-            work_host_path: var("Work__HostPath").unwrap_or(work).into(),
+            work_host_path: match var("Work__Volume") {
+                Some(_) => work.clone().into(),
+                None => var("Work__HostPath").unwrap_or(work).into(),
+            },
+            pipes_volume: var("Pipes__Volume"),
             pipes_path: var("Pipes__Path").map(Into::into),
-            pipes_host_path: var("Pipes__HostPath")
-                .or_else(|| var("Pipes__Path"))
-                .map(Into::into),
+            pipes_host_path: match var("Pipes__Volume") {
+                Some(_) => var("Pipes__Path").map(Into::into),
+                None => var("Pipes__HostPath")
+                    .or_else(|| var("Pipes__Path"))
+                    .map(Into::into),
+            },
 
             // Either name. The old one is not deprecated so much as narrower
             // than what it always did, and a development `.env` that has it
