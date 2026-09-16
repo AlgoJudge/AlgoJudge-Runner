@@ -162,9 +162,116 @@ fn split(mine: Option<&str>, lanes: usize) -> Vec<Option<String>> {
         .collect()
 }
 
+/// The processors that share a physical core with this one, as the kernel says.
+///
+/// `None` where the host does not answer — a virtual machine that publishes no
+/// topology, or a kernel built without it. Nothing is refused on a silence.
+fn siblings_of(cpu: usize) -> Option<Vec<usize>> {
+    let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+    parse(std::fs::read_to_string(path).ok()?.trim())
+}
+
+/// Lanes that were given one **thread** of a core rather than a core.
+///
+/// **Measured 2026-09-15, and the reason this exists.** The same submission
+/// judged in lanes of one thread measured a median 318 ms of processor time per
+/// test against 196 ms in lanes of a whole core — and a time limit is processor
+/// time, so 71% of that submission's tests went over a limit that none of them
+/// reached at the wider setting. A lane holds a judged run, the judge reading
+/// it, and the measuring shim; one thread is not enough processor for three
+/// things, and nothing in the verdict says so.
+///
+/// Reported rather than refused: an operator may have a host with no siblings
+/// to give, and a Runner that will not start is worse than one that says what
+/// it would rather have.
+pub fn threads_not_cores(lanes: &[Option<String>]) -> Vec<String> {
+    thin(lanes, siblings_of)
+}
+
+/// The same, as a function of what was read, so it is testable off a host.
+fn thin(lanes: &[Option<String>], siblings: impl Fn(usize) -> Option<Vec<usize>>) -> Vec<String> {
+    let cut: Vec<Vec<usize>> = lanes
+        .iter()
+        .map(|lane| lane.as_deref().and_then(parse).unwrap_or_default())
+        .collect();
+
+    let mut said = Vec::new();
+    for (index, mine) in cut.iter().enumerate() {
+        for &cpu in mine {
+            let Some(family) = siblings(cpu) else {
+                continue;
+            };
+            for kin in family.into_iter().filter(|&kin| kin != cpu) {
+                if mine.contains(&kin) {
+                    continue;
+                }
+                let elsewhere = cut
+                    .iter()
+                    .position(|other| other.contains(&kin))
+                    .map(|at| format!("lane {at}"))
+                    .unwrap_or_else(|| "no lane of this Runner".to_owned());
+                said.push(format!(
+                    "lane {index} has cpu {cpu}, whose sibling cpu {kin} is in {elsewhere}"
+                ));
+            }
+        }
+    }
+    said
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host whose siblings are `0-1`, `2-3`, ... as this machine's are.
+    fn pairs(cpu: usize) -> Option<Vec<usize>> {
+        let low = cpu - cpu % 2;
+        Some(vec![low, low + 1])
+    }
+
+    #[test]
+    fn a_lane_holding_a_whole_core_is_not_complained_about() {
+        let lanes = vec![Some("0,1".to_owned()), Some("2,3".to_owned())];
+        assert_eq!(thin(&lanes, pairs), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_lane_holding_one_thread_of_a_core_is_named_with_where_its_sibling_went() {
+        let lanes = vec![Some("0".to_owned()), Some("1".to_owned())];
+        let said = thin(&lanes, pairs);
+        assert_eq!(
+            said.len(),
+            2,
+            "both halves of the split core are named: {said:?}"
+        );
+        assert!(said[0].contains("lane 0 has cpu 0"), "{said:?}");
+        assert!(said[0].contains("sibling cpu 1 is in lane 1"), "{said:?}");
+    }
+
+    #[test]
+    fn a_sibling_this_runner_was_never_given_is_said_to_be_nobodys() {
+        // `0,2,4,6` is one thread of each of four cores -- the arrangement that
+        // measured no better than four threads of two cores.
+        let lanes = vec![Some("0".to_owned()), Some("2".to_owned())];
+        let said = thin(&lanes, pairs);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(
+            said.iter()
+                .all(|one| one.contains("no lane of this Runner")),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_host_that_publishes_no_topology_is_not_complained_about() {
+        let lanes = vec![Some("0".to_owned()), Some("1".to_owned())];
+        assert_eq!(thin(&lanes, |_| None), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_runner_that_pins_nothing_has_nothing_to_say() {
+        assert_eq!(thin(&[None, None], pairs), Vec::<String>::new());
+    }
 
     #[test]
     fn a_runner_that_may_use_the_whole_machine_pins_nothing() {
