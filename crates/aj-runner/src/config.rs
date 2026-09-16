@@ -250,22 +250,16 @@ impl Config {
             // still read, because it is what every deployment and every
             // compose file in this repository sets today. It is the old name
             // for one of the four, not a fifth image.
-            images: [
-                // The old name first, so the new one wins when both are set.
-                (aj_standard_io::language::GCC, "Sandbox__Image__Cpp"),
-                (aj_standard_io::language::GCC, "Sandbox__Image__Gcc"),
-                (aj_standard_io::language::CLANG, "Sandbox__Image__Clang"),
-                (aj_standard_io::language::CPYTHON, "Sandbox__Image__Python"),
-                (aj_standard_io::language::PYPY, "Sandbox__Image__Pypy"),
-            ]
-            .into_iter()
-            .fold(
-                aj_standard_io::Images::default(),
-                |images, (key, name)| match var(name) {
-                    Some(image) => images.with(key, image),
-                    None => images,
-                },
-            ),
+            // The old name first, so the new one wins when both are set.
+            images: std::iter::once((aj_standard_io::language::GCC, "Sandbox__Image__Cpp"))
+                .chain(IMAGE_SETTINGS.iter().copied())
+                .fold(
+                    aj_standard_io::Images::default(),
+                    |images, (key, name)| match var(name) {
+                        Some(image) => images.with(key, image),
+                        None => images,
+                    },
+                ),
         })
     }
 
@@ -340,6 +334,23 @@ fn problem_types(configured: Option<String>) -> Vec<String> {
         .filter(|t| !t.is_empty())
         .collect()
 }
+
+/// The four image keys, and the setting an operator writes for each without the
+/// `AJ_` prefix [`var`] adds.
+///
+/// **One spelling, because two readers need it.** The configuration above turns
+/// these into an [`aj_standard_io::Images`], and `crate::images::ready` names
+/// them when it refuses to start — an operator is told the variable they would
+/// change rather than the key the code files it under.
+///
+/// `Sandbox__Image__Cpp` is deliberately absent: it is the old name for the GCC
+/// image, still read above, and never the one to suggest to somebody now.
+pub const IMAGE_SETTINGS: &[(&str, &str)] = &[
+    (aj_standard_io::language::GCC, "Sandbox__Image__Gcc"),
+    (aj_standard_io::language::CLANG, "Sandbox__Image__Clang"),
+    (aj_standard_io::language::CPYTHON, "Sandbox__Image__Python"),
+    (aj_standard_io::language::PYPY, "Sandbox__Image__Pypy"),
+];
 
 fn var(key: &str) -> Option<String> {
     std::env::var(format!("AJ_{key}"))

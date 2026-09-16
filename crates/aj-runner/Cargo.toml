@@ -19,6 +19,9 @@ aj-sandbox = { path = "../aj-sandbox" }
 aj-standard-io = { path = "../aj-standard-io" }
 
 anyhow.workspace = true
+# The start-up gate's two-method seam over the sandbox, so its decision table is
+# exercised without a daemon. Same shape the sandbox's own `Sandbox` trait uses.
+async-trait.workspace = true
 # The key a built judge is filed under in the shared cache: its source, the
 # language it declares and the id of the image it was compiled against.
 hex.workspace = true

@@ -12,6 +12,7 @@ use aj_protocol::stopping::Stopping;
 use std::time::Duration;
 
 pub mod config;
+pub mod images;
 pub mod keeper;
 pub mod prepare;
 pub mod run;

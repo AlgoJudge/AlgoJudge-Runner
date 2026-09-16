@@ -1,9 +1,18 @@
 # PostgreSQL, the Server and a Runner, for development and for the tests that
 # need all three.
 #
+#   docker build -t algojudge/lang-gcc:local -f images/gcc/Dockerfile images/
+#   # ... and clang, python, pypy
 #   docker compose -f example-runner-development-docker-compose.yaml up -d --build --wait
 #   ./x test --test conformance -- --include-ignored --test-threads=1
 #   docker compose -f example-runner-development-docker-compose.yaml down -v
+#
+# **Build the language images first, and that is an order rather than a habit.**
+# This file names none of them, so the Runner wants the compiled-in
+# `algojudge/lang-*:local` — and since 2026-09-16 it proves it can judge before
+# it registers, so a Runner brought up before they exist refuses, restarts, and
+# goes on doing that until they do. Nothing is broken by it; the first
+# submission simply waits.
 #
 # **`--test-threads=1` is a requirement of that suite, not a preference.** Several
 # of its cases drain the queue or read a submission's state, and two running at

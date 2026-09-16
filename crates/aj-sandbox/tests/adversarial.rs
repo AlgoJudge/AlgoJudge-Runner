@@ -1614,3 +1614,84 @@ async fn a_child_that_escapes_the_process_group_cannot_write_after_the_report() 
     );
     assert_eq!(leftovers(&docker).await, 0);
 }
+
+// ── Pulling ─────────────────────────────────────────────────────────────────
+
+/// **The bug this exists to keep closed is not "the image is missing".** It is
+/// the image that is present and is no longer the one the tag names. A Runner
+/// that fetched only what was absent kept a toolchain from before the shim
+/// existed and failed every job in words that blamed the image.
+///
+/// Proved without a registry of our own: two real tags of a small public image,
+/// the older one's id tagged onto the newer one's name. That is exactly the
+/// state a moved tag leaves on a host that pulled before it moved.
+#[tokio::test]
+#[ignore = "needs a container runtime and a route to a registry"]
+async fn a_tag_that_moved_is_fetched_again_even_though_something_is_here() {
+    const OLDER: &str = "alpine:3.20";
+    const MOVED: &str = "alpine:3.21";
+
+    let docker = sandbox().await;
+    let client = bollard::Docker::connect_with_local_defaults().expect("the daemon");
+
+    let genuine = docker
+        .pull_image(MOVED)
+        .await
+        .expect("the image the tag names");
+    let older = docker.pull_image(OLDER).await.expect("an older one");
+    assert_ne!(
+        genuine, older,
+        "two tags naming one image would prove nothing"
+    );
+
+    client
+        .tag_image(
+            OLDER,
+            Some(
+                bollard::query_parameters::TagImageOptionsBuilder::default()
+                    .repo("alpine")
+                    .tag("3.21")
+                    .build(),
+            ),
+        )
+        .await
+        .expect("the older image under the newer name");
+    assert_eq!(
+        docker.image_id(MOVED).await.expect("what is here now"),
+        older,
+        "the host holds the wrong image under the right name, which is the case"
+    );
+
+    let after = docker.pull_image(MOVED).await.expect("the pull");
+
+    assert_eq!(
+        after, genuine,
+        "the tag was not fetched again, so a moved one would never be noticed"
+    );
+}
+
+/// A reference no registry serves is a refusal, which is what the start-up
+/// gate's "could not be pulled and is not on this host" arm rests on.
+///
+/// **It does not prove the two guards inside `pull_image`**, and that was
+/// measured rather than assumed: with both removed — the in-band error check
+/// and the confirming `inspect_image` — this case still fails, because the
+/// daemon refuses an unknown manifest with a status and bollard yields it as a
+/// stream error the `?` catches. The guards are for the other shape, a layer
+/// that fails after the response has already succeeded, which needs a registry
+/// that breaks mid-transfer and there is none in CI.
+#[tokio::test]
+#[ignore = "needs a container runtime and a route to a registry"]
+async fn a_tag_no_registry_serves_is_a_refusal() {
+    let docker = sandbox().await;
+
+    let said = docker
+        .pull_image("alpine:no-such-tag-9f3a2b")
+        .await
+        .expect_err("there is no such tag");
+
+    assert!(
+        format!("{said}").contains("alpine"),
+        "the sentence has to name what could not be pulled: {said}"
+    );
+}
