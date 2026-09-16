@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aj_package::{Config, Test, TestSet};
-use aj_sandbox::pipes::{open_for_writing, release, release_writer, Fifo};
+use aj_sandbox::pipes::{open_for_reading, open_for_writing, release, release_writer, Fifo};
 use aj_sandbox::{Beside, Enough, Mount, Pipes, Profile, Sandbox, Stopped};
 use futures_util::StreamExt as _;
 
@@ -85,6 +85,21 @@ const OUTPUT_CAP: u64 = 64 * 1024 * 1024;
 /// checker that has not opened its answer within its own wall clock is a
 /// checker that is never going to.
 const CHECKER_WALL_CLOCK: Duration = Duration::from_secs(30);
+
+/// How long a channel waits for the container that is supposed to open it.
+///
+/// **A bound rather than a rescue.** Every one of these pipes is read by a
+/// blocking thread, and a blocking open waits for a writer for ever — which was
+/// safe only while every path out of a run remembered to call `release`. That
+/// rule failed twice: the interactor's verdict, and a judged run's own output,
+/// each time as a Runner that never reported and re-claimed its job until it was
+/// restarted. `release` is still called, and still ends a wait at once; this is
+/// what makes it an optimisation rather than the only way out.
+///
+/// Thirty seconds is the checker's own wall clock, and two orders of magnitude
+/// above what it is bounding: a container's start was measured at 374 ms on
+/// 2026-09-05.
+const CHANNEL_WALL_CLOCK: Duration = Duration::from_secs(30);
 
 /// The largest submission this problem type will look at — **the outer wall,
 /// and not a rule of anybody's activity.**
@@ -847,6 +862,7 @@ impl<S: Sandbox> Pipeline<S> {
             watching,
             OUTPUT_CAP,
             beside.clone(),
+            CHANNEL_WALL_CLOCK,
         );
         let feeding = feeding.map(|stdin| {
             (
@@ -948,6 +964,16 @@ impl<S: Sandbox> Pipeline<S> {
         let produced = reading
             .await
             .map_err(|e| format!("test {}: the output was not read: {e}", test.name))?;
+        // **Before the run's own error**, because this is the more specific
+        // account of the same failure: a container that never started has no
+        // output channel to have opened, and reporting what it printed would be
+        // reporting on something that did not run.
+        if produced.never_opened {
+            return Err(format!(
+                "test {}: nothing opened the run's output channel within {CHANNEL_WALL_CLOCK:?}",
+                test.name,
+            ));
+        }
         let run = run.map_err(|e| format!("a test could not be run: {e}"))?;
 
         // The channels go with it; nothing in here outlives a test.
@@ -1464,6 +1490,15 @@ struct Produced {
     /// code rather than anything this could carry. There is no third case:
     /// somebody is always reading, which is why nothing here holds the bytes.
     found: Option<Comparison>,
+    /// Nobody ever opened the run's own output channel.
+    ///
+    /// **Not the same as printing nothing, and reporting it as that would judge
+    /// a participant on a container that never ran.** The shim opens this pipe
+    /// before the program does anything at all, so a channel still unopened when
+    /// the deadline passes means the container did not start -- an
+    /// infrastructure failure, which is what the caller turns it into. A test
+    /// that could not be read is not a verdict.
+    never_opened: bool,
     /// It printed more than it was allowed to.
     ///
     /// **Kept here rather than read off `Stopped::Output`**, because the two
@@ -1490,6 +1525,7 @@ fn relay(
     watching: Watching,
     cap: u64,
     beside: Beside,
+    waiting: Duration,
 ) -> tokio::task::JoinHandle<Produced> {
     tokio::task::spawn_blocking(move || {
         use std::io::Read as _;
@@ -1518,7 +1554,7 @@ fn relay(
             // The wait stays the checker's whole wall clock, and it has to: a
             // shorter one could give up on a checker that was going to read,
             // and *that* would be a wrong verdict rather than a slow one.
-            Watching::Relay(to) => match open_for_writing(to, CHECKER_WALL_CLOCK) {
+            Watching::Relay(to) => match open_for_writing(to, waiting) {
                 Ok(open) => Some(open),
                 Err(e) => {
                     tracing::warn!(
@@ -1531,61 +1567,88 @@ fn relay(
             _ => None,
         };
         let mut capped = false;
+        let mut never_opened = false;
         let mut total: u64 = 0;
 
-        if let Ok(mut channel) = std::fs::File::open(&at) {
-            let mut buffer = vec![0u8; 64 * 1024];
-            loop {
-                let read = match channel.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(read) => read,
-                };
-                let chunk = &buffer[..read];
-                // What the reaper watches: a run talking to its checker is
-                // working, however little processor time it is spending.
-                beside.moved(read);
-                total += read as u64;
-
-                // **The cap covers the comparing side too**, and not only the
-                // checker's. A program printing one enormous token with no
-                // whitespace in it is holding that token in *this* process
-                // until it ends, because a token is only whole once something
-                // follows it.
-                if !capped && total > cap {
-                    capped = true;
-                    // The checker is reading a stream that is not going to end
-                    // on its own. Closing this is what lets it finish rather
-                    // than wait out its own wall clock.
-                    far = None;
-                    beside.enough(Enough::Output);
+        // **Bounded, and that is the whole of the fix.** This was a blocking
+        // open, which waits for a writer for ever — and the one thing that
+        // could end that wait, `release`, had already been called by the time
+        // this thread reached here whenever the judged run finished inside the
+        // wait above. A container that never started then held the job for
+        // ever.
+        match open_for_reading(&at, waiting) {
+            Err(e) => {
+                never_opened = true;
+                tracing::warn!(
+                    path = %at.display(), %e,
+                    "nothing opened the run's output within the deadline",
+                );
+            }
+            Ok((mut channel, first)) => {
+                let mut buffer = vec![0u8; 64 * 1024];
+                // What the open had to take from the stream to learn that a writer
+                // had arrived. Normally nothing; never dropped.
+                if buffer.len() < first.len() {
+                    buffer.resize(first.len(), 0);
                 }
-                if capped {
-                    continue;
-                }
+                buffer[..first.len()].copy_from_slice(&first);
+                let mut carried = first.len();
+                loop {
+                    let read = if carried > 0 {
+                        std::mem::take(&mut carried)
+                    } else {
+                        match channel.read(&mut buffer) {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => read,
+                        }
+                    };
+                    let chunk = &buffer[..read];
+                    // What the reaper watches: a run talking to its checker is
+                    // working, however little processor time it is spending.
+                    beside.moved(read);
+                    total += read as u64;
 
-                match (&mut comparing, &mut far) {
-                    (Some(comparing), _) => {
-                        if comparing.feed(chunk).is_some() {
-                            beside.enough(Enough::Decided);
-                        }
+                    // **The cap covers the comparing side too**, and not only the
+                    // checker's. A program printing one enormous token with no
+                    // whitespace in it is holding that token in *this* process
+                    // until it ends, because a token is only whole once something
+                    // follows it.
+                    if !capped && total > cap {
+                        capped = true;
+                        // The checker is reading a stream that is not going to end
+                        // on its own. Closing this is what lets it finish rather
+                        // than wait out its own wall clock.
+                        far = None;
+                        beside.enough(Enough::Output);
                     }
-                    // **A checker that has stopped reading has decided.** It is
-                    // the only signal there is: a checker says what it thinks
-                    // with an exit code, so the moment it exits its end of the
-                    // pipe closes and this write fails. That is the same early
-                    // kill the built-in comparison gets, reached by the only
-                    // road a separate program leaves open.
-                    (None, Some(open)) => {
-                        use std::io::Write as _;
-                        if open.write_all(chunk).is_err() {
-                            beside.enough(Enough::Decided);
-                            far = None;
-                        }
+                    if capped {
+                        continue;
                     }
-                    // Nothing is listening any more — the checker exited, or
-                    // the cap closed its end. Draining is still what keeps the
-                    // program out of a blocking `write` until it is stopped.
-                    (None, None) => {}
+
+                    match (&mut comparing, &mut far) {
+                        (Some(comparing), _) => {
+                            if comparing.feed(chunk).is_some() {
+                                beside.enough(Enough::Decided);
+                            }
+                        }
+                        // **A checker that has stopped reading has decided.** It is
+                        // the only signal there is: a checker says what it thinks
+                        // with an exit code, so the moment it exits its end of the
+                        // pipe closes and this write fails. That is the same early
+                        // kill the built-in comparison gets, reached by the only
+                        // road a separate program leaves open.
+                        (None, Some(open)) => {
+                            use std::io::Write as _;
+                            if open.write_all(chunk).is_err() {
+                                beside.enough(Enough::Decided);
+                                far = None;
+                            }
+                        }
+                        // Nothing is listening any more — the checker exited, or
+                        // the cap closed its end. Draining is still what keeps the
+                        // program out of a blocking `write` until it is stopped.
+                        (None, None) => {}
+                    }
                 }
             }
         }
@@ -1593,13 +1656,26 @@ fn relay(
         Produced {
             found: comparing.map(|comparing| comparing.finish()),
             capped,
+            never_opened,
         }
     })
 }
 
 /// Reads one channel to its end, on a thread of its own.
+///
+/// **Bounded like every other reader here.** `std::fs::read` of a pipe blocks on
+/// the open until somebody writes, and an interactor that could not start never
+/// will. `release` is called on every path out of `interact`, which is what made
+/// this survivable; the deadline is what makes it safe without that.
 fn read_channel(at: PathBuf) -> tokio::task::JoinHandle<Vec<u8>> {
-    tokio::task::spawn_blocking(move || std::fs::read(&at).unwrap_or_default())
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let Ok((mut open, mut said)) = open_for_reading(&at, CHANNEL_WALL_CLOCK) else {
+            return Vec::new();
+        };
+        let _ = open.read_to_end(&mut said);
+        said
+    })
 }
 
 /// Carries what the interactor says back to the submission.
@@ -1618,12 +1694,22 @@ fn feed(from: PathBuf, to: PathBuf, beside: Beside) -> tokio::task::JoinHandle<(
         // The far end first, exactly as the forward relay does: the submission
         // is blocked opening its input, and it is the interactor's arrival that
         // has to be waited for, not the submission's.
-        let Ok(mut said) = std::fs::File::open(&from) else {
+        let Ok((mut said, first)) = open_for_reading(&from, CHANNEL_WALL_CLOCK) else {
             return;
         };
         let Ok(mut onward) = open_for_writing(&to, CHECKER_WALL_CLOCK) else {
             return;
         };
+
+        // Whatever the open had to take to learn the far end had arrived goes
+        // onward first: this is one half of a conversation, and a lost first
+        // line is a different conversation.
+        if !first.is_empty() {
+            beside.moved(first.len());
+            if onward.write_all(&first).is_err() {
+                return;
+            }
+        }
 
         let mut buffer = vec![0u8; 64 * 1024];
         loop {
@@ -1938,6 +2024,55 @@ pub fn scratch(root: &Path, job_id: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    /// A checker that never started, and the thread that used to wait for it.
+    ///
+    /// **This is the shape that held a Runner for ever.** The judged run ends,
+    /// `one_test` calls `release` on its way out — and this thread is still
+    /// inside the wait for the checker's answer channel, so that release lands
+    /// on nobody. It then opened the run's own output, for which no writer would
+    /// ever come, and blocked with no deadline: the job was never reported, the
+    /// lease was renewed, and the same job was claimed again until a restart.
+    #[tokio::test]
+    async fn a_relay_whose_channels_nobody_opens_ends_rather_than_waits() {
+        let here = std::env::temp_dir().join(format!("aj-relay-{}", std::process::id()));
+        std::fs::create_dir_all(&here).expect("somewhere to put pipes");
+        let out = aj_sandbox::pipes::Fifo::make(here.join("stdout"), 0o600).expect("a pipe");
+        let answer = aj_sandbox::pipes::Fifo::make(here.join("answer"), 0o600).expect("a pipe");
+
+        let began = std::time::Instant::now();
+        let reading = relay(
+            out.path().to_path_buf(),
+            Watching::Relay(answer.path().to_path_buf()),
+            OUTPUT_CAP,
+            Beside::new(),
+            Duration::from_millis(200),
+        );
+
+        // No `release` anywhere: the point is that this ends without one.
+        let produced = tokio::time::timeout(Duration::from_secs(20), reading)
+            .await
+            .expect("the relay ended on its own")
+            .expect("the thread did not panic");
+
+        // **Said, and not merely survived.** Reported as "it printed nothing"
+        // this would be a wrong answer pinned on a participant whose container
+        // never ran; the caller turns this flag into a failure with a reason.
+        assert!(
+            produced.never_opened,
+            "a channel nobody opened has to say so"
+        );
+        assert!(
+            produced.found.is_none(),
+            "nothing was compared, because nothing was written"
+        );
+        assert!(!produced.capped);
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "it waited {:?}, which is a Runner holding a job",
+            began.elapsed(),
+        );
+    }
+
     use super::*;
 
     use crate::policy::Violation;
