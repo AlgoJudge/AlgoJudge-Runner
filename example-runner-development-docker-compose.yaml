@@ -145,6 +145,12 @@ services:
       AJ_Server__BaseUrl: http://server:8080/api/v1
       AJ_Runner__Name: runner-dev
       AJ_Runner__ProblemTypes: standard-io@1,output-only@1
+      # **How many of one submission's tests this Runner judges at once.** One
+      # here, because a development stack shares a developer's machine with
+      # everything else on it; raise it to watch a submission spread across
+      # lanes. Nothing is pinned either way -- this container is given no
+      # `cpuset`, so the host's scheduler places the tests.
+      AJ_Runner__TestsAtOnce: ${AJ_RUNNER_TESTS_AT_ONCE:-1}
       # Which pools this Runner belongs to, comma-separated — a laboratory, a
       # room, a machine class. Left unset it is in `default`, which is where
       # every untagged activity's work is, and it behaves as every Runner did

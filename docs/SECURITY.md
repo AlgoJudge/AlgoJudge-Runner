@@ -53,7 +53,7 @@ trusted code.
 | `--pids-limit` | a fork bomb hits a wall |
 | **the host's cgroup namespace**, on a judged run alone | the shim has to name its container's own cgroup to make the submission's underneath it, and `/proc/self/cgroup` reads `/` in a private namespace. Without this the shim cannot make the cgroup its memory limit goes on, and refuses to start the submission rather than run it unlimited. It grants no write: the only cgroup file the container can reach is the one bound for it, which is root's. What it costs is that `/proc/self/cgroup` names the host's path rather than `/` |
 | `--cpus` | one processor's worth per second. The threading hole is closed by the accounting as well — `cpu.stat` sums the subtree, so threads spend the budget faster rather than escaping it |
-| `--cpuset-cpus`, **only where the Runner was given a set** | an operator's division of the host, carried to the job containers, which inherit no affinity of their own. Given the whole machine the Runner pins nothing: several Runners choosing processors with nothing coordinating them is worse than letting the host place the work |
+| `--cpuset-cpus`, **only where the Runner was given a set** | an operator's division of the host, carried to the job containers, which inherit no affinity of their own. Where a Runner judges several tests at once (`AJ_Runner__TestsAtOnce`) that set is **cut into one lane per test**, in the order it names the processors, and a test's judge runs in its test's lane. Given the whole machine the Runner pins nothing, at any width: several Runners choosing processors with nothing coordinating them is worse than letting the host place the work |
 | wall clock = **four times the limit plus four seconds without progress** | not a limit anybody is judged against: a time limit is processor time, so this reaps what is *not* spending any — one stuck in an uninterruptible syscall, or one that waits for input that never comes. It counts **consecutive** time: any processor time at all resets it, so a program descheduled on a busy host is never reaped for it. Four times the limit is roughly a host loaded four times past what it can carry, and the four seconds are what make this the guard against a hang at a limit small enough that four times it would not be |
 | processor time past **the limit plus two seconds** | there is no reason to keep waiting; the verdict is still decided afterwards on the measurement. Added rather than multiplied: the reading is the cgroup's, so it carries the container's own start, and a container costs what it costs whatever limit the problem set |
 | wall clock past **five times that ceiling**, whatever the progress | the last bound there is, and the only one a program making steady progress can reach — one waking for a millisecond a tick never stalls and never approaches its limit. Five times what the run was entitled to spend, so a problem allowed more processor time has earned more wall clock. It is reported as its own outcome, because "no processor time for four seconds" is false about a run that spent some in every one of them |
@@ -163,7 +163,9 @@ has a test rather than a paragraph.
    The one difference is that it opens **no measurement**: a judged run holds the
    cgroup gate for its whole length, and on the systemd cgroup driver that gate
    is an owned mutex, so a program beside it asking for one of its own would wait
-   for a run that is waiting for it.
+   for a run that is waiting for it. The gate is per lane rather than per Runner
+   since 2026-09-15, which changes nothing here — a judge runs in the same lane
+   as the test it is judging, which is the lane already held.
 
    That was two differences until 2026-09-05, and this document named one. The
    `--cpuset-cpus` row above was applied to the judged run alone, so on a host an
@@ -174,6 +176,10 @@ has a test rather than a paragraph.
    is what keeps a sixth from being added without it — a source check, because
    the behaviour is only observable on a machine that has been divided up, which
    neither a developer's nor CI's is.
+   `a_test_and_the_judge_beside_it_are_confined_to_one_lane` is the same kind of
+   check for the half that lanes added: which of them a container goes in. The
+   type carries the rest — a lane is not `Clone`, and exactly one is in scope
+   while a test is being judged.
 
 Two things that follow, and are easy to get wrong in the opposite direction:
 

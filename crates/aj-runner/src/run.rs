@@ -1435,6 +1435,7 @@ mod tests {
             lease_seconds: seconds,
             cache_path: "/dev/null".into(),
             cache_host_path: "/dev/null".into(),
+            tests_at_once: 1,
             cache_max_bytes: 0,
             work_path: "/dev/null".into(),
             work_host_path: "/dev/null".into(),

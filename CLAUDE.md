@@ -101,6 +101,15 @@ joining a reserved one. Two things about it are easy to get wrong here:
   nobody else's inode. A **judge's** container mounts `tests/` and the built
   program straight from the cache, which is why `AJ_Cache__HostPath` exists and
   why `docs/SECURITY.md` §6 was rewritten rather than left as it stood.
+- **One submission's tests are judged in lanes.** `AJ_Runner__TestsAtOnce`,
+  one by default. A lane is a piece of the processors the Runner was given plus
+  a **measurement home of its own** — under `systemd` a slice per lane, because
+  a reading there is a difference across one and only one run may be in it at a
+  time. A test's checker or interactor runs in the test's own lane. More lanes
+  than the Runner has processors is refused at start: a limit is processor time,
+  and two judged runs sharing a processor spend more of it on the same work. A
+  trial is unaffected — it judges one test at a time whatever the width says,
+  because the limits it derives are permanent.
 - **A shim change means rebuilding all four language images.** The Runner reads
   the binary out of an image to decide what it can do, and refuses a judged run
   in one whose shim predates the input arriving as a descriptor — an image is

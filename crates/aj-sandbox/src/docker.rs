@@ -30,7 +30,7 @@ use bollard::query_parameters::{
 };
 use futures_util::StreamExt as _;
 
-use crate::cgroups::{self, Cgroups};
+use crate::cgroups::{self, Cgroups, Homes};
 use std::path::{Path, PathBuf};
 
 use crate::profile::{Outcome, Pipes, Profile, Stopped, SHIM};
@@ -71,7 +71,14 @@ pub struct Docker {
     /// way. Absent is then the honest answer rather than a guess.
     ///
     /// Resolved by [`Self::preflight`], because deciding it needs the daemon.
-    cgroups: std::sync::OnceLock<Option<Cgroups>>,
+    /// How many tests this Runner judges at once, and so how many measurement
+    /// homes [`Self::preflight`] makes and proves.
+    ///
+    /// Decided before preflight because preflight is what creates them; one
+    /// unless [`Self::across`] said otherwise, which is what keeps a Runner
+    /// nobody widened on exactly the arrangement it had before lanes existed.
+    lanes: usize,
+    cgroups: std::sync::OnceLock<Option<Homes>>,
     /// What each image's measuring shim can do, asked once.
     ///
     /// **It has to be known before the container is made**, because it decides
@@ -113,14 +120,33 @@ impl Docker {
         Ok(Self {
             client: bollard::Docker::connect_with_local_defaults()?,
             instance: instance.into(),
+            lanes: 1,
             cgroups: std::sync::OnceLock::new(),
             shims: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
+    /// Judges this many tests at once, each in a measurement home of its own.
+    ///
+    /// A builder and not an argument to [`Self::connect`], so that a caller who
+    /// judges one thing at a time -- every test suite here, and a Runner nobody
+    /// widened -- goes on saying nothing about lanes.
+    pub fn across(mut self, lanes: usize) -> Self {
+        // Zero would be a Runner that starts, registers and then never judges
+        // anything: the fan-out it feeds yields nothing at width zero.
+        self.lanes = lanes.max(1);
+        self
+    }
+
     /// What [`Self::preflight`] decided, for a log and for a suite that has to
     /// know which host it is on before it can assert anything about a number.
     pub fn cgroups(&self) -> Option<&Cgroups> {
+        Some(self.homes()?.any())
+    }
+
+    /// The same, one per lane. What a suite needs to assert that two lanes
+    /// measure in two places rather than in one.
+    pub fn homes(&self) -> Option<&Homes> {
         self.cgroups.get()?.as_ref()
     }
 
@@ -165,8 +191,19 @@ impl Docker {
                 return None;
             }
         };
-        if let Some(known) = self.shims.lock().await.get(&id) {
-            return *known;
+        // **Held across the probe, and that is the fix rather than the cost.**
+        // Two tests starting at once both find this map empty, and the probe's
+        // container has a fixed name -- so the second one's `take_nothing`
+        // removes the first one's container out from under the read, and
+        // whichever loses answers *this image has no shim*. A measured, silent
+        // run in an image with no shim is refused, so that answer fails a
+        // submission -- and it is then remembered, so it fails every submission
+        // until the Runner is restarted. The lock costs one probe's wait, once
+        // per image for the life of a Runner, and it does the work once instead
+        // of once per lane. Nothing under it asks for it again.
+        let mut known = self.shims.lock().await;
+        if let Some(found) = known.get(&id) {
+            return *found;
         }
 
         let name = format!("algojudge-{}-shimprobe", self.instance);
@@ -209,7 +246,7 @@ impl Docker {
             socket_input = found.is_some_and(|f| f.socket_input),
             "measured runs in this image",
         );
-        self.shims.lock().await.insert(id, found);
+        known.insert(id, found);
         found
     }
 
@@ -220,6 +257,10 @@ impl Docker {
     /// into the container that judges with them — so a path that is real here
     /// and meaningless to the daemon is every submission to every problem with
     /// a checker failing, worded as though the author's checker did not build.
+    ///
+    /// **A fixed container name here needs no lock, where [`Self::image_shim`]
+    /// does**: this is asked once, from the Runner's start-up, before anything
+    /// has been claimed -- there is no second caller to race.
     ///
     /// A **typed** mount, which refuses a source that is not there, on a
     /// container that is created and never started: the check costs no image
@@ -346,8 +387,8 @@ impl Docker {
         // container's own as a child while the container exists, and a cgroup
         // with a child cannot be removed.
         let abandoned = self
-            .cgroups()
-            .map_or(0, |cgroups| cgroups.abandoned(&self.instance));
+            .homes()
+            .map_or(0, |homes| homes.abandoned(&self.instance));
         if abandoned > 0 {
             tracing::warn!(
                 abandoned,
@@ -586,6 +627,10 @@ impl Sandbox for Docker {
         "docker"
     }
 
+    fn lanes(&self) -> usize {
+        self.lanes
+    }
+
     /// **Asked every time, and cheap**: it is a local call, and it is the only
     /// way to notice that a tag has been republished under a Runner that has
     /// not restarted. Everything remembered about an image is filed under this.
@@ -655,20 +700,21 @@ impl Sandbox for Docker {
             .map(|d| d.to_string())
             .unwrap_or_default();
         let decided = cgroups::root_from_environment()
-            .and_then(|root| Cgroups::resolve(&driver, root, &self.instance))
+            .and_then(|root| Homes::resolve(&driver, root, &self.instance, self.lanes))
             .and_then(|chosen| chosen.prepare(&self.instance).map(|()| chosen));
 
         if let Ok(chosen) = &decided {
             tracing::info!(
-                driver = chosen.driver(),
-                home = %chosen.home().display(),
+                driver = chosen.any().driver(),
+                lanes = self.lanes,
+                homes = ?chosen.homes(),
                 "processor time and peak memory are read from here",
             );
             // Not a refusal: a verdict is made of processor time, which is
             // unaffected. Said once, at start, because the alternative is a
             // participant wondering why one installation prints a number and
             // another does not.
-            if let Some(why) = chosen.without_peak_memory() {
+            if let Some(why) = chosen.any().without_peak_memory() {
                 tracing::warn!("peak memory will not be reported: {why}");
             }
         }
@@ -733,13 +779,17 @@ impl Sandbox for Docker {
         // it and because under the systemd backend the reading is a difference
         // that has to have a beginning. Failure here is not an error: the run
         // proceeds unmeasured.
-        let cgroup = match self.cgroups() {
+        let cgroup = match self.homes() {
             // **A run beside another one opens nothing.** Under `systemd` the
             // gate `begin` takes is held for the whole of the run that owns it,
             // so asking for one here is how a checker comes to wait for the
             // submission that is waiting for the checker.
             _ if profile.alongside => None,
-            Some(cgroups) => cgroups.begin(&name).await,
+            // **The lane the caller placed this run in**, which is the lane its
+            // processors came from: a run measured in one lane's home while
+            // running on another's would be a reading taken where a second run
+            // was also making one.
+            Some(homes) => homes.lane(profile.lane).begin(&name).await,
             None => None,
         };
 
@@ -754,8 +804,8 @@ impl Sandbox for Docker {
         // unapplied.
         let bound = shim
             .then(|| {
-                self.cgroups()
-                    .and_then(|cgroups| cgroups.mount_point(&name))
+                self.homes()
+                    .and_then(|homes| homes.lane(profile.lane).mount_point(&name))
             })
             .flatten();
         if shim && bound.is_none() {

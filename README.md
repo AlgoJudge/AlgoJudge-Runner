@@ -173,8 +173,8 @@ from `cpu.stat` in a cgroup the sandbox is started under.
 **Both cgroup drivers are supported**, `cgroupfs` and `systemd`, and the Runner
 chooses from what the daemon reports. Under `cgroupfs` it makes a cgroup per run
 and removes it; under `systemd` — the default on virtually every Linux server —
-systemd owns the cgroup, so the Runner keeps one slice for its whole life and
-takes each run's numbers as the change across it. Either way the container needs
+systemd owns the cgroup, so the Runner keeps a slice per lane for its whole life
+and takes each run's numbers as the change across one. Either way the container needs
 the host's cgroup tree mounted writable, `--cgroupns=host`, and to run as root.
 `docs/CGROUP_V2.md` compares them.
 

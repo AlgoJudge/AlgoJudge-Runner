@@ -172,6 +172,20 @@ pub struct Profile {
     /// time.
     pub cpuset: Option<String>,
 
+    /// Which of the Runner's measurement lanes this run is measured in.
+    ///
+    /// **Not a processor, and not a set of them** -- that is [`Self::cpuset`],
+    /// and the two are set together by whoever holds the lane. This is the
+    /// index of the home a reading comes out of: under `cgroupfs` every run
+    /// makes a directory of its own and this changes nothing, and under
+    /// `systemd` it picks which of the Runner's slices the run is started
+    /// under, where *one run at a time* is the whole reason a reading is a
+    /// difference rather than a number.
+    ///
+    /// Zero where nobody said, which is every caller that runs one thing at a
+    /// time.
+    pub lane: usize,
+
     /// Whether this step is one a participant is judged on the time of.
     ///
     /// **It decides who the container starts as.** A measured step goes through
@@ -366,6 +380,7 @@ impl Profile {
             max_open_files: 256,
             max_file_bytes: 256 * 1024 * 1024,
             cpuset: None,
+            lane: 0,
             writable_root: false,
             silent: false,
             alongside: false,
@@ -443,6 +458,16 @@ impl Profile {
     /// allowed everything.
     pub fn cpuset(mut self, set: impl Into<String>) -> Self {
         self.cpuset = Some(set.into());
+        self
+    }
+
+    /// The measurement lane this run belongs to. See [`Profile::lane`].
+    ///
+    /// Set beside [`Self::cpuset`] and by the same caller: a run placed on one
+    /// lane's processors and measured in another's would be two halves of two
+    /// different arrangements.
+    pub fn lane(mut self, index: usize) -> Self {
+        self.lane = index;
         self
     }
 
@@ -594,5 +619,20 @@ pub struct Outcome {
 impl Outcome {
     pub fn succeeded(&self) -> bool {
         self.stopped == Stopped::OnItsOwn && self.exit_code == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A profile says where it is measured as well as where it runs, and says
+    /// the first lane when nobody said -- which is what every caller that runs
+    /// one thing at a time means.
+    #[test]
+    fn a_profile_says_which_lane_it_is_measured_in() {
+        let bare = Profile::new("image", vec!["true".to_owned()]);
+        assert_eq!(bare.lane, 0);
+        assert_eq!(bare.lane(2).lane, 2);
     }
 }
