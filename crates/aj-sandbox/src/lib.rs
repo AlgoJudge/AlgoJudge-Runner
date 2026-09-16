@@ -34,7 +34,7 @@ mod profile;
 
 pub use beside::{Beside, Enough};
 pub use cgroups::{Cgroups, Homes};
-pub use docker::{Docker, ShimFeatures};
+pub use docker::{Docker, Root, ShimFeatures};
 #[cfg(target_os = "linux")]
 pub use memfd::SealedInput;
 pub use profile::{Mount, Outcome, Pipes, Profile, Stopped, SHIM, SOCKET_INPUT};

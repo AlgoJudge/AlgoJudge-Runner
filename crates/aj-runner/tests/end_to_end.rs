@@ -1076,6 +1076,9 @@ fn probe_config() -> Config {
         // made to matter — and it makes the keeper's interval fifteen seconds.
         lease_seconds: 60,
         cache_path: scratch.join("cache"),
+        cache_volume: None,
+        work_volume: None,
+        pipes_volume: None,
         cache_host_path: scratch.join("cache"),
         cache_max_bytes: 0,
         work_path: scratch.join("work"),
