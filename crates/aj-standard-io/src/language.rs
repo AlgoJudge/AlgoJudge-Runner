@@ -186,8 +186,10 @@ impl Images {
 
     /// Every image this Runner needs to judge the whole catalogue.
     ///
-    /// For a caller that pulls or preflights them: the set, not one per
-    /// toolchain, because eighteen toolchains share four images.
+    /// The set, not one per toolchain, because eighteen toolchains share four
+    /// images. Use [`Images::wanted`] where it matters whether the operator
+    /// named an image or it fell back to the compiled-in one; this answers only
+    /// what the images are.
     pub fn all(&self) -> Vec<String> {
         let mut seen: Vec<String> = CATALOGUE
             .iter()
@@ -198,6 +200,54 @@ impl Images {
         seen.dedup();
         seen
     }
+
+    /// The same set, with **where each image's name came from**.
+    ///
+    /// The distinction decides what may be asked of a registry. An image the
+    /// operator named is a published reference and pulling it is the point; one
+    /// that fell back to the compiled-in default is `algojudge/lang-*:local`,
+    /// a build product this repository publishes nowhere. Asking a registry for
+    /// that name is worse than pointless: Docker resolves an unqualified name
+    /// against Docker Hub, where `algojudge` is not us, so a *successful* pull
+    /// would replace a locally built image on a host that runs untrusted code.
+    pub fn wanted(&self) -> Vec<Wanted> {
+        let mut keys: Vec<&'static str> = CATALOGUE.iter().map(|e| e.image).collect();
+        keys.sort_unstable();
+        keys.dedup();
+
+        // **Grouped by image, because several keys may name one.** An operator
+        // who points GCC and Clang at the same reference wants it fetched once,
+        // and — if it turns out to be wrong — wants to be told about both
+        // settings rather than whichever the loop reached first.
+        let mut seen: Vec<Wanted> = Vec::new();
+        for key in keys {
+            let Some(image) = self.named(key) else {
+                continue;
+            };
+            match seen.iter_mut().find(|w| w.image == image) {
+                Some(already) => already.keys.push(key),
+                None => seen.push(Wanted {
+                    keys: vec![key],
+                    image: image.to_owned(),
+                    operators: self.named.contains_key(key),
+                }),
+            }
+        }
+        seen
+    }
+}
+
+/// One image this Runner needs, and whether it is the operator's or ours.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wanted {
+    /// Every image key that resolves to this reference, as [`GCC`] and its
+    /// neighbours spell them. Never empty.
+    pub keys: Vec<&'static str>,
+    /// The reference to ask the daemon for.
+    pub image: String,
+    /// The operator named this one. False means the compiled-in default, which
+    /// is published nowhere and must never be asked of a registry.
+    pub operators: bool,
 }
 
 fn built_in_image(key: &str) -> Option<&'static str> {
@@ -615,6 +665,33 @@ mod tests {
             );
         }
         assert_eq!(Images::default().all().len(), 4, "eighteen share four");
+        assert_eq!(
+            Images::default().wanted().len(),
+            4,
+            "a start-up gate that skipped one would let it fail at judging time"
+        );
+    }
+
+    /// **A partial map is the normal case**, and the gate that pulls these has
+    /// to tell the two apart per key: an operator's reference is published and
+    /// pulling it is the point, ours is `:local` and asking a registry for it
+    /// reaches a stranger's account on Docker Hub.
+    #[test]
+    fn where_an_image_came_from_is_known_per_key() {
+        let images = Images::default().with(GCC, "ghcr.io/somebody/gcc:1");
+
+        let wanted = images.wanted();
+        let theirs: Vec<&Wanted> = wanted.iter().filter(|w| w.operators).collect();
+        let ours: Vec<&Wanted> = wanted.iter().filter(|w| !w.operators).collect();
+
+        assert_eq!(theirs.len(), 1, "one was named: {wanted:?}");
+        assert_eq!(theirs[0].keys, vec![GCC]);
+        assert_eq!(theirs[0].image, "ghcr.io/somebody/gcc:1");
+        assert_eq!(ours.len(), 3, "three fell back: {wanted:?}");
+        assert!(
+            ours.iter().all(|w| w.image.ends_with(":local")),
+            "the fallbacks are the compiled-in ones: {ours:?}"
+        );
     }
 
     #[test]
@@ -815,5 +892,31 @@ mod tests {
                 assert!(!command.contains('{'), "{}: {command}", language.id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod wanted_tests {
+    use super::*;
+
+    /// **Found by running the gate against a real daemon**, which reported a
+    /// setting the operator had not written. Several keys pointing at one image
+    /// is one fetch and one entry, and the entry has to carry all of them or a
+    /// refusal sends somebody to change the wrong variable.
+    #[test]
+    fn keys_that_share_an_image_share_one_entry() {
+        let images = Images::default()
+            .with(GCC, "example.test/one:1")
+            .with(CLANG, "example.test/one:1");
+
+        let wanted = images.wanted();
+        let shared: Vec<&Wanted> = wanted
+            .iter()
+            .filter(|w| w.image == "example.test/one:1")
+            .collect();
+
+        assert_eq!(shared.len(), 1, "fetched once: {wanted:?}");
+        assert_eq!(shared[0].keys, vec![CLANG, GCC], "both are named");
+        assert_eq!(wanted.len(), 3, "and the other two still stand alone");
     }
 }

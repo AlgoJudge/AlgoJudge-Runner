@@ -267,12 +267,6 @@ impl Docker {
         ])
     }
 
-    /// Pulls an image if it is not here yet.
-    ///
-    /// Language images are pinned by the caller. This exists so a first
-    /// evaluation on a fresh host does not fail with "no such image", which
-    /// would be reported as an infrastructure failure and be entirely correct
-    /// and entirely unhelpful.
     /// Whether an image carries the shim, asked once per image and remembered.
     ///
     /// **Read out of the image rather than run.** A container is created and
@@ -285,7 +279,7 @@ impl Docker {
     /// Any failure answers `false`, which is the safe direction: the run falls
     /// back to the shell, the container stays unprivileged, and the measurement
     /// is the cgroup's alone.
-    async fn image_shim(&self, image: &str) -> Option<ShimFeatures> {
+    pub async fn image_shim(&self, image: &str) -> Option<ShimFeatures> {
         let id = match self.image_id(image).await {
             Ok(id) => id,
             Err(e) => {
@@ -366,9 +360,14 @@ impl Docker {
     ///
     /// A **typed** mount, which refuses a source that is not there, on a
     /// container that is created and never started: the check costs no image
-    /// pull and runs nothing. Skipped where the image is not on this host yet —
-    /// the first judged run pulls it and would produce the same refusal, with
-    /// the same words.
+    /// pull and runs nothing.
+    ///
+    /// Answers `Ok(false)` where the image is not on this host, which by the
+    /// time anything calls this cannot happen: the start-up gate has already
+    /// put every image here or refused. It said *the first judged run pulls it*
+    /// until 2026-09-16, and no judged run has ever pulled anything — the
+    /// sentence described `docker run`, and this Runner speaks the daemon's API
+    /// instead, where a missing image is a 404 nobody catches.
     pub async fn can_mount(&self, at: &Path, image: &str) -> Result<bool> {
         if self.client.inspect_image(image).await.is_err() {
             tracing::debug!(image, "not here yet, so the cache mount was not checked");
@@ -414,6 +413,16 @@ impl Docker {
         })
     }
 
+    /// Pulls an image if it is not here yet.
+    ///
+    /// **A test helper, and it must stay one.** Every caller is a suite setting
+    /// up against `algojudge/lang-*:local` — names `./x` builds and this
+    /// repository publishes nowhere — so making this unconditional would put
+    /// four doomed round trips to Docker Hub in front of every local run.
+    ///
+    /// **Production wants [`Self::pull_image`] instead**, and the difference is
+    /// the early return below: this asks *is one here*, which a moving tag
+    /// answers yes to for ever.
     pub async fn ensure_image(&self, image: &str) -> Result<()> {
         if self.client.inspect_image(image).await.is_ok() {
             return Ok(());
@@ -433,6 +442,67 @@ impl Docker {
             step?;
         }
         Ok(())
+    }
+
+    /// Asks the registry for an image, whatever is already on this host.
+    ///
+    /// **Unconditional, and that is the whole of it.** [`Self::ensure_image`]
+    /// returns the moment the image is present, which answers *is one here* and
+    /// never *is this the one the tag names now* — and an installation is given
+    /// the moving major `0`. A Runner that fetched only what was missing kept a
+    /// toolchain from before the shim existed and failed every job in words
+    /// that blamed the image. Where nothing has moved the daemon compares
+    /// digests and fetches no layer, so the honest question costs a round trip
+    /// rather than a download.
+    ///
+    /// Answers the image's id, read back **after** the stream: the daemon
+    /// reports a failed layer in the body of a response that is otherwise a
+    /// success, and a stream that ended quietly is not evidence that anything
+    /// arrived.
+    ///
+    /// **Those two guards are deliberate and untested, which is said rather
+    /// than hidden.** An unknown manifest never reaches them — the daemon
+    /// refuses it with a status and bollard yields a stream error the `?`
+    /// catches, measured 2026-09-16 by removing both and watching
+    /// `a_tag_no_registry_serves_is_a_refusal` stay green. What they are for is
+    /// a layer that fails after the response has already succeeded, and
+    /// provoking that needs a registry that breaks mid-transfer.
+    pub async fn pull_image(&self, image: &str) -> Result<String> {
+        tracing::info!(image, "pulling");
+        let started = Instant::now();
+        let mut said = Instant::now();
+
+        let mut pull = self.client.create_image(
+            Some(
+                CreateImageOptionsBuilder::default()
+                    .from_image(image)
+                    .build(),
+            ),
+            None,
+            None,
+        );
+        while let Some(step) = pull.next().await {
+            let step = step?;
+            if let Some(e) = step.error {
+                return Err(Error::Refused(format!("{image} could not be pulled: {e}")));
+            }
+            // **Said out loud, because a first install is otherwise silent for
+            // minutes.** An operator watching nothing happen reaches for a
+            // restart in the middle of a multi-gigabyte download, and a restart
+            // is the one thing that makes it take longer.
+            if said.elapsed() >= Duration::from_secs(15) {
+                said = Instant::now();
+                tracing::info!(
+                    image,
+                    status = step.status.unwrap_or_default(),
+                    "pulling, still"
+                );
+            }
+        }
+
+        let id = self.image_id(image).await?;
+        tracing::info!(image, id, elapsed = ?started.elapsed(), "pulled");
+        Ok(id)
     }
 
     /// Removes the sandbox containers **this Runner** is responsible for, and
@@ -903,8 +973,10 @@ impl Sandbox for Docker {
         if profile.socket_input && !features.is_some_and(|f| f.socket_input) {
             return Err(Error::Refused(format!(
                 "the {SHIM} in {} predates the input arriving as a descriptor, so it \
-                 cannot judge. Pull the language images published with this Runner \
-                 and restart it: an image is probed once and the answer is remembered",
+                 cannot judge. Restart this Runner, which pulls its language images \
+                 at start. Pulling by hand works too: a running Runner takes up a \
+                 replaced image without a restart, because what it remembers about \
+                 one is filed under the image's id",
                 profile.image
             )));
         }

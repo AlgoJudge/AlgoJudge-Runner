@@ -161,13 +161,31 @@ async fn started() -> anyhow::Result<()> {
         );
     }
 
+    // **Before it registers, so nothing is claimed that this Runner would
+    // fail.** Every language image is put on this host and proved able to judge;
+    // a refusal here exits non-zero rather than starting, and the container
+    // runtime's restart policy is the retry.
+    //
+    // **This line is the whole of the ordering, and nothing enforces it.** A
+    // token only `ready` could make would turn it into a compile error, at the
+    // cost of threading one through the claim loop's re-handshake — and it
+    // would still be constructible in a test, so it would buy less than it
+    // reads. Said plainly rather than asserted, because a comment claiming an
+    // enforcement that does not exist is exactly the defect this gate closes:
+    // `can_mount` promised for a year that the first judged run would pull, and
+    // no judged run has ever pulled anything.
+    aj_runner::images::ready(&sandbox, &config.images, aj_runner::config::IMAGE_SETTINGS).await?;
+
     // **Before anything is judged, because the failure it catches is silent.**
     // The cache is where a package is unpacked and its judge built, and both
     // are mounted into the container that judges with them — so a path the
     // daemon cannot open is every submission to every checker problem failing,
     // in words that blame the package's author.
     // One image is enough — what is being asked about is the path — and any of
-    // them will do, so the first that is on this host already answers it.
+    // them will do, so the first that is on this host already answers it. The
+    // gate above has just put every one of them here, so the first iteration
+    // answers rather than falling through: this loop running out used to be how
+    // a wrong cache path hid behind four missing images.
     for image in config.images.all() {
         if sandbox.can_mount(&config.cache_host_path, &image).await? {
             break;

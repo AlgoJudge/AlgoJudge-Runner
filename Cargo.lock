@@ -61,6 +61,7 @@ dependencies = [
  "aj-sandbox",
  "aj-standard-io",
  "anyhow",
+ "async-trait",
  "bollard",
  "hex",
  "reqwest",
