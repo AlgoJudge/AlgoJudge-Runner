@@ -36,10 +36,17 @@ use std::time::Duration;
 /// called and *landed on nobody*: the thread was still inside a bounded wait for
 /// something else, and reached the open it needed rescuing from afterwards.
 ///
-/// [`open_for_reading`] has its own deadline now, so this is an optimisation —
-/// it ends a wait at once when the Runner already knows nothing is coming —
-/// rather than the thing correctness rests on. Calling it is still right on
-/// every path out; forgetting it is no longer fatal.
+/// [`open_for_reading`] has its own deadline, so for every reader that uses it
+/// this is an optimisation — it ends a wait at once when the Runner already
+/// knows nothing is coming — rather than the thing correctness rests on.
+///
+/// **It is still load-bearing for one reader**, and saying otherwise would be
+/// the same mistake in a new place: `docker::read_to_end`, which collects the
+/// shim's report, still opens blocking. It cannot use a deadline, because it is
+/// started before the run and has to wait out however long the run takes. What
+/// keeps it safe is the property the relay lacked — that blocking open is the
+/// first thing its thread does, so the release always lands on a thread already
+/// waiting for it.
 pub fn release(at: &Path) {
     use std::os::unix::fs::OpenOptionsExt as _;
     let _ = std::fs::OpenOptions::new()
@@ -50,13 +57,16 @@ pub fn release(at: &Path) {
 
 /// Opens a pipe for writing, waiting for the far end to arrive.
 ///
-/// **Non-blocking and retried, rather than a blocking open, and the asymmetry
-/// with the reader is deliberate.** A reader blocked on an open can be let go
-/// by opening the writing end for an instant — see [`release`] — because that
-/// is a thing the Runner can do on its own. A writer blocked on an open needs
-/// somebody to open the *reading* end, and the only candidate is the container
-/// that failed to start. So the wait is bounded here instead of relying on a
-/// rescue that would have to come from the thing that went wrong.
+/// **Non-blocking and retried, rather than a blocking open.** A writer blocked
+/// on an open needs somebody to open the *reading* end, and the only candidate
+/// is the container that failed to start — so the wait is bounded here instead
+/// of resting on a rescue that would have to come from the thing that went
+/// wrong.
+///
+/// This was the only bounded open of the two until 2026-09-16, on the argument
+/// that a reader *can* be let go from outside — see [`release`]. It can, and
+/// the rescue was missed anyway; [`open_for_reading`] is now the same shape as
+/// this one.
 ///
 /// `ENXIO` is the whole of the retry: it is what a non-blocking `O_WRONLY` open
 /// says when no reader has the pipe open yet, and it is indistinguishable from
@@ -146,6 +156,19 @@ pub fn open_for_reading(at: &Path, waiting: Duration) -> io::Result<(std::fs::Fi
     let until = std::time::Instant::now() + waiting;
     let mut first = Vec::new();
     loop {
+        // **Checked at the top, so no path through the loop can skip it.** An
+        // interrupted `poll` or `read` used to `continue` past the only place
+        // the deadline was consulted, which made a stream of signals a wait
+        // with no end -- the shape this function exists to remove.
+        if std::time::Instant::now() >= until {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "nothing opened {} for writing within {waiting:?}",
+                    at.display()
+                ),
+            ));
+        }
         let mut watched = libc::pollfd {
             fd: open.as_raw_fd(),
             events: libc::POLLIN,
@@ -189,26 +212,31 @@ pub fn open_for_reading(at: &Path, waiting: Duration) -> io::Result<(std::fs::Fi
                 _ => return Err(e),
             }
         }
-        // Zero: nobody holds the writing end. Not yet, or not ever.
-        if std::time::Instant::now() >= until {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "nothing opened {} for writing within {waiting:?}",
-                    at.display()
-                ),
-            ));
-        }
+        // Zero: nobody holds the writing end. Not yet, or not ever -- the
+        // deadline at the top of the loop decides which.
         std::thread::sleep(Duration::from_millis(1));
     }
 
     // SAFETY: the descriptor is open and owned by `open`.
-    unsafe {
+    let cleared = unsafe {
         let flags = libc::fcntl(open.as_raw_fd(), libc::F_GETFL);
-        if flags < 0 || libc::fcntl(open.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) < 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+        flags >= 0 && libc::fcntl(open.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) >= 0
+    };
+    if !cleared {
+        // **Said rather than swallowed.** Anything already taken out of the
+        // pipe goes with this error: the bytes are no longer in the pipe and
+        // there is nowhere to put them, so the count goes in the message
+        // instead of being lost in silence. `fcntl` on a descriptor this
+        // function owns has no failure anybody has seen.
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(
+            e.kind(),
+            format!(
+                "{} could not be put back into blocking mode, losing {} byte(s) already read: {e}",
+                at.display(),
+                first.len(),
+            ),
+        ));
     }
     Ok((open, first))
 }
@@ -517,6 +545,40 @@ mod tests {
     }
 
     #[test]
+    fn a_writer_that_is_merely_silent_ends_the_wait_rather_than_deferring_it() {
+        use std::io::Read as _;
+        let at = somewhere("silent-but-here").join("stdout");
+        let fifo = Fifo::make(&at, 0o600).expect("a pipe");
+        let path = fifo.path().to_path_buf();
+
+        // Opens at once, then says nothing for far longer than the deadline.
+        let writing = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let mut open = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("the far end");
+            std::thread::sleep(Duration::from_millis(700));
+            open.write_all(b"eventually").expect("said");
+        });
+
+        // **The deadline is deliberately shorter than the silence.** `EAGAIN`
+        // means a writer holds the pipe, so the wait is over and the deadline
+        // stops applying; read `EAGAIN` as "no data yet" instead and this asks
+        // for 200 ms of a program that thinks for 700, which in production is
+        // every submission that computes for longer than CHANNEL_WALL_CLOCK
+        // coming back as an infrastructure failure instead of a verdict.
+        let (mut open, first) =
+            open_for_reading(fifo.path(), Duration::from_millis(200)).expect("a writer holds it");
+        assert!(first.is_empty());
+
+        let mut said = Vec::new();
+        open.read_to_end(&mut said).expect("read");
+        writing.join().expect("the writer finished");
+        assert_eq!(said, b"eventually");
+    }
+
+    #[test]
     fn a_writer_that_opens_and_says_nothing_is_an_empty_channel() {
         let at = somewhere("silent").join("stdout");
         let fifo = Fifo::make(&at, 0o600).expect("a pipe");
@@ -541,9 +603,17 @@ mod tests {
         let fifo = Fifo::make(&at, 0o600).expect("a pipe");
         let path = fifo.path().to_path_buf();
 
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(40));
-            release(&path);
+        // **Released until it takes, rather than once at 40 ms.** `release`
+        // opens `O_WRONLY|O_NONBLOCK`, which answers `ENXIO` and does nothing
+        // at all if no reader has the pipe open yet -- so a single shot makes
+        // this test a race against the main thread reaching its own open, and
+        // on a loaded machine the loser is the test.
+        let (done, ended) = std::sync::mpsc::channel::<()>();
+        let releasing = std::thread::spawn(move || {
+            while ended.try_recv().is_err() {
+                release(&path);
+                std::thread::sleep(Duration::from_millis(10));
+            }
         });
 
         // `release` is no longer what keeps this from hanging -- the deadline is
@@ -551,6 +621,8 @@ mod tests {
         // knows nothing will come.
         let began = std::time::Instant::now();
         let said = drained(fifo.path(), Duration::from_secs(30)).expect("released");
+        let _ = done.send(());
+        releasing.join().expect("the releasing thread finished");
         assert_eq!(said, b"");
         assert!(
             began.elapsed() < Duration::from_secs(5),

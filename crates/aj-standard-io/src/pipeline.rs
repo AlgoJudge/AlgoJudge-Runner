@@ -81,9 +81,13 @@ const OUTPUT_CAP: u64 = 64 * 1024 * 1024;
 
 /// How long a checker may run, and how long the Runner waits for it to open.
 ///
-/// One constant for both because they are the same wait seen from two sides: a
-/// checker that has not opened its answer within its own wall clock is a
-/// checker that is never going to.
+/// One constant for those two because they are the same wait seen from two
+/// sides: a checker that has not opened its answer within its own wall clock is
+/// a checker that is never going to.
+///
+/// **Waiting for a *container* is a different question** and has its own
+/// constant below. The two are the same length today and mean different things,
+/// which is why they are not one name.
 const CHECKER_WALL_CLOCK: Duration = Duration::from_secs(30);
 
 /// How long a channel waits for the container that is supposed to open it.
@@ -97,8 +101,8 @@ const CHECKER_WALL_CLOCK: Duration = Duration::from_secs(30);
 /// what makes it an optimisation rather than the only way out.
 ///
 /// Thirty seconds is the checker's own wall clock, and two orders of magnitude
-/// above what it is bounding: a container's start was measured at 374 ms on
-/// 2026-09-05.
+/// above what it is bounding: `tests/judging.rs` records a container's own start
+/// as "some 374 ms on the machine it was written on".
 const CHANNEL_WALL_CLOCK: Duration = Duration::from_secs(30);
 
 /// The largest submission this problem type will look at — **the outer wall,
@@ -937,10 +941,13 @@ impl<S: Sandbox> Pipeline<S> {
             None => (running.await, None),
         };
 
-        // **Before either error, and that is not a preference.** The relay
-        // is a thread blocked on an open that a container which never
-        // started will never answer; leaving by a `?` would leak one per
-        // failed test for the life of the Runner.
+        // **Ends the relay's wait at once where it is already waiting.** It
+        // is not what keeps that thread from hanging any more -- its opens
+        // have their own deadline -- and this call is deliberately unreliable
+        // in one direction: the relay may still be inside its wait for the
+        // checker's answer channel, in which case this lands on nobody and the
+        // deadline is what ends the thread. That ordering is the whole reason
+        // the deadline exists.
         release(output.path());
         // **The hand-over is a task, never an arm of the `select!` above.**
         // It finishes the moment the shim connects, which in the ordinary
@@ -954,9 +961,10 @@ impl<S: Sandbox> Pipeline<S> {
         }
         if let Some((feeding, stdin)) = feeding {
             // Nothing is going to write the far end now, and nothing is
-            // going to read this one. Both halves of the thread's wait have
-            // to be ended, or it is a thread held for the life of the
-            // Runner.
+            // going to read this one. Both halves of the thread's wait are
+            // ended here rather than waited out: `feed` opens its reading end
+            // first and under a deadline, so this shortens the wait rather
+            // than being the only thing that ends it.
             release(&beside_them.here.join(FROM_THE_JUDGE));
             release_writer(stdin.path());
             let _ = feeding.await;
@@ -964,17 +972,26 @@ impl<S: Sandbox> Pipeline<S> {
         let produced = reading
             .await
             .map_err(|e| format!("test {}: the output was not read: {e}", test.name))?;
-        // **Before the run's own error**, because this is the more specific
-        // account of the same failure: a container that never started has no
-        // output channel to have opened, and reporting what it printed would be
-        // reporting on something that did not run.
+        let run = run.map_err(|e| format!("a test could not be run: {e}"))?;
+        // **The judge's own words, before the symptom below.** A checker or
+        // interactor that could not be started says so with the daemon's
+        // message — which names the image, the path and the reason — and an
+        // empty channel is only what that failure looks like from here.
+        // Hoisted out of the verdict below so the more specific account is the
+        // one reported; what remains there is the judge's answer, not its
+        // machinery.
+        let said = said.transpose()?;
+        // **A channel nobody opened, with nothing else to explain it.** The
+        // shim opens this pipe before the program runs, so one still unopened
+        // at the deadline means the container did not start — an
+        // infrastructure failure. Reported as output it would be a wrong
+        // answer pinned on a submission that never ran.
         if produced.never_opened {
             return Err(format!(
                 "test {}: nothing opened the run's output channel within {CHANNEL_WALL_CLOCK:?}",
                 test.name,
             ));
         }
-        let run = run.map_err(|e| format!("a test could not be run: {e}"))?;
 
         // The channels go with it; nothing in here outlives a test.
         let _ = std::fs::remove_dir_all(&per_test.here);
@@ -1106,7 +1123,7 @@ impl<S: Sandbox> Pipeline<S> {
 
         let (status, percentage, note) = match said {
             Some(said) => {
-                match said? {
+                match said {
                     Ok(said) => (
                         if said.accepted {
                             Status::Ok
@@ -1490,14 +1507,20 @@ struct Produced {
     /// code rather than anything this could carry. There is no third case:
     /// somebody is always reading, which is why nothing here holds the bytes.
     found: Option<Comparison>,
-    /// Nobody ever opened the run's own output channel.
+    /// The wait for somebody to open the run's own output channel ran out.
     ///
+    /// **Not "nobody opened it", which is a wider claim than this can make.**
+    /// The Runner's own `release` is a writer that opens and goes, so a thread
+    /// woken by it comes back with this `false` and an empty stream — reported,
+    /// correctly, as a run that printed nothing, because by then the Runner
+    /// already knows the run is over.
+    ///
+    /// What it does record is the deadline passing with no writer at all.
     /// **Not the same as printing nothing, and reporting it as that would judge
-    /// a participant on a container that never ran.** The shim opens this pipe
-    /// before the program does anything at all, so a channel still unopened when
-    /// the deadline passes means the container did not start -- an
-    /// infrastructure failure, which is what the caller turns it into. A test
-    /// that could not be read is not a verdict.
+    /// a participant on a container that never ran:** the shim opens this pipe
+    /// before the program does anything, so a channel still unopened at the
+    /// deadline means the container did not start. A test that could not be
+    /// read is not a verdict.
     never_opened: bool,
     /// It printed more than it was allowed to.
     ///
@@ -1510,11 +1533,13 @@ struct Produced {
 
 /// Reads one run's output as it is written, and decides what can be decided.
 ///
-/// **Blocking, on a thread of its own, and the blocking is the point.** Opening
-/// a pipe for reading waits for a writer, so the reader cannot mistake *nothing
-/// has been written yet* for *nothing will be* — which is what a non-blocking
-/// open reports, as an immediate end of file, and it would arrive here as a
-/// program that printed nothing.
+/// **On a thread of its own, and it waits for a writer rather than assuming
+/// one.** A reader must not mistake *nothing has been written yet* for *nothing
+/// will be* — a bare non-blocking open reports the second as an immediate end of
+/// file, and it would arrive here as a program that printed nothing. This used
+/// to be a blocking open, which cannot make that mistake and cannot end either;
+/// `open_for_reading` keeps the distinction and adds a deadline, and what
+/// happens when that deadline passes is `Produced::never_opened`.
 ///
 /// **It goes on draining after it has decided.** The verdict is settled and the
 /// bytes are thrown away, but a reader that stops reading is a full pipe, and a
@@ -1663,8 +1688,8 @@ fn relay(
 
 /// Reads one channel to its end, on a thread of its own.
 ///
-/// **Bounded like every other reader here.** `std::fs::read` of a pipe blocks on
-/// the open until somebody writes, and an interactor that could not start never
+/// **Bounded like every other reader here.** A blocking open of a pipe waits
+/// for a writer to *open* it, and an interactor that could not start never
 /// will. `release` is called on every path out of `interact`, which is what made
 /// this survivable; the deadline is what makes it safe without that.
 fn read_channel(at: PathBuf) -> tokio::task::JoinHandle<Vec<u8>> {
@@ -2049,10 +2074,26 @@ mod tests {
         );
 
         // No `release` anywhere: the point is that this ends without one.
-        let produced = tokio::time::timeout(Duration::from_secs(20), reading)
-            .await
-            .expect("the relay ended on its own")
-            .expect("the thread did not panic");
+        //
+        // **The rescue is on the failing arm, and nowhere else.** `reading` is a
+        // `spawn_blocking` task that nothing can cancel, so a timeout alone
+        // would not make a regression fail: the panic drops the runtime,
+        // `Runtime::drop` waits for the blocking pool, and the blocked thread
+        // never finishes -- the binary wedges before libtest is told anything.
+        // Measured by putting the blocking open back: "has been running for
+        // over 60 seconds", and the run had to be killed. CI declares no
+        // `timeout-minutes`, so that is six hours naming nothing.
+        //
+        // Releasing here and not before is what keeps the test honest: the wait
+        // has already failed by the time this runs, so it cannot mask the thing
+        // being tested -- it only lets the failure be reported.
+        let produced = match tokio::time::timeout(Duration::from_secs(20), reading).await {
+            Ok(joined) => joined.expect("the thread did not panic"),
+            Err(_) => {
+                aj_sandbox::pipes::release(out.path());
+                panic!("the relay did not end on its own");
+            }
+        };
 
         // **Said, and not merely survived.** Reported as "it printed nothing"
         // this would be a wrong answer pinned on a participant whose container
