@@ -1156,20 +1156,24 @@ int main(int argc, char** argv) {
     );
 }
 
-/// **A checker's exit is what stops the submission**, and it is the only thing
-/// a separate program can say while it is still running.
+/// **A submission has to end by itself to be accepted**, and a satisfied
+/// checker does not rescue one that will not.
 ///
-/// This is the checker's half of the change: the built-in comparison stops a
-/// program by deciding, and a checker stops one by finishing. Both arrive at
-/// the sandbox the same way — the Runner's write into the far pipe fails, and
-/// it asks for the run to end.
+/// This case was the opposite until 2026-09-16, and the reason it turned is
+/// that it was never one answer. The checker's exit and the output cap are
+/// decided in the same loop, and either could win: measured that day, the
+/// checker won every idle run and the cap won 24% of runs on a loaded host —
+/// the same submission, the same package, `Accepted` or `Output limit
+/// exceeded` depending on how the machine was feeling. A participant cannot
+/// reproduce that or argue with it, which is worse than either answer.
 ///
-/// The submission here never stops on its own. If it is judged at all, it was
-/// stopped; and the reported time says it was stopped almost at once rather
-/// than waited out.
+/// So the checker no longer stops anything, and the program below runs into a
+/// limit of its own. **Which** limit is deliberately not asserted: the cap and
+/// the processor-time ceiling are themselves a race, and pinning the faster of
+/// two racing stops would put the flakiness back one level down.
 #[tokio::test]
 #[ignore = "needs a container runtime and the language images"]
-async fn a_checker_that_has_seen_enough_stops_the_submission() {
+async fn a_submission_that_keeps_writing_after_its_answer_is_not_accepted() {
     // Prints the right answer, then never stops. Correct on everything the
     // checker below reads, so the verdict cannot come from the flood.
     let then_forever = r#"
@@ -1204,19 +1208,14 @@ int main(int argc, char** argv) {
     let first = &document["tests"][0];
 
     assert_eq!(
-        first["status"], "OK",
-        "the checker read its number and was satisfied: {document}"
+        first["status"], "ERROR",
+        "it printed the right answer and then would not stop, so it is not \
+         accepted however happy the checker was: {document}"
     );
-
-    // The limit these tests are judged under.
-    const LIMIT_MS: u64 = 2000;
-    let spent = first["timeMs"].as_u64().unwrap_or(LIMIT_MS);
     assert!(
-        spent * 4 < LIMIT_MS,
-        "a program that never stops reported {spent} ms of {LIMIT_MS} ms, which is \
-         not the shape of a run that was stopped: {document}"
+        judged.judgement.score < judged.judgement.max_score,
+        "and it does not score as though it had: {document}"
     );
-    assert_eq!(judged.judgement.score, judged.judgement.max_score);
 }
 
 /// A package like [`package`], judged by an interactor of the caller's own.
@@ -1280,12 +1279,20 @@ async fn an_interactor_judges_a_conversation() {
     );
 }
 
-/// **An interactor that has heard enough stops the submission**, exactly as a
-/// checker does: it exits, its end of the conversation closes, and the Runner
-/// turns the failed write into a kill.
+/// **A judge that refused outranks whatever stopped the submission.**
+///
+/// The submission below never ends, so since 2026-09-16 it is stopped by a
+/// limit rather than by the interactor. That decides it is not accepted — and
+/// it must not decide what a participant is told, because the interactor had
+/// already said something far more useful than "Time limit exceeded".
+///
+/// **On an interactive problem that sentence is the only feedback there is.**
+/// There is no expected output to show a difference against, so a lost comment
+/// is a participant left with nothing to act on. The first draft of this
+/// change did lose it, and this test is what would have caught that.
 #[tokio::test]
 #[ignore = "needs a container runtime and the language images"]
-async fn an_interactor_that_gives_up_stops_the_submission() {
+async fn an_interactor_that_refused_outranks_whatever_stopped_the_submission() {
     // Asks the same question forever and never listens to the answer.
     let deaf = r#"
 #include <cstdio>
@@ -1302,14 +1309,67 @@ int main() {
         "the interactor gave up on it, and that is a verdict about the answer \
          rather than about the machinery: {document}"
     );
-
-    // The limit these tests are judged under.
-    const LIMIT_MS: u64 = 2000;
-    let spent = first["timeMs"].as_u64().unwrap_or(LIMIT_MS);
     assert!(
-        spent < LIMIT_MS,
-        "a program that never stops reported {spent} ms of {LIMIT_MS} ms: {document}"
+        first["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("too many questions"),
+        "and the interactor's own words survive the stop, because they are the \
+         only thing an interactive problem can tell a participant: {document}"
     );
+}
+
+/// **A submission that waits for something that will never come is a time
+/// limit**, even where the judge was perfectly happy with what it said.
+///
+/// The other half of *a submission has to end by itself*: the case above keeps
+/// writing, this one keeps listening. The judge answers the one question,
+/// records `OK` and leaves — and the submission never checks whether its read
+/// worked, so it never notices the conversation ended and goes round for ever.
+/// Being accepted is not enough; it never ended, so a limit ends it.
+///
+/// **The shape is a real mistake rather than a contrived one**: a `scanf` whose
+/// result nobody looks at is the ordinary way an interactive submission fails
+/// to notice EOF.
+#[tokio::test]
+#[ignore = "needs a container runtime and the language images"]
+async fn a_submission_that_never_ends_is_a_time_limit_however_happy_the_judge_was() {
+    // Answers the first question, says the run was fine, and leaves.
+    let accepting = r#"
+#include <cstdio>
+int main(int argc, char** argv) {
+    if (argc < 4) return 1;
+    char q = 0; long long guess = 0;
+    if (scanf(" %c %lld", &q, &guess) != 2) return 1;
+    printf("=\n");
+    fflush(stdout);
+    FILE* say = fopen(argv[2], "w");
+    if (!say) return 1;
+    fprintf(say, "OK\n");
+    fclose(say);
+    return 0;
+}
+"#;
+    // Asks once, hears the answer, and then reads for ever without ever asking
+    // whether the read worked.
+    let waiting = r#"
+#include <cstdio>
+int main() {
+    printf("? 1\n");
+    fflush(stdout);
+    char c = 0;
+    for (;;) { scanf(" %c", &c); }
+}
+"#;
+    let judged = verdict(judge_interactive("cpp-waits-for-ever", waiting, accepting).await);
+    let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
+    let first = &document["tests"][0];
+
+    assert_eq!(
+        first["reason"], "timeLimit",
+        "the judge accepted it and it still never ended: {document}"
+    );
+    assert_ne!(first["status"], "OK", "so it is not accepted: {document}");
 }
 
 /// **A program that does not flush deadlocks, and the judge has to say which
