@@ -1,0 +1,34 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directories: ["/", "/images/*"]
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      # One digest pins the Rust toolchain in six places, here and in
+      # AlgoJudge-External-Runner, and `x` names the compiler it resolves to.
+      # It moves in all six at once, by hand.
+      - dependency-name: rust
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
