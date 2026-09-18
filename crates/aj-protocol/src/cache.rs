@@ -266,7 +266,7 @@ fn taken(at: &Path) -> Result<Option<std::fs::File>> {
 /// The lock on one entry, held for as long as this value is.
 ///
 /// Dropping it closes the descriptor, which is what releases the lock — so it
-/// is released on every path out, including a panic and a cancelled future.
+/// is released on every path out, including a panic and a canceled future.
 pub struct Locked<'a> {
     entry: &'a Entry,
     _held: std::fs::File,
@@ -1373,7 +1373,7 @@ mod tests {
         let mut held = Vec::new();
         for id in ["old", "middle", "held"] {
             let entry = an_entry(&cache, id, 100);
-            // What was derived from it counts towards the ceiling as well.
+            // What was derived from it counts toward the ceiling as well.
             std::fs::create_dir_all(entry.dir.join("_extracted")).unwrap();
             std::fs::write(entry.dir.join("_extracted/tests"), vec![0u8; 100]).unwrap();
             std::thread::sleep(Duration::from_millis(20));
@@ -1574,7 +1574,7 @@ mod tests {
         );
     }
 
-    /// **A dotted file id cannot reach a neighbour's name any more**, because
+    /// **A dotted file id cannot reach a neighbor's name any more**, because
     /// what is being named sits *inside* the entry rather than beside it. The
     /// hazard was real while the suffix replaced an extension: a file id of
     /// `a.b` produced `a.partial`, which is where the entry named `a` would

@@ -12,7 +12,7 @@ pub enum Error {
     #[error("the archive could not be opened: {0}")]
     NotAnArchive(#[from] zip::result::ZipError),
 
-    /// One of the extraction defences said no. Each carries what it saw,
+    /// One of the extraction defenses said no. Each carries what it saw,
     /// because "the package is bad" is not something an author can act on.
     #[error("{0}")]
     Refused(String),

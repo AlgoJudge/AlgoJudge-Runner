@@ -85,7 +85,7 @@ pub struct TestOutcome {
 }
 
 #[derive(Debug, Clone)]
-pub struct Judgement {
+pub struct Judgment {
     pub score: f64,
     pub max_score: f64,
     pub verdict: String,
@@ -108,7 +108,7 @@ pub struct ScoredTest {
     pub max_score: f64,
 }
 
-pub fn judge(config: &Config, tests: &TestSet, outcomes: &[TestOutcome]) -> Judgement {
+pub fn judge(config: &Config, tests: &TestSet, outcomes: &[TestOutcome]) -> Judgment {
     let mut groups = Vec::new();
     let mut scored = Vec::new();
 
@@ -159,7 +159,7 @@ pub fn judge(config: &Config, tests: &TestSet, outcomes: &[TestOutcome]) -> Judg
     let score: f64 = groups.iter().map(|g| g.points).sum();
     let max_score: f64 = groups.iter().map(|g| g.max_points).sum();
 
-    Judgement {
+    Judgment {
         verdict: verdict(&scored, score, max_score),
         score: round(score),
         max_score,

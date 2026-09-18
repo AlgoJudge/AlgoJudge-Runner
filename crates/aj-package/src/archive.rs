@@ -19,7 +19,7 @@ pub struct Limits {
     pub max_entry_bytes: u64,
     pub max_total_bytes: u64,
     /// Total uncompressed over total compressed. A cheap early signal, not the
-    /// real defence — the absolute caps are. Set generously, because test output
+    /// real defense — the absolute caps are. Set generously, because test output
     /// is legitimately very compressible and a problem with a megabyte of
     /// repeated digits is an ordinary problem, not an attack.
     pub max_ratio: u64,

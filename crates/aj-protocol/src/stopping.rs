@@ -18,7 +18,7 @@
 //!
 //!   - the retry that carries an answer already computed, bounded by the lease:
 //!     **ten minutes** at the shipped default;
-//!   - the wait on a Server that is deliberately down, which honours the
+//!   - the wait on a Server that is deliberately down, which honors the
 //!     operator's own `Retry-After` and so has **no bound this side sets**;
 //!   - the registration loop, which a Runner re-enters whenever its token is
 //!     forgotten, and which took no handle at all.

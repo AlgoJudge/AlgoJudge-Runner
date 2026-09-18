@@ -409,7 +409,7 @@ async fn settled(participant: &Session, activity: &str, submission: &str) -> Val
             .await;
 
         match seen["state"].as_str().unwrap_or("") {
-            "completed" | "failed" | "cancelled" => return seen,
+            "completed" | "failed" | "canceled" => return seen,
             _ => tokio::time::sleep(Duration::from_millis(500)).await,
         }
     }
@@ -438,7 +438,7 @@ async fn a_runner_judges_every_outcome_a_participant_can_get() {
 
     let participant = Session::as_("student", "student-development-only").await;
     participant
-        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .post(&format!("/activities/{activity}/enrollment"), json!({}))
         .await;
 
     wait_until_open(&participant, &activity).await;
@@ -558,7 +558,7 @@ async fn two_runners_sharing_one_cache_judge_the_same_problem_at_once() {
 
     let participant = Session::as_("student", "student-development-only").await;
     participant
-        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .post(&format!("/activities/{activity}/enrollment"), json!({}))
         .await;
     wait_until_open(&participant, &activity).await;
 
@@ -612,7 +612,7 @@ async fn a_package_that_will_not_open_is_not_scored_as_a_wrong_answer() {
 
     let participant = Session::as_("student", "student-development-only").await;
     participant
-        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .post(&format!("/activities/{activity}/enrollment"), json!({}))
         .await;
     wait_until_open(&participant, &activity).await;
 
@@ -659,7 +659,7 @@ async fn a_second_problem_type_is_judged_without_the_server_learning_about_it() 
 
     let participant = Session::as_("student", "student-development-only").await;
     participant
-        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .post(&format!("/activities/{activity}/enrollment"), json!({}))
         .await;
     wait_until_open(&participant, &activity).await;
 
@@ -872,7 +872,7 @@ async fn a_window_does_not_cost_a_participant_their_submission() {
     let activity = publish(&admin, fixture("sum.zip")).await;
     let participant = Session::as_("student", "student-development-only").await;
     participant
-        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .post(&format!("/activities/{activity}/enrollment"), json!({}))
         .await;
     wait_until_open(&participant, &activity).await;
 
@@ -996,7 +996,7 @@ async fn a_renewed_lease_outlives_the_deadline_it_was_granted() {
 
     let participant = Session::as_("student", "student-development-only").await;
     participant
-        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .post(&format!("/activities/{activity}/enrollment"), json!({}))
         .await;
     wait_until_open(&participant, &activity).await;
     participant
@@ -1142,7 +1142,7 @@ async fn an_assignments_own_limits_are_what_the_submission_is_judged_under() {
 
     let participant = Session::as_("student", "student-development-only").await;
     participant
-        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .post(&format!("/activities/{activity}/enrollment"), json!({}))
         .await;
     wait_until_open(&participant, &activity).await;
 
@@ -1204,7 +1204,7 @@ async fn a_runner_told_to_stop_hands_its_job_back_at_once() {
 
     let participant = Session::as_("student", "student-development-only").await;
     participant
-        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .post(&format!("/activities/{activity}/enrollment"), json!({}))
         .await;
     wait_until_open(&participant, &activity).await;
 
@@ -1319,7 +1319,7 @@ async fn settled_within(
             .get(&format!("/activities/{activity}/submissions/{submission}"))
             .await;
         match seen["state"].as_str().unwrap_or("") {
-            "completed" | "failed" | "cancelled" => return seen,
+            "completed" | "failed" | "canceled" => return seen,
             _ => tokio::time::sleep(Duration::from_millis(500)).await,
         }
     }
@@ -1406,7 +1406,7 @@ async fn one_package_is_prepared_once_however_many_submissions_arrive() {
     let activity = publish(&admin, fixture("sum.zip")).await;
     let participant = Session::as_("student", "student-development-only").await;
     participant
-        .post(&format!("/activities/{activity}/enrolment"), json!({}))
+        .post(&format!("/activities/{activity}/enrollment"), json!({}))
         .await;
     wait_until_open(&participant, &activity).await;
 

@@ -1,6 +1,6 @@
 # The LLVM toolchain a C or C++ submission is built and run with.
 #
-# The catalogue offers every standard through both compilers, because `g++` and
+# The catalog offers every standard through both compilers, because `g++` and
 # `clang++` disagree about enough that a submission accepted by one is
 # occasionally rejected by the other — which is a thing a course teaching a
 # standard may legitimately want to pin.

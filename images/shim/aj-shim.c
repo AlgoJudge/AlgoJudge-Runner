@@ -121,7 +121,7 @@ static char nonce[128];
 /* Where the report goes.
  *
  * **stderr until told otherwise, and that is the transition and the fallback
- * at once.** A Runner that names no channel gets the old behaviour, which is
+ * at once.** A Runner that names no channel gets the old behavior, which is
  * what keeps an older image and a newer one both judgeable while this moves.
  * Once the child is running its own stderr is `/dev/null`, so this is also the
  * one descriptor by which anything can still be said. */
@@ -172,13 +172,13 @@ static void take_nonce(void) {
 
 /* The report's channel, taken from the environment and then removed from it.
  *
- * **Scrubbed like the nonce**, for a weaker reason: a submission that learnt the
+ * **Scrubbed like the nonce**, for a weaker reason: a submission that learned the
  * path could open it and write a line of its own, and although the nonce is
  * what makes such a line ignorable, a channel it cannot name is one it cannot
  * try. Absent means stderr, which is where the report went until 2026-09-05.
  *
  * A path that is given and cannot be opened is fatal. There is no third
- * behaviour: a Runner that named a channel is waiting on it, and a shim that
+ * behavior: a Runner that named a channel is waiting on it, and a shim that
  * quietly wrote somewhere else would leave that Runner waiting for ever. */
 static void take_report_channel(void) {
     static const char key[] = "AJ_SHIM_REPORT=";
@@ -208,7 +208,7 @@ static void take_report_channel(void) {
  * its own namespace. A sibling made by hand inherits no controllers, because a
  * cgroup passes on only what it was passed. And the slice a sibling would live
  * in belongs to systemd, which rewrites its `cgroup.subtree_control` whenever it
- * realises a unit there: measured 2026-09-06, a box made with `memory.max` had
+ * realizes a unit there: measured 2026-09-06, a box made with `memory.max` had
  * that file *gone* after the next container started in the same slice, so the
  * submission ran with no limit at all and was killed by the container's.
  *
@@ -405,7 +405,7 @@ static void become_the_submission(void) {
  *
  * Outside one, the child's own process group is the most that can be killed
  * safely. It misses a `setsid` escapee, which is why that case is proved in the
- * containerised suite and not here. */
+ * containerized suite and not here. */
 static void kill_the_rest(pid_t group) {
     if (getpid() == 1) {
         kill(-1, SIGKILL);
@@ -569,9 +569,9 @@ int main(int argc, char **argv) {
          * write needs root and the next line gives root up. */
         join_the_cgroup();
         become_the_submission();
-        /* **`execvp`, because the catalogue names `python3` and not a path.**
+        /* **`execvp`, because the catalog names `python3` and not a path.**
          * The shell this replaces searched `PATH`; `execve` does not, and every
-         * interpreted language in the catalogue would come back as a program
+         * interpreted language in the catalog would come back as a program
          * that is not there. The environment is the one already scrubbed of the
          * nonce, which `execvp` passes on as it stands. */
         execvp(argv[3], &argv[3]);

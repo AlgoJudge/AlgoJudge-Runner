@@ -81,7 +81,7 @@ pub struct Config {
     /// container the path it sees is not the path the daemon can open — and a
     /// path the daemon cannot open produces an **empty directory** rather than
     /// an error, which means tests silently run against nothing. Where the
-    /// Runner is not containerised the two are the same and this can be left
+    /// Runner is not containerized the two are the same and this can be left
     /// alone.
     pub work_path: PathBuf,
     pub work_host_path: PathBuf,
@@ -124,7 +124,7 @@ pub struct Config {
     /// the conformance suite needs and all it needs.
     ///
     /// **Renamed from `AJ_Sandbox__AllowCgroupV1` on 2026-09-02**, which is
-    /// still honoured: cgroup v1 was one of three conditions even then, and
+    /// still honored: cgroup v1 was one of three conditions even then, and
     /// after the refusal became about the verdict rather than about a number
     /// beside it, the old name described none of them.
     pub allow_unmeasured: bool,

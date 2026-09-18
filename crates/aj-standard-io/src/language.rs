@@ -5,7 +5,7 @@
 //! one or two. What that missed is that a *standard* is not a toolchain: a
 //! course teaching C++17 and a course teaching C89 are not asking for a
 //! different compiler, they are asking the same compiler for a different `-std`,
-//! and refusing them cost a Runner release each. So the catalogue is a table
+//! and refusing them cost a Runner release each. So the catalog is a table
 //! now, and adding a row is a data change.
 //!
 //! ## Two levels, because they answer two different questions
@@ -78,7 +78,7 @@ pub struct Language {
     /// Run in the build container. `None` for a language with nothing to build.
     pub build: Option<Vec<String>>,
     /// What the build leaves behind, and what the run container mounts.
-    pub artefact: &'static str,
+    pub artifact: &'static str,
     /// Run in the test container. The caller wraps this to redirect input.
     pub start: Vec<String>,
 }
@@ -113,7 +113,7 @@ pub const SOURCE: &str = "/src";
 /// **The build gets no writable host path.** It was handed one at first, and a
 /// container running as an unprivileged user could not write to a directory the
 /// Runner owned — the fix is not to open that directory to everybody but to
-/// take the artefact back through the runtime API. It is not a tmpfs either:
+/// take the artifact back through the runtime API. It is not a tmpfs either:
 /// that is destroyed with the container, so the archive endpoint would find
 /// nothing to hand over.
 pub const BUILD_OUTPUT: &str = "/out";
@@ -184,14 +184,14 @@ impl Images {
             .or_else(|| built_in_image(key))
     }
 
-    /// Every image this Runner needs to judge the whole catalogue.
+    /// Every image this Runner needs to judge the whole catalog.
     ///
     /// The set, not one per toolchain, because eighteen toolchains share four
     /// images. Use [`Images::wanted`] where it matters whether the operator
     /// named an image or it fell back to the compiled-in one; this answers only
     /// what the images are.
     pub fn all(&self) -> Vec<String> {
-        let mut seen: Vec<String> = CATALOGUE
+        let mut seen: Vec<String> = CATALOG
             .iter()
             .filter_map(|e| self.named(e.image))
             .map(str::to_owned)
@@ -211,7 +211,7 @@ impl Images {
     /// against Docker Hub, where `algojudge` is not us, so a *successful* pull
     /// would replace a locally built image on a host that runs untrusted code.
     pub fn wanted(&self) -> Vec<Wanted> {
-        let mut keys: Vec<&'static str> = CATALOGUE.iter().map(|e| e.image).collect();
+        let mut keys: Vec<&'static str> = CATALOG.iter().map(|e| e.image).collect();
         keys.sort_unstable();
         keys.dedup();
 
@@ -241,7 +241,7 @@ impl Images {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wanted {
     /// Every image key that resolves to this reference, as [`GCC`] and its
-    /// neighbours spell them. Never empty.
+    /// neighbors spell them. Never empty.
     pub keys: Vec<&'static str>,
     /// The reference to ask the daemon for.
     pub image: String,
@@ -260,7 +260,7 @@ fn built_in_image(key: &str) -> Option<&'static str> {
     }
 }
 
-// ── the catalogue ───────────────────────────────────────────────────────────
+// ── the catalog ─────────────────────────────────────────────────────────────
 
 struct Entry {
     id: &'static str,
@@ -271,7 +271,7 @@ struct Entry {
     extensions: &'static [&'static str],
     /// `{BUILD_OUTPUT}` and `{SOURCE}` are substituted before the shell sees it.
     build: &'static str,
-    artefact: &'static str,
+    artifact: &'static str,
     start: &'static [&'static str],
 }
 
@@ -293,7 +293,7 @@ const PY: &[&str] = &[".py"];
 ///   with "Read-only file system", which reported every correct Python solution
 ///   as a compilation error.
 ///
-/// `-O2` because a limit is stated against optimised code, and judging a debug
+/// `-O2` because a limit is stated against optimized code, and judging a debug
 /// build would make every limit a different limit.
 ///
 /// `-static` on every compiled row — and **not** for the reason this file gave
@@ -306,13 +306,13 @@ const PY: &[&str] = &[".py"];
 ///
 /// What it does buy is worth keeping, so the flag stays:
 ///
-/// - the artefact stops depending on the image it happens to be run in, which
+/// - the artifact stops depending on the image it happens to be run in, which
 ///   is what lets a run image be slimmed — or replaced with a distroless one —
 ///   without quietly changing what every submission is judged on; and
 /// - the measured run does not include the loader resolving shared libraries.
 ///   A limit is stated against the program, and start-up that varies with the
 ///   image is not the program.
-const CATALOGUE: &[Entry] = &[
+const CATALOG: &[Entry] = &[
     Entry {
         id: "c89-gcc",
         label: "C89 / ANSI C (GCC)",
@@ -321,7 +321,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.c",
         extensions: C,
         build: "mkdir -p {BUILD_OUTPUT} && gcc -O2 -std=c89 -pedantic-errors -static -o {BUILD_OUTPUT}/program {SOURCE}/main.c",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -332,7 +332,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.c",
         extensions: C,
         build: "mkdir -p {BUILD_OUTPUT} && clang -O2 -std=c89 -pedantic-errors -static -o {BUILD_OUTPUT}/program {SOURCE}/main.c",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -343,7 +343,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.c",
         extensions: C,
         build: "mkdir -p {BUILD_OUTPUT} && gcc -O2 -std=c99 -static -o {BUILD_OUTPUT}/program {SOURCE}/main.c",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -354,7 +354,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.c",
         extensions: C,
         build: "mkdir -p {BUILD_OUTPUT} && clang -O2 -std=c99 -static -o {BUILD_OUTPUT}/program {SOURCE}/main.c",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -365,7 +365,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.c",
         extensions: C,
         build: "mkdir -p {BUILD_OUTPUT} && gcc -O2 -std=c11 -static -o {BUILD_OUTPUT}/program {SOURCE}/main.c",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -376,7 +376,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.c",
         extensions: C,
         build: "mkdir -p {BUILD_OUTPUT} && clang -O2 -std=c11 -static -o {BUILD_OUTPUT}/program {SOURCE}/main.c",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -387,7 +387,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.c",
         extensions: C,
         build: "mkdir -p {BUILD_OUTPUT} && gcc -O2 -std=c23 -static -o {BUILD_OUTPUT}/program {SOURCE}/main.c",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -398,7 +398,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.c",
         extensions: C,
         build: "mkdir -p {BUILD_OUTPUT} && clang -O2 -std=c23 -static -o {BUILD_OUTPUT}/program {SOURCE}/main.c",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -409,7 +409,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.cpp",
         extensions: CPP,
         build: "mkdir -p {BUILD_OUTPUT} && g++ -O2 -std=c++11 -static -o {BUILD_OUTPUT}/program {SOURCE}/main.cpp",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -420,7 +420,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.cpp",
         extensions: CPP,
         build: "mkdir -p {BUILD_OUTPUT} && clang++ -O2 -std=c++11 -static -o {BUILD_OUTPUT}/program {SOURCE}/main.cpp",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -431,7 +431,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.cpp",
         extensions: CPP,
         build: "mkdir -p {BUILD_OUTPUT} && g++ -O2 -std=c++17 -static -o {BUILD_OUTPUT}/program {SOURCE}/main.cpp",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -442,7 +442,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.cpp",
         extensions: CPP,
         build: "mkdir -p {BUILD_OUTPUT} && clang++ -O2 -std=c++17 -static -o {BUILD_OUTPUT}/program {SOURCE}/main.cpp",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -453,7 +453,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.cpp",
         extensions: CPP,
         build: "mkdir -p {BUILD_OUTPUT} && g++ -O2 -std=c++20 -static -o {BUILD_OUTPUT}/program {SOURCE}/main.cpp",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -464,7 +464,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.cpp",
         extensions: CPP,
         build: "mkdir -p {BUILD_OUTPUT} && clang++ -O2 -std=c++20 -static -o {BUILD_OUTPUT}/program {SOURCE}/main.cpp",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -475,7 +475,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.cpp",
         extensions: CPP,
         build: "mkdir -p {BUILD_OUTPUT} && g++ -O2 -std=c++23 -static -o {BUILD_OUTPUT}/program {SOURCE}/main.cpp",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -486,7 +486,7 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.cpp",
         extensions: CPP,
         build: "mkdir -p {BUILD_OUTPUT} && clang++ -O2 -std=c++23 -static -o {BUILD_OUTPUT}/program {SOURCE}/main.cpp",
-        artefact: "program",
+        artifact: "program",
         start: &["{PROGRAM}/program"],
     },
     Entry {
@@ -500,7 +500,7 @@ const CATALOGUE: &[Entry] = &[
         // one failure a participant can read rather than into every test
         // failing with the same traceback.
         build: "cp {SOURCE}/main.py {BUILD_OUTPUT}/program.py && python3 -m py_compile {BUILD_OUTPUT}/program.py",
-        artefact: "program.py",
+        artifact: "program.py",
         start: &["python3", "{PROGRAM}/program.py"],
     },
     Entry {
@@ -511,12 +511,12 @@ const CATALOGUE: &[Entry] = &[
         source_name: "main.py",
         extensions: PY,
         build: "cp {SOURCE}/main.py {BUILD_OUTPUT}/program.py && pypy3 -m py_compile {BUILD_OUTPUT}/program.py",
-        artefact: "program.py",
+        artifact: "program.py",
         start: &["pypy3", "{PROGRAM}/program.py"],
     },
 ];
 
-/// The ids that were the whole catalogue until 2026-08-22, and what they mean now.
+/// The ids that were the whole catalog until 2026-08-22, and what they mean now.
 ///
 /// **Kept, and not out of kindness to old submissions.** `config.yml` names the
 /// checker's language and a model solution's language, `PACKAGE_FORMAT.md`
@@ -526,14 +526,14 @@ const CATALOGUE: &[Entry] = &[
 /// submission to it, not a message anybody can act on.
 ///
 /// `cpp` is C++20 because that is the `-std` the single C++ entry carried before
-/// the catalogue existed, so a package judged yesterday is judged the same way
-/// today. They resolve, and they are not offered: `catalogue()` returns the
+/// the catalog existed, so a package judged yesterday is judged the same way
+/// today. They resolve, and they are not offered: `catalog()` returns the
 /// eighteen.
 const ALIASES: &[(&str, &str)] = &[("cpp", "cpp20-gcc"), ("python", "python3")];
 
 /// Every toolchain a submission may name, in the order a form should offer them.
-pub fn catalogue(images: &Images) -> Vec<Language> {
-    CATALOGUE.iter().filter_map(|e| built(e, images)).collect()
+pub fn catalog(images: &Images) -> Vec<Language> {
+    CATALOG.iter().filter_map(|e| built(e, images)).collect()
 }
 
 pub fn for_id(id: &str, images: &Images) -> Option<Language> {
@@ -543,7 +543,7 @@ pub fn for_id(id: &str, images: &Images) -> Option<Language> {
         .map(|(_, to)| *to)
         .unwrap_or(id);
 
-    CATALOGUE
+    CATALOG
         .iter()
         .find(|e| e.id == resolved)
         .and_then(|e| built(e, images))
@@ -558,7 +558,7 @@ fn built(entry: &Entry, images: &Images) -> Option<Language> {
         source_name: entry.source_name,
         extensions: entry.extensions,
         build: Some(shell(&places(entry.build))),
-        artefact: entry.artefact,
+        artifact: entry.artifact,
         start: entry.start.iter().map(|part| places(part)).collect(),
     })
 }
@@ -622,8 +622,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_catalogue_is_the_eighteen_the_specification_names() {
-        let offered: Vec<&str> = catalogue(&Images::default()).iter().map(|l| l.id).collect();
+    fn the_catalog_is_the_eighteen_the_specification_names() {
+        let offered: Vec<&str> = catalog(&Images::default()).iter().map(|l| l.id).collect();
 
         assert_eq!(
             offered,
@@ -656,7 +656,7 @@ mod tests {
     /// missing default.
     #[test]
     fn every_entry_names_an_image_that_has_a_default() {
-        for entry in CATALOGUE {
+        for entry in CATALOG {
             assert!(
                 built_in_image(entry.image).is_some(),
                 "{} names the image key {:?}, which has no default",
@@ -695,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn an_id_that_is_not_in_the_catalogue_is_not_a_language() {
+    fn an_id_that_is_not_in_the_catalog_is_not_a_language() {
         let images = Images::default();
 
         // Java was considered and left out: the JVM reserves address space
@@ -719,7 +719,7 @@ mod tests {
         assert_eq!(for_id("python", &images).unwrap().id, "python3");
 
         assert!(
-            !catalogue(&images).iter().any(|l| l.id == "cpp"),
+            !catalog(&images).iter().any(|l| l.id == "cpp"),
             "an alias resolves; it is not offered",
         );
     }
@@ -745,7 +745,7 @@ mod tests {
 
         // Least specific first, because the caller applies them in order and
         // the toolchain's own entry has to win.
-        for language in catalogue(&images) {
+        for language in catalog(&images) {
             assert_eq!(language.keys()[0], language.family.as_str());
             assert_eq!(language.keys()[1], language.id);
         }
@@ -846,17 +846,17 @@ mod tests {
         assert_eq!(quoted("a'b"), "'a'\\''b'");
     }
 
-    /// Every compiled submission is judged against an optimised, statically
+    /// Every compiled submission is judged against an optimized, statically
     /// linked build, because the run container mounts the binary and nothing
     /// else. Asserted over the whole table rather than one row: this is the
     /// property a new row is most likely to be copied without.
     #[test]
-    fn every_compiled_row_is_static_and_optimised() {
-        for language in catalogue(&Images::default()) {
+    fn every_compiled_row_is_static_and_optimized() {
+        for language in catalog(&Images::default()) {
             let script = language.build.clone().unwrap().last().unwrap().clone();
 
             assert!(
-                script.contains(&format!("{BUILD_OUTPUT}/{}", language.artefact)),
+                script.contains(&format!("{BUILD_OUTPUT}/{}", language.artifact)),
                 "{}: {script}",
                 language.id,
             );
@@ -879,7 +879,7 @@ mod tests {
     /// The placeholders are substituted, and no row keeps one by accident.
     #[test]
     fn no_command_reaches_a_container_with_a_placeholder_left_in_it() {
-        for language in catalogue(&Images::default()) {
+        for language in catalog(&Images::default()) {
             let commands: Vec<String> = language
                 .build
                 .clone()

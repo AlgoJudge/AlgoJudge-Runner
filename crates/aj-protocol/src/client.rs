@@ -1,6 +1,6 @@
 //! Everything this Runner says to the Server.
 //!
-//! Twelve endpoints, and every one of them is the Runner dialling out. The
+//! Twelve endpoints, and every one of them is the Runner dialing out. The
 //! Server never calls back, which is what lets a Runner sit behind a domestic
 //! router — and it is why there is no listener anywhere in this crate.
 
@@ -16,7 +16,7 @@ use crate::wire::*;
 
 pub struct Server {
     http: reqwest::Client,
-    /// Normalised: no trailing slash, and **including `/api/v1`**. The Server
+    /// Normalized: no trailing slash, and **including `/api/v1`**. The Server
     /// serves nothing outside that prefix — a guard returns an empty 404 before
     /// routing — so a base URL without it fails on every call with no clue as
     /// to why.
@@ -59,7 +59,7 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long an unused connection is kept for the next call.
 ///
-/// **Reuse is not an optimisation here; it is most of the cost.** Every call
+/// **Reuse is not an optimization here; it is most of the cost.** Every call
 /// this Runner makes is to one host over TLS, and a handshake is two round
 /// trips and an asymmetric operation before a byte of the request is sent. A
 /// submission is a claim, a progress note, a package download, one file per
@@ -350,7 +350,7 @@ impl Server {
     /// Says what a trial measured, or why it measured nothing.
     ///
     /// Idempotent on the lease token, as a job report is: a resend after a lost
-    /// acknowledgement answers `duplicate: true` rather than recording a second
+    /// acknowledgment answers `duplicate: true` rather than recording a second
     /// measurement.
     pub async fn report_trial(
         &self,
@@ -743,7 +743,7 @@ mod tests {
 
     /// A Runner in no pool sends the registration it has always sent, so an
     /// older Server sees nothing new — and one that names a pool sends it
-    /// exactly once, because the Server honours the field on the first
+    /// exactly once, because the Server honors the field on the first
     /// registration only.
     #[test]
     fn tags_are_sent_only_when_there_are_any() {
@@ -819,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn a_job_without_a_package_is_recognised_rather_than_fetched() {
+    fn a_job_without_a_package_is_recognized_rather_than_fetched() {
         let job: ClaimedJob = serde_json::from_value(serde_json::json!({
             "jobId": "j", "submissionId": "s", "attempt": 1,
             "leaseToken": "t", "leaseExpiresAt": "2026-08-08T10:00:00Z",

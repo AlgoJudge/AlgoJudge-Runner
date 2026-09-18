@@ -2,7 +2,7 @@
 //!
 //! The format is `docs/specs/PACKAGE_FORMAT.md`, accepted 2026-08-08. This crate
 //! reads it and nothing else: it does not compile, run, score or talk to a
-//! Server. That separation is deliberate — **the extraction defences are a
+//! Server. That separation is deliberate — **the extraction defenses are a
 //! security boundary**, and a boundary that can only be tested by running a
 //! whole evaluation is a boundary nobody tests.
 //!

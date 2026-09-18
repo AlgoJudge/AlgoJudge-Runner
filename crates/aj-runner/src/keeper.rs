@@ -7,7 +7,7 @@
 //! Nothing here renewed until this module existed. The loop asked for ten
 //! minutes at claim and never mentioned the lease again, which is right for
 //! every package anyone has built so far and wrong in a way that would be very
-//! hard to recognise. An evaluation is a sum of bounded steps — sixty seconds to
+//! hard to recognize. An evaluation is a sum of bounded steps — sixty seconds to
 //! compile, a limit and a second per test, thirty for a checker — but **nothing
 //! bounds the number of tests**, so the sum is not bounded either. A package
 //! whose tests genuinely take longer than one lease is not judged slowly: it is

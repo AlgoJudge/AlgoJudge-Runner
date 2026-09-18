@@ -5,6 +5,11 @@
 A component that executes and evaluates untrusted solutions.
 It may be one of several compatible Runner implementations.
 
+## Language
+
+Write American English: code, comments and documentation.
+`scripts/check-american-english.py` in the workspace finds a British spelling.
+
 ## Security rules
 
 - Every submission is potentially malicious.
@@ -64,7 +69,7 @@ Three things it **deliberately does not specify**, so nobody adds them back by
 accident:
 
 - **There is no WebSocket for a Runner.** The queue is polled and an empty one
-  answers **204**. A socket would be an optimisation of *when* a Runner learns
+  answers **204**. A socket would be an optimization of *when* a Runner learns
   there is work, never of *how* it takes it.
 - **There is no key rotation.** Revocation is permanent; a leaked key means a
   new configuration, a new key and a new registration.
@@ -90,7 +95,7 @@ joining a reserved one. Two things about it are easy to get wrong here:
 - **Rust.** `tokio`, `reqwest`, `serde`, `tracing`, `ed25519-dalek`, `bollard`
   for the container layer. A static musl binary in a `distroless`/`scratch`
   image; a `.deb` with a systemd unit is supported but **not preferred in
-  production**. One artefact with every backend compiled in, chosen by
+  production**. One artifact with every backend compiled in, chosen by
   configuration. `linux/amd64`, **cgroup v2 required**.
 - **Three layers.** L1 control: protocol, leasing, cache. L2 backend
   orchestration. L3 the sandbox that runs untrusted code. **We do not write our
@@ -167,7 +172,7 @@ the package. Two rules are easy to get wrong and matter to a participant:
   failed, not that the answer was wrong. Conflating them turns a bug in a
   checker into a rejected submission.
 
-### The language catalogue (2026-08-22)
+### The language catalog (2026-08-22)
 
 **Eighteen toolchains in three families**, as a table in
 `crates/aj-standard-io/src/language.rs`. Adding a row is a data change; the
@@ -195,7 +200,7 @@ participant chose both and the compiler would have said so anyway.
 Four images carry the eighteen: `images/gcc`, `images/clang`, `images/python`,
 `images/pypy`. **Debian, not Alpine** — PyPy has no musl build and Clang plus
 static linking is less certain there; trixie rather than bookworm because
-`-std=c23` and `-std=c++23` are what the catalogue asks for and GCC 12 spells
+`-std=c23` and `-std=c++23` are what the catalog asks for and GCC 12 spells
 them differently. Nothing builds them for you, and every judging case fails
 without them.
 
@@ -292,7 +297,7 @@ introduced under the word "both" until 2026-08-31:
   that can reach that socket is root on the host.
 - `AJ_Work__HostPath` is the job scratch directory **as the daemon sees it**. A
   bind mount is resolved by the daemon, so a path that is real to a
-  containerised Runner and meaningless to the daemon produces an **empty
+  containerized Runner and meaningless to the daemon produces an **empty
   directory** rather than an error — and tests then run against nothing.
 - `AJ_Sandbox__AllowUnmeasured` starts on a host the Runner would otherwise
   refuse — cgroup v1, a cgroup driver it knows neither of, or a cgroup tree it
@@ -300,7 +305,7 @@ introduced under the word "both" until 2026-08-31:
   read from a cgroup, so such a Runner registers, answers the protocol and fails
   every job it claims; that is exactly what the conformance suite needs.
   Development only, and it says so at `ERROR` on every start.
-  `AJ_Sandbox__AllowCgroupV1` is the old name, still honoured.
+  `AJ_Sandbox__AllowCgroupV1` is the old name, still honored.
 
 **Two measurement backends, chosen from the daemon's cgroup driver** (2026-09-03,
 `crates/aj-sandbox/src/cgroups.rs`). Under `cgroupfs` a cgroup parent is a path

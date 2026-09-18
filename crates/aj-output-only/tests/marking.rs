@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use aj_output_only::{details, mark, Answers};
 use aj_package::{Config, TestSet};
-use aj_standard_io::score::{Judgement, Reason, Status};
+use aj_standard_io::score::{Judgment, Reason, Status};
 
 /// Two groups worth 40 and 60, so a partial mark is distinguishable from both
 /// zero and full — with one group, a wrong answer and a missing one would look
@@ -73,12 +73,12 @@ fn answers(case: &Path, files: &[(&str, &str)]) -> Answers {
     Answers::unpack(&zipped, &case.join("unpacked")).unwrap()
 }
 
-fn note_for<'a>(judged: &'a Judgement, test: &str) -> &'a str {
+fn note_for<'a>(judged: &'a Judgment, test: &str) -> &'a str {
     &judged
         .tests
         .iter()
         .find(|t| t.outcome.name == test)
-        .expect("the test is in the judgement")
+        .expect("the test is in the judgment")
         .outcome
         .note
 }
@@ -125,7 +125,7 @@ fn a_missing_answer_costs_only_its_own_test() {
 
     let judged = mark(&root, &config, &tests, &given);
 
-    // The behaviour the handler's own comment promises: somebody who answered
+    // The behavior the handler's own comment promises: somebody who answered
     // one of two keeps the one, rather than the upload failing as a whole.
     assert_eq!(judged.score, 40.0);
     assert_eq!(

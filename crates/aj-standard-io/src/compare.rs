@@ -143,7 +143,7 @@ impl<'a> Comparing<'a> {
         // Unicode-aware set of separators rather than quietly narrowing it.
         //
         // **Only the arriving bytes are searched, and that is not an
-        // optimisation.** Whatever was held over from last time was held over
+        // optimization.** Whatever was held over from last time was held over
         // *because* it had no separator in it, so searching it again can only
         // find nothing — and searching it again is quadratic in the length of a
         // token the submission chooses. Measured before it was fixed: a program

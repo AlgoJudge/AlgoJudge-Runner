@@ -9,27 +9,27 @@
 #
 # This was `alpine:3`, on the argument that the run container is started once
 # per test and image size is start-up latency. That argument was real and it
-# lost to two things the language catalogue needs:
+# lost to two things the language catalog needs:
 #
 #   - **PyPy has no official musl build**, so `images/pypy` could not exist on
 #     Alpine at all; and
 #   - **Clang plus static linking is less certain on musl than on glibc**, and
-#     half the catalogue is Clang.
+#     half the catalog is Clang.
 #
 # Both disappear together on Debian, and a toolchain set that behaves the same
 # way across its eighteen entries is worth more than the start-up time. Every
 # language image goes the same way, so nothing is judged on two libcs.
 #
 # Trixie rather than bookworm, and not for freshness: **`-std=c23` and
-# `-std=c++23` are what the catalogue asks for**, and bookworm's GCC 12 knows
+# `-std=c++23` are what the catalog asks for**, and bookworm's GCC 12 knows
 # them only as `-std=c2x` and `-std=c++2b`. A base that cannot spell the flag
-# turns four catalogue rows into compilation errors for every submission.
+# turns four catalog rows into compilation errors for every submission.
 #
 # Two consequences of that move, recorded rather than discovered later:
 #
 #   - **`-static` stays**, and its old justification does not: a test is started
 #     from this same image, so the shared libraries are present and a dynamic
-#     binary would run. It is kept because it makes the artefact independent of
+#     binary would run. It is kept because it makes the artifact independent of
 #     whatever image it is run in, and keeps the loader out of the measured
 #     time. See `language.rs`, which carries the whole of that.
 #   - **glibc's static linking has a known caveat**: `getaddrinfo` and

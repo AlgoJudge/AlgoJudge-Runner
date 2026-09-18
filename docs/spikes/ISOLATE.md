@@ -130,7 +130,7 @@ sandbox container's cgroup and report them. This unblocks memory calibration,
 which `PACKAGE_FORMAT.md` records as waiting on exactly this measurement, and it
 costs no capability.
 
-**R — reopen `isolate` only under a different argument.** Defence in depth and
+**R — reopen `isolate` only under a different argument.** Defense in depth and
 its syscall filtering are real, and neither has been measured here. That would be
 a new decision with its own evidence, not this one continued.
 

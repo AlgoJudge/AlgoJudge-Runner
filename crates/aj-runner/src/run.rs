@@ -143,7 +143,7 @@ pub async fn admitted(
 ///
 /// **The Server's `Retry-After` wins only where it asked for longer.** This
 /// Runner's own jittered backoff is the floor, so an operator asking for five
-/// minutes is honoured, while a proxy answering `Retry-After: 0` cannot turn a
+/// minutes is honored, while a proxy answering `Retry-After: 0` cannot turn a
 /// retry into a spin against a Server that is trying to be down.
 fn how_long(e: &aj_protocol::Error, backoff: &mut Backoff) -> Duration {
     let mine = backoff.next_delay();
@@ -917,16 +917,16 @@ async fn judge(
                 .into());
             };
 
-            let judgement =
+            let judgment =
                 aj_output_only::mark(&prepared.package.here, package_config, tests, &answers);
-            let details = aj_output_only::details(&judgement, package_config);
+            let details = aj_output_only::details(&judgment, package_config);
 
             Ok((
                 ReportResult::judged(
                     &job.lease_token,
-                    judgement.score,
-                    judgement.max_score,
-                    &judgement.verdict,
+                    judgment.score,
+                    judgment.max_score,
+                    &judgment.verdict,
                 ),
                 Attachments {
                     log: String::new(),
@@ -946,9 +946,9 @@ fn finish(evaluated: Evaluated, lease_token: &str) -> Result<(ReportResult, Atta
         Evaluated::Judged(verdict) => Ok((
             ReportResult::judged(
                 lease_token,
-                verdict.judgement.score,
-                verdict.judgement.max_score,
-                &verdict.judgement.verdict,
+                verdict.judgment.score,
+                verdict.judgment.max_score,
+                &verdict.judgment.verdict,
             ),
             Attachments {
                 log: verdict.log.clone(),
@@ -1326,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn the_servers_own_wait_is_honoured_only_where_it_asks_for_longer() {
+    fn the_servers_own_wait_is_honored_only_where_it_asks_for_longer() {
         let mut backoff = Backoff::new(FIVE, THIRTY);
         assert_eq!(
             how_long(

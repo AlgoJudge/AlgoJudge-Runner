@@ -118,7 +118,7 @@ ever be *regained*.
 Two more, from the pipeline rather than the sandbox:
 
 - **The build gets no writable host path.** It writes to its own container layer
-  and the artefact is read back through the runtime API. The alternative was
+  and the artifact is read back through the runtime API. The alternative was
   opening a directory to every user on the host.
 - **A package-supplied checker is sandboxed too.** It comes from a problem
   author rather than from the platform, and it runs with its own limits and no
@@ -174,7 +174,7 @@ has a test rather than a paragraph.
    containers carry the set now, and
    `pipeline.rs::every_container_this_pipeline_starts_is_confined_to_the_runners_processors`
    is what keeps a sixth from being added without it — a source check, because
-   the behaviour is only observable on a machine that has been divided up, which
+   the behavior is only observable on a machine that has been divided up, which
    neither a developer's nor CI's is.
    `a_test_and_the_judge_beside_it_are_confined_to_one_lane` is the same kind of
    check for the half that lanes added: which of them a container goes in. The
@@ -296,7 +296,7 @@ registers and answers the protocol and then fails every job it claims with an
 infrastructure error, which is what a conformance suite needs and all it needs.
 It is off by default and shouts at `ERROR` on every start, because a quiet
 override is a production setting waiting to happen. `AJ_Sandbox__AllowCgroupV1`
-is the old name and is still honoured.
+is the old name and is still honored.
 
 ## 6. What is not here yet
 
@@ -360,7 +360,7 @@ Stated so that absence is not read as a decision:
   The other half of the trade is what a custom profile costs. Docker's
   `--security-opt seccomp=` **replaces** the builtin rather than extending it, so
   ours would have to carry everything measured above — `default.json` is a
-  generated artefact, ~830 lines, published under a moby tag and **absent from
+  generated artifact, ~830 lines, published under a moby tag and **absent from
   master**. A vendored copy that falls behind does not leave us standing still:
   Docker improves its builtin between releases and ours would not, so the sandbox
   would get quietly weaker than doing nothing. That is defensible only with a CI

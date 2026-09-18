@@ -16,7 +16,7 @@
 
 use serde::Serialize;
 
-use crate::score::{Judgement, Reason, Status};
+use crate::score::{Judgment, Reason, Status};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,7 +52,7 @@ pub struct Limits {
 pub struct Compilation {
     pub status: Status,
     /// The compiler's own words, as text. It is the participant's most useful
-    /// single artefact when their submission does not build.
+    /// single artifact when their submission does not build.
     pub log: String,
 }
 
@@ -92,7 +92,7 @@ pub struct TestReport {
 }
 
 impl Details {
-    pub fn of(judged: &Judgement, limits: Limits, compilation: Compilation) -> Self {
+    pub fn of(judged: &Judgment, limits: Limits, compilation: Compilation) -> Self {
         Self {
             kind: "standard-io@1",
             limits,
@@ -129,7 +129,7 @@ impl Details {
 
     /// The bytes that go through the file API under the name `details`.
     pub fn to_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("a document of numbers and strings always serialises")
+        serde_json::to_vec(self).expect("a document of numbers and strings always serializes")
     }
 }
 
@@ -153,8 +153,8 @@ mod tests {
     use super::*;
     use crate::score::{GroupScore, ScoredTest, TestOutcome};
 
-    fn judged() -> Judgement {
-        Judgement {
+    fn judged() -> Judgment {
+        Judgment {
             score: 70.0,
             max_score: 100.0,
             verdict: "Wrong answer".into(),
@@ -230,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn a_status_serialises_as_the_documents_vocabulary() {
+    fn a_status_serializes_as_the_documents_vocabulary() {
         for (status, expected) in [
             (Status::Ok, "OK"),
             (Status::Error, "ERROR"),
@@ -244,11 +244,11 @@ mod tests {
     /// memory is a claim; absence is the truth.
     #[test]
     fn memory_that_was_not_measured_is_absent() {
-        let mut judgement = judged();
-        judgement.tests[0].outcome.memory_bytes = None;
+        let mut judgment = judged();
+        judgment.tests[0].outcome.memory_bytes = None;
 
         let details = Details::of(
-            &judgement,
+            &judgment,
             Limits {
                 time_ms: 1,
                 memory_bytes: 1,
@@ -269,11 +269,11 @@ mod tests {
     /// Memory keeps the old rule: it is absent on a test that never ran.
     #[test]
     fn every_test_reports_a_time_and_memory_still_comes_and_goes() {
-        let mut judgement = judged();
-        judgement.tests[0].outcome.memory_bytes = None;
+        let mut judgment = judged();
+        judgment.tests[0].outcome.memory_bytes = None;
 
         let details = Details::of(
-            &judgement,
+            &judgment,
             Limits {
                 time_ms: 1,
                 memory_bytes: 1,

@@ -520,7 +520,7 @@ async fn an_infrastructure_failure_carries_no_score() {
     assert!(accepted.result_id.is_none(), "{:?}", accepted.result_id);
     assert!(!accepted.duplicate);
 
-    // It stops travelling once the deliveries run out, and only then is there a
+    // It stops traveling once the deliveries run out, and only then is there a
     // result — which still carries no score, because a failure is not an answer.
     let mut last = accepted;
     for _ in 0..8 {
@@ -829,7 +829,7 @@ impl Participant {
 
         // Already enrolled from an earlier run is not a failure.
         let _ = http
-            .post(format!("{base}/activities/{ACTIVITY}/enrolment"))
+            .post(format!("{base}/activities/{ACTIVITY}/enrollment"))
             .json(&serde_json::json!({}))
             .send()
             .await;

@@ -62,8 +62,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [profile.release]
-# The artefact is a static binary in a scratch image; size is worth the link
-# time, and one codegen unit lets the optimiser see across the crate graph.
+# The artifact is a static binary in a scratch image; size is worth the link
+# time, and one codegen unit lets the optimizer see across the crate graph.
 codegen-units = 1
 lto = true
 strip = true

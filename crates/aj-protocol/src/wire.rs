@@ -108,7 +108,7 @@ pub struct Register {
     /// Runner that names a pool leaves the general queue as well as joining a
     /// reserved one.
     ///
-    /// **A seed, and the Server honours it once.** Every other field here is
+    /// **A seed, and the Server honors it once.** Every other field here is
     /// refreshed whenever this Runner registers again — which is how a restart
     /// is reported — and this one is not: from the first registration onwards
     /// the operator owns it in the panel. A Runner that could re-declare its
@@ -183,7 +183,7 @@ pub struct ClaimRequest {
     pub lease_seconds: Option<u32>,
     /// How long the Server may hold this open while the queue is empty.
     ///
-    /// **Absent is the old behaviour**, which is why it is skipped rather than
+    /// **Absent is the old behavior**, which is why it is skipped rather than
     /// sent as zero: a Server that has never heard of it reads exactly the body
     /// it always read, and the trial claim — which does not offer this — sends
     /// the same bytes it did before.
