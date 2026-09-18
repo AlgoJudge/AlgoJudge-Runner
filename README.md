@@ -8,16 +8,14 @@ for [AlgoJudge](https://github.com/AlgoJudge).
 
 ## Documentation
 
-**[docs.algojudge.pl](https://docs.algojudge.pl/en/runner/)** is written for
-somebody who does not have this source open. This README is the other half:
-what the repository is, and how to build, run and change it.
+The full AlgoJudge documentation is available at [docs.algojudge.pl](https://docs.algojudge.pl/).
+
+This README contains repository-specific information about development, building, running, and contributing.
 
 | | |
 |---|---|
 | [`/en/runner/`](https://docs.algojudge.pl/en/runner/) | what a Runner is, isolation and limits, the four languages, problem types, routing by tags, and every configuration key |
 | [`/en/protocol/`](https://docs.algojudge.pl/en/protocol/) | the contract this Runner and the Server share, written for a reader rather than as a specification |
-
-Both are English. Polish covers `/client/` and `/install/`.
 
 ## What it does
 
@@ -208,11 +206,9 @@ gate.
 
 ## Contributing
 
-Open an issue saying what you expected, what happened, and how to reproduce it.
-Or open a pull request against `main`: one subject per pull request, with a note
-on what changes and why.
-
-By contributing you agree that your work is licensed under the terms below.
+Read the [contributing guide](https://github.com/AlgoJudge/.github/blob/main/CONTRIBUTING.md)
+before you open a pull request. Report security vulnerabilities privately, as
+described in [SECURITY.md](SECURITY.md).
 
 ## License
 
