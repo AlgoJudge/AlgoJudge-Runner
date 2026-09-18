@@ -23,7 +23,7 @@ use crate::language::{
     self, Images, ANSWER, BUILD_OUTPUT, FROM_THE_JUDGE, INPUT, OUTPUT, PROGRAM, SOURCE,
     TO_THE_JUDGE, VERDICT,
 };
-use crate::score::{judge, Judgement, Reason, Status, TestOutcome};
+use crate::score::{judge, Judgment, Reason, Status, TestOutcome};
 
 /// The scratch a compiler is given, for **every** build.
 ///
@@ -46,16 +46,16 @@ const BUILD_TMPFS_BYTES: u64 = 64 * 1024 * 1024;
 /// **The `fsize` limit is the one that matters, and it belongs on the
 /// container.** `char pad[240*1024*1024] = {1};` is one line of source and a
 /// binary that size; the profile's default is 256 MiB and neither build
-/// overrode it, so the artefact was read into the trusted process — twice, at
+/// overrode it, so the artifact was read into the trusted process — twice, at
 /// the moment of joining — and `unpack` wrote a third copy into the job's
 /// scratch, where it is mounted into every test container.
 ///
 /// Applied to the container rather than caught afterwards, because `SIGXFSZ`
-/// makes an oversized artefact the participant's **compilation error**, which
+/// makes an oversized artifact the participant's **compilation error**, which
 /// is a verdict they can act on, instead of an infrastructure failure that
 /// claims the system broke. A statically linked C++ binary with heavy
 /// templates is tens of megabytes, so this refuses what is not a program.
-const BUILD_ARTEFACT_BYTES: u64 = 64 * 1024 * 1024;
+const BUILD_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// What a build may say, for **both** builds.
 ///
@@ -98,7 +98,7 @@ const CHECKER_WALL_CLOCK: Duration = Duration::from_secs(30);
 /// rule failed twice: the interactor's verdict, and a judged run's own output,
 /// each time as a Runner that never reported and re-claimed its job until it was
 /// restarted. `release` is still called, and still ends a wait at once; this is
-/// what makes it an optimisation rather than the only way out.
+/// what makes it an optimization rather than the only way out.
 ///
 /// Thirty seconds is the checker's own wall clock, and two orders of magnitude
 /// above what it is bounding: `tests/judging.rs` records a container's own start
@@ -183,8 +183,8 @@ pub struct Places {
 ///
 /// A function rather than a chain at the call site, because this is the one
 /// place the rule is stated and it can then be asserted without a container.
-fn judged_mounts(artefacts: &Path) -> Vec<Mount> {
-    vec![Mount::read_only(artefacts, PROGRAM)]
+fn judged_mounts(artifacts: &Path) -> Vec<Mount> {
+    vec![Mount::read_only(artifacts, PROGRAM)]
 }
 
 impl Places {
@@ -268,7 +268,7 @@ pub struct Judge {
 /// The program beside the submission, and which of the two things it is.
 ///
 /// **One build and two wirings.** A checker and an interactor are the same
-/// artefact — a program the package author wrote, compiled in a language image,
+/// artifact — a program the package author wrote, compiled in a language image,
 /// run in its own container — and they differ only in what is connected to it.
 /// A checker is handed the answer and asked about it; an interactor is handed
 /// the submission's questions and produces the answers to them.
@@ -279,7 +279,7 @@ enum Aside<'a> {
 
 /// A submission that was actually judged.
 pub struct Verdict {
-    pub judgement: Judgement,
+    pub judgment: Judgment,
     pub details: Details,
     pub log: String,
 }
@@ -318,7 +318,7 @@ struct Lanes {
 /// it is the only thing in this file that can confine a container to anything
 /// narrower than the whole Runner -- so a checker cannot be given a different
 /// one without somebody deliberately taking a second lane, which would
-/// serialise the fan-out and show up the moment it was measured.
+/// serialize the fan-out and show up the moment it was measured.
 struct Lane<'a> {
     pool: &'a Lanes,
     index: usize,
@@ -561,7 +561,7 @@ impl<S: Sandbox> Pipeline<S> {
 
         let source = job.work.join("src");
         let built_into = job.work.join("build");
-        let artefacts = built_into.join("out");
+        let artifacts = built_into.join("out");
         for place in [&source, &built_into] {
             std::fs::create_dir_all(&place.here).map_err(|e| e.to_string())?;
         }
@@ -598,10 +598,10 @@ impl<S: Sandbox> Pipeline<S> {
                             .pids(128)
                             .wall_clock(Duration::from_secs(60))
                             .max_output_bytes(BUILD_LOG_BYTES)
-                            .max_file_bytes(BUILD_ARTEFACT_BYTES as i64)
+                            .max_file_bytes(BUILD_ARTIFACT_BYTES as i64)
                             .tmpfs_bytes(BUILD_TMPFS_BYTES)
                             .writable_root()
-                            .collect(BUILD_OUTPUT, BUILD_ARTEFACT_BYTES)
+                            .collect(BUILD_OUTPUT, BUILD_ARTIFACT_BYTES)
                             .mount(Mount::read_only(&source.on_host, SOURCE)),
                     ),
                 )
@@ -669,7 +669,7 @@ impl<S: Sandbox> Pipeline<S> {
             futures_util::stream::iter(job.tests.iter().enumerate().map(|(at, test)| {
                 let scheduling = &scheduling;
                 let language = &language;
-                let artefacts = &artefacts;
+                let artifacts = &artifacts;
                 let aside = &aside;
                 async move {
                     if !scheduling.load(std::sync::atomic::Ordering::Relaxed) {
@@ -680,7 +680,7 @@ impl<S: Sandbox> Pipeline<S> {
                     // bounded by the lanes exactly as its containers are.
                     let lane = self.lanes.take().await;
                     let outcome = self
-                        .one_test(job, language, artefacts, aside, test, &lane)
+                        .one_test(job, language, artifacts, aside, test, &lane)
                         .await;
                     if outcome.is_err() {
                         scheduling.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -694,11 +694,11 @@ impl<S: Sandbox> Pipeline<S> {
 
         let outcomes = in_test_order(done)?;
 
-        let judgement = judge(job.config, job.tests, &outcomes);
-        let details = Details::of(&judgement, limits_of(job, &language), compiled());
+        let judgment = judge(job.config, job.tests, &outcomes);
+        let details = Details::of(&judgment, limits_of(job, &language), compiled());
 
         Ok(Evaluated::Judged(Box::new(Verdict {
-            judgement,
+            judgment,
             details,
             log,
         })))
@@ -720,7 +720,7 @@ impl<S: Sandbox> Pipeline<S> {
         &self,
         job: &Job<'_>,
         language: &crate::language::Language,
-        artefacts: &Places,
+        artifacts: &Places,
         aside: &Option<Aside<'_>>,
         test: &Test,
         lane: &Lane<'_>,
@@ -772,7 +772,7 @@ impl<S: Sandbox> Pipeline<S> {
 
         // **Who compares decides what the relay does with the bytes**, and
         // in both arms nothing is stored. With no checker the Runner
-        // tokenises them itself; with one it passes them straight on to a
+        // tokenizes them itself; with one it passes them straight on to a
         // second pipe the checker is reading.
         //
         // 0666, where the submission's own channels are 0600: whatever is
@@ -912,7 +912,7 @@ impl<S: Sandbox> Pipeline<S> {
             true => judged.reading_a_socket(),
             false => judged,
         };
-        let judged = judged_mounts(&artefacts.on_host)
+        let judged = judged_mounts(&artifacts.on_host)
             .into_iter()
             .fold(judged, Profile::mount);
         let judged = self.pinned(On::Lane(lane), judged);
@@ -1291,10 +1291,10 @@ impl<S: Sandbox> Pipeline<S> {
                         .pids(128)
                         .wall_clock(Duration::from_secs(60))
                         .max_output_bytes(BUILD_LOG_BYTES)
-                        .max_file_bytes(BUILD_ARTEFACT_BYTES as i64)
+                        .max_file_bytes(BUILD_ARTIFACT_BYTES as i64)
                         .tmpfs_bytes(BUILD_TMPFS_BYTES)
                         .writable_root()
-                        .collect(BUILD_OUTPUT, BUILD_ARTEFACT_BYTES)
+                        .collect(BUILD_OUTPUT, BUILD_ARTIFACT_BYTES)
                         // Required: the source it compiles is in the shared
                         // cache, and an empty `/src` is a checker that does not
                         // build for a reason the message would blame on its
@@ -1516,7 +1516,7 @@ impl<S: Sandbox> Pipeline<S> {
 /// What the Runner does with a submission's output while it is being produced.
 ///
 /// **The Runner is the only reader of it, always.** Where there is no checker it
-/// tokenises the bytes itself; where there is one it keeps them for it. The
+/// tokenizes the bytes itself; where there is one it keeps them for it. The
 /// program is never wired to anything the package brought with it.
 enum Watching {
     /// Compare against the reference answer, token by token, as it arrives.
@@ -2019,9 +2019,9 @@ fn policy_violation(job: &Job<'_>, language: &language::Language, listed: &[Stri
         .map(|test| failed(test, None, "Policy violation", Reason::PolicyViolation))
         .collect();
 
-    let judgement = judge(job.config, job.tests, &outcomes);
+    let judgment = judge(job.config, job.tests, &outcomes);
     let details = Details::of(
-        &judgement,
+        &judgment,
         limits_of(job, language),
         Compilation {
             // Not an error: nothing failed to compile, because nothing was
@@ -2032,9 +2032,9 @@ fn policy_violation(job: &Job<'_>, language: &language::Language, listed: &[Stri
     );
 
     Evaluated::Judged(Box::new(Verdict {
-        judgement: Judgement {
+        judgment: Judgment {
             verdict: "PolicyViolation".into(),
-            ..judgement.clone()
+            ..judgment.clone()
         },
         details,
         log: listed.join("\n"),
@@ -2049,13 +2049,13 @@ fn compilation_failed(job: &Job<'_>, language: &language::Language, log: &str) -
         .map(|test| failed(test, None, "Compilation error", Reason::CompilationError))
         .collect();
 
-    let judgement = judge(job.config, job.tests, &outcomes);
-    let details = Details::of(&judgement, limits_of(job, language), failed_to_compile(log));
+    let judgment = judge(job.config, job.tests, &outcomes);
+    let details = Details::of(&judgment, limits_of(job, language), failed_to_compile(log));
 
     Evaluated::Judged(Box::new(Verdict {
-        judgement: Judgement {
+        judgment: Judgment {
             verdict: "Compilation error".into(),
-            ..judgement.clone()
+            ..judgment.clone()
         },
         details,
         log: log.to_owned(),
@@ -2182,7 +2182,7 @@ mod tests {
 
     /// **Every profile this file builds is pinned, and this is what says so.**
     ///
-    /// A source check rather than a behavioural one, because the behaviour is
+    /// A source check rather than a behavioral one, because the behavior is
     /// only observable on a host that has been divided up — which neither a
     /// developer's machine nor CI is, so a container test would pass on both
     /// while the property was false. Reading the source is what is left.
@@ -2282,12 +2282,12 @@ mod tests {
     /// forbidden-identifier dictionary refuses a submission both. That
     /// dictionary is why the answer key went unnoticed in the mount for so
     /// long, and it is also why it is not enough — it is a policy control by
-    /// decision, and a package may turn it off. The containerised half is
+    /// decision, and a package may turn it off. The containerized half is
     /// `judging.rs::a_judged_submission_cannot_read_the_answer_key`.
     #[test]
     fn a_judged_submission_is_given_its_program_and_nothing_else() {
-        let artefacts = std::path::Path::new("/work/build/out");
-        let mounts = judged_mounts(artefacts);
+        let artifacts = std::path::Path::new("/work/build/out");
+        let mounts = judged_mounts(artifacts);
 
         assert_eq!(mounts.len(), 1, "the program, and nothing else: {mounts:?}");
         assert_eq!(mounts[0].to, PROGRAM);
@@ -2370,7 +2370,7 @@ mod tests {
     }
 
     /// A verdict cannot be made without the number it is compared against, and
-    /// inventing one would be a judgement about a participant made out of a
+    /// inventing one would be a judgment about a participant made out of a
     /// broken judge.
     #[test]
     fn a_run_with_no_processor_time_is_not_a_verdict() {

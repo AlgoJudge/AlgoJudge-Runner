@@ -172,7 +172,7 @@ impl Error {
     ///
     /// Advice, not an instruction: it is compared against this Runner's own
     /// backoff and the longer of the two wins, so an operator's `Retry-After: 300`
-    /// is honoured while a proxy's `Retry-After: 0` cannot turn the retry into a
+    /// is honored while a proxy's `Retry-After: 0` cannot turn the retry into a
     /// spin.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {

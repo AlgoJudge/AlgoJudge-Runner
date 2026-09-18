@@ -42,7 +42,7 @@ pub struct Prepared {
 /// queue the way every stopped job does.
 ///
 /// **Everything up to the lock being dropped is preparation; judging happens
-/// after it.** Holding it through a judged run would serialise every Runner
+/// after it.** Holding it through a judged run would serialize every Runner
 /// sharing the cache on one submission, and none of what judging reads is
 /// written by anybody: what protects the entry then is the holding marker the
 /// `Entry` carries.
@@ -172,7 +172,7 @@ pub async fn prepare(
         }
     };
 
-    // **After the lock, not before it.** What was just published counts towards
+    // **After the lock, not before it.** What was just published counts toward
     // the ceiling, and an entry that grows after it arrives would otherwise
     // never be weighed: eviction used to run only where something was
     // downloaded.

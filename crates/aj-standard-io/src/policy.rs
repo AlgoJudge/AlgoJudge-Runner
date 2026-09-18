@@ -548,14 +548,14 @@ fn builtins(scanned: &Scanned, rules: &LanguageRules, found: &mut Vec<Violation>
 mod tests {
     use super::*;
 
-    use crate::language::{catalogue, for_id, Images};
+    use crate::language::{catalog, for_id, Images};
 
     /// By toolchain id, because that is what a submission carries. Every
     /// assertion below is therefore also an assertion that the id resolved to a
     /// family and the family found its rules.
     fn check(language: &str, source: &str) -> Vec<Violation> {
         let resolved = for_id(language, &Images::default())
-            .unwrap_or_else(|| panic!("{language} is not in the catalogue"));
+            .unwrap_or_else(|| panic!("{language} is not in the catalog"));
         Dictionary::built_in().check(&resolved, source)
     }
 
@@ -570,7 +570,7 @@ mod tests {
     }
 
     /// **The trap this lookup exists to close.** Every toolchain in the
-    /// catalogue has to reach a rule set, because one that does not returns no
+    /// catalog has to reach a rule set, because one that does not returns no
     /// violations — which reads exactly like a clean submission and would have
     /// disabled the dictionary for sixteen of the eighteen the day they were
     /// added.
@@ -579,7 +579,7 @@ mod tests {
     /// profile up: a lookup asserted against itself would keep passing if the
     /// checks stopped running.
     #[test]
-    fn every_toolchain_in_the_catalogue_is_actually_policed() {
+    fn every_toolchain_in_the_catalog_is_actually_policed() {
         let breaks_a_rule = |family| match family {
             Family::C => {
                 "#include <unistd.h>
@@ -597,7 +597,7 @@ int main(){}
             }
         };
 
-        for language in catalogue(&Images::default()) {
+        for language in catalog(&Images::default()) {
             let found = Dictionary::built_in().check(&language, breaks_a_rule(language.family));
             assert!(
                 !found.is_empty(),

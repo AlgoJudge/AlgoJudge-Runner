@@ -191,7 +191,7 @@ languages:
           - 'std\s*::\s*this_thread'
 
       O:
-        name: "Changing compiler optimisation"
+        name: "Changing compiler optimization"
         default: on
         patterns:
           - '#\s*pragma\s+GCC\s+optimize'

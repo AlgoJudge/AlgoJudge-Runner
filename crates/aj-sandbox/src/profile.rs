@@ -146,7 +146,7 @@ pub struct Profile {
 
     /// How many files it may hold open, and how large one may get.
     ///
-    /// Neither is the main defence — the tmpfs size bounds what can be written
+    /// Neither is the main defense — the tmpfs size bounds what can be written
     /// and the memory limit bounds the rest — but both are cheap, and `fsize` is
     /// the one that turns "wrote a hundred gigabytes to scratch" from a slow
     /// failure into an immediate one.
@@ -272,11 +272,11 @@ pub struct Profile {
     /// **Set together with `collect`, and it has to be**: what comes back is
     /// whatever compiling untrusted code produced, it arrives in the *trusted*
     /// process, and a bound nobody stated is a bound nobody has. A submission
-    /// declaring a 240 MiB initialised array is a one-line source and a binary
+    /// declaring a 240 MiB initialized array is a one-line source and a binary
     /// that size.
     ///
     /// The container's own `fsize` is the first bound and the better one — it
-    /// makes an oversized artefact the participant's compilation error rather
+    /// makes an oversized artifact the participant's compilation error rather
     /// than the machinery refusing after the fact. This is the second, and it
     /// exists because the first is a limit the *runtime* applies and this one
     /// is a limit **we** apply.
@@ -306,7 +306,7 @@ pub struct Pipes {
     /// **Three views and not two, and the third is the one that bites.** The
     /// daemon resolves the bind mount, so `on_host` is its view; the command
     /// names `at`, so that is the container's. But the channels are *made and
-    /// read by the Runner*, which where it is itself containerised sees neither
+    /// read by the Runner*, which where it is itself containerized sees neither
     /// of those — and a `mkfifo` against the daemon's path fails with "no such
     /// file or directory" while naming a path that plainly exists, which is a
     /// confusing hour for whoever meets it.

@@ -136,7 +136,7 @@ impl Homes {
     ///
     /// **Every lane and not just the first.** Each home is the source of the
     /// mount a shim reaches its own cgroup through, so a lane whose slice was
-    /// never realised is a judged container with no memory limit -- discovered
+    /// never realized is a judged container with no memory limit -- discovered
     /// one submission at a time. It is also what puts every lane's slice in the
     /// tree *before* a test snapshots it, which is what lets a leak check
     /// compare like with like.
@@ -252,7 +252,7 @@ impl Cgroups {
     /// become an absolute path, because a bind mount is resolved by the daemon.
     ///
     /// Created where it is missing, and under `systemd` that is the first run of
-    /// a Runner's life: the slice is systemd's to realise, but a mount needs its
+    /// a Runner's life: the slice is systemd's to realize, but a mount needs its
     /// source to exist before the container starts. **Nothing is put in it and
     /// nothing depends on what it holds** — the cgroup the submission is judged
     /// in is made by the shim, inside the container's own, which is a child of
@@ -382,7 +382,7 @@ impl Cgroups {
     /// and answers how many.
     ///
     /// **A Runner stopped in the middle of a job leaves one.** The evaluation is
-    /// cancelled where it stands, so [`Measuring::finish`] — which is what
+    /// canceled where it stands, so [`Measuring::finish`] — which is what
     /// removes a run's directory — is never reached, and the directory sits in
     /// the tree until somebody takes it away. This is that somebody, called
     /// once the containers are gone, because a cgroup with a live child cannot
@@ -764,7 +764,7 @@ fn probe_name(instance: &str) -> String {
 /// **The Runner, not the process.** The name was the pid, which says nothing
 /// about whose a container or a cgroup is: several Runners share one host and
 /// one `algojudge` directory, and inside a container every one of them is pid 1.
-/// A sweep keyed on that would have removed a neighbour's live run. The
+/// A sweep keyed on that would have removed a neighbor's live run. The
 /// fingerprint is this Runner's and survives a restart, which is what lets a
 /// Runner clear up after the process it used to be.
 ///
@@ -1142,30 +1142,30 @@ mod tests {
     /// Measured before it was written: CI's *No per-run cgroup was left behind*
     /// step went red the first time a test stopped a Runner while it was
     /// judging, on `algojudge/algojudge-1-14285993230047861089`. `finish` is
-    /// what removes a run's directory, and a cancelled evaluation never reaches
+    /// what removes a run's directory, and a canceled evaluation never reaches
     /// it.
     ///
-    /// The neighbour is the other half. Several Runners share one `algojudge`
+    /// The neighbor is the other half. Several Runners share one `algojudge`
     /// directory, so a sweep that took every leftover would take a running
     /// evaluation's cgroup off a Runner that is busy.
     #[test]
-    fn a_sweep_clears_this_runners_abandoned_runs_and_leaves_a_neighbours() {
+    fn a_sweep_clears_this_runners_abandoned_runs_and_leaves_a_neighbors() {
         let root = std::env::temp_dir().join(format!("aj-abandoned-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let home = root.join("algojudge");
         std::fs::create_dir_all(&home).expect("a scratch home");
 
         let ours = home.join(format!("{}dead", run_prefix("ours")));
-        let neighbour = home.join(format!("{}live", run_prefix("theirs")));
+        let neighbor = home.join(format!("{}live", run_prefix("theirs")));
         let probe = home.join(probe_name("ours"));
-        for made in [&ours, &neighbour, &probe] {
+        for made in [&ours, &neighbor, &probe] {
             std::fs::create_dir(made).expect("a scratch run");
         }
 
         let backend = Cgroups::Cgroupfs { root: root.clone() };
         assert_eq!(backend.abandoned("ours"), 1);
         assert!(!ours.is_dir(), "the abandoned run was left behind");
-        assert!(neighbour.is_dir(), "another Runner's run was swept");
+        assert!(neighbor.is_dir(), "another Runner's run was swept");
         assert!(probe.is_dir(), "a start-up probe was swept");
 
         // And nothing is left to find on the second pass, so a sweep at every
@@ -1282,7 +1282,7 @@ oom_kill 0
     }
 
     #[test]
-    fn an_empty_cgroup_root_is_unset_rather_than_honoured() {
+    fn an_empty_cgroup_root_is_unset_rather_than_honored() {
         for value in [None, Some(String::new()), Some("   ".to_owned())] {
             assert_eq!(root_from(value).expect("the default"), root());
         }

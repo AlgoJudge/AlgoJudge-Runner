@@ -271,7 +271,7 @@ impl Docker {
     ///
     /// **Read out of the image rather than run.** A container is created and
     /// never started, and the path is fetched through the archive endpoint --
-    /// the same one a build's artefacts come back through. Starting one to run
+    /// the same one a build's artifacts come back through. Starting one to run
     /// `test -x` would cost a container start per image and would be the only
     /// place the Runner executes something in an image before it has decided how
     /// to confine it.
@@ -1110,7 +1110,7 @@ impl Sandbox for Docker {
         let report = match (&profile.pipes, nonce.as_deref()) {
             (Some(pipes), Some(_)) => {
                 // This process's own view: it is the one making and reading
-                // the channel, and where it is containerised that is neither
+                // the channel, and where it is containerized that is neither
                 // the daemon's path nor the container's.
                 let at = pipes.here(Pipes::REPORT);
                 match crate::pipes::Fifo::make(&at, 0o600) {
@@ -1452,16 +1452,16 @@ impl Docker {
     ///
     /// `None` rather than an error when it is not there: a build that produced
     /// nothing is a build that failed, and the caller already knows that from
-    /// the exit code. Turning "no artefact" into an infrastructure failure
+    /// the exit code. Turning "no artifact" into an infrastructure failure
     /// would report a participant's unbuildable submission as the system being
     /// broken.
     /// **Bounded, and accumulated once.** It used to `try_collect()` every chunk
-    /// into a `Vec<Bytes>` and then `concat()` them, so the whole artefact
+    /// into a `Vec<Bytes>` and then `concat()` them, so the whole artifact
     /// existed twice at the moment of joining, with nothing capping either copy
     /// — in the trusted process, on bytes a participant's compilation produced.
     ///
     /// Refused rather than truncated, for the reason the output collector gives
-    /// above: a silently shortened artefact is a program that will not run, and
+    /// above: a silently shortened artifact is a program that will not run, and
     /// nothing downstream could tell that from a build that never worked.
     async fn take(&self, name: &str, path: &str, cap: u64) -> Result<Option<Vec<u8>>> {
         let options = DownloadFromContainerOptionsBuilder::new()
@@ -1744,7 +1744,7 @@ fn measured_time(reported: Duration, whole: Option<Duration>) -> Duration {
 /// takes is the nonce, which is scrubbed from the environment before the fork
 /// and sits in a process owned by root while the submission runs as nobody --
 /// so a forgery is downstream of a privilege escalation inside the container,
-/// and this bounds the damage rather than being the defence.
+/// and this bounds the damage rather than being the defense.
 ///
 /// Against that: **every value below the measured maximum fails honest runs.**
 /// The largest difference across 7077 runs under load was 619 ms, so anything
@@ -2007,7 +2007,7 @@ struct Reported {
     system: Duration,
 }
 
-/// Takes the shim's report out of the standard error it travelled on.
+/// Takes the shim's report out of the standard error it traveled on.
 ///
 /// **The last one wins, and every one of them is removed.** A submission can
 /// write a line in the same shape -- it shares the descriptor -- but the shim

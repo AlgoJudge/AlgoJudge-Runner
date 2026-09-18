@@ -147,7 +147,7 @@ fn compile(source: &str, into: &Path, name: &str) -> Option<PathBuf> {
 
 /// **The shim is built the way the images build it**, at `-O2` and with
 /// `-Werror`, so that what is tested here is the binary an operator gets: an
-/// optimiser that drops the feature marker, or a warning the image build would
+/// optimizer that drops the feature marker, or a warning the image build would
 /// refuse, is found by `cargo test` rather than by `docker build`.
 fn compile_with(source: &str, into: &Path, name: &str, flags: &[&str]) -> Option<PathBuf> {
     let file = into.join(format!("{name}.c"));
@@ -431,7 +431,7 @@ fn the_report_travels_on_the_channel_it_was_given() {
 
 /// **A channel that was named and cannot be opened is fatal.**
 ///
-/// There is no third behaviour, and the reason is what the Runner does with it:
+/// There is no third behavior, and the reason is what the Runner does with it:
 /// having named a channel, it is reading that channel. A shim that quietly fell
 /// back to stderr would leave it reading an empty pipe until something else
 /// gave up — an infrastructure failure reported as a timeout, which is a
@@ -466,7 +466,7 @@ fn a_report_channel_that_cannot_be_opened_is_fatal() {
 /// replaced "the report is written last".
 ///
 /// It used to share stderr with whatever the program printed there, so the
-/// ordering was the defence: the shim killed everything else in the namespace
+/// ordering was the defense: the shim killed everything else in the namespace
 /// and then wrote, last. The submission's stderr is `/dev/null` now, so the two
 /// do not share a channel at all -- a stronger thing to be able to say, and a
 /// cheaper one to keep true.
@@ -616,9 +616,9 @@ fn unprivileged_the_scrub_is_what_hides_the_nonce() {
     );
 }
 
-/// **The catalogue names `python3`, not a path to it.** The shell this replaced
+/// **The catalog names `python3`, not a path to it.** The shell this replaced
 /// searched `PATH`, so a shim that did not would turn every interpreted
-/// language in the catalogue into a program that is not there -- which is what
+/// language in the catalog into a program that is not there -- which is what
 /// it did, and what this pins.
 #[test]
 fn a_program_named_without_a_path_is_found() {
@@ -783,6 +783,6 @@ fn the_shim_says_what_it_can_do() {
         binary
             .windows(aj_sandbox::SOCKET_INPUT.len())
             .any(|at| at == aj_sandbox::SOCKET_INPUT.as_bytes()),
-        "the marker was optimised away, and every image would be refused",
+        "the marker was optimized away, and every image would be refused",
     );
 }

@@ -24,7 +24,7 @@ use aj_standard_io::Images;
 /// What the gate needs of a sandbox.
 ///
 /// **Three methods, so the decision table below can be exercised without a
-/// daemon.** Every branch of it is a judgement call — a name of ours is never
+/// daemon.** Every branch of it is a judgment call — a name of ours is never
 /// asked of a registry, a pull that failed over a copy that is here is not a
 /// refusal — and a rule that can only be reached through Docker is a rule
 /// nobody reaches.

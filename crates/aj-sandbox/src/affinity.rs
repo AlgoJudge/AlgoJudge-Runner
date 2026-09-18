@@ -26,12 +26,12 @@
 //! on top was wall clock inside a single CFS period, and
 //! `a_pinned_run_is_given_one_core_and_the_one_it_asked_for` records the
 //! measurement: four spinners burning 1.4 s took 1835/1867/1886 ms unpinned
-//! against 1902/1909/1919 ms pinned, the quota having equalised them. Since
+//! against 1902/1909/1919 ms pinned, the quota having equalized them. Since
 //! 2026-09-02 a limit is processor time, so that residue decides nothing.
 
 /// The processors this Runner may use, when that is fewer than the host has.
 ///
-/// `None` means *use the host's own judgement* -- either because nobody narrowed
+/// `None` means *use the host's own judgment* -- either because nobody narrowed
 /// this process, or because the question could not be answered here, which is
 /// the same answer for the same reason: an unasked-for pin is the failure this
 /// module exists to avoid.

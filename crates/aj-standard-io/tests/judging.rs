@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use aj_package::{Config, TestSet};
 use aj_sandbox::{Docker, Sandbox};
-use aj_standard_io::{catalogue, for_id, Evaluated, Family, Images, Job, Judge, Pipeline, Places};
+use aj_standard_io::{catalog, for_id, Evaluated, Family, Images, Job, Judge, Pipeline, Places};
 
 const CONFIG: &str = r#"
 type: "standard-io@1"
@@ -122,7 +122,7 @@ int main() {{
 /// policy dictionary denies `<unistd.h>`, `<fcntl.h>`, `<sys/wait.h>` and
 /// `ifstream` alike — and a submission refused by the dictionary never reaches
 /// the sandbox, which is the thing under test here. The dictionary is advice
-/// spelt as a refusal; the cgroup is the enforcement, and these two cases are
+/// spelled as a refusal; the cgroup is the enforcement, and these two cases are
 /// exactly what it enforces that a report of one process's resident set cannot.
 const SCRATCH_CPP: &str = r#"
 #include <iostream>
@@ -173,7 +173,7 @@ int main() { long long a, b; std::cin >> a >> b; std::cout << a + b << "\n"; }
 
 const CORRECT_PYTHON: &str = "a, b = input().split()\nprint(int(a) + int(b))\n";
 
-/// The same program in C, written to the **oldest** standard the catalogue
+/// The same program in C, written to the **oldest** standard the catalog
 /// offers so that one source serves all eight C rows.
 ///
 /// `long` rather than `long long`, declarations before statements, no `//`
@@ -319,7 +319,7 @@ fn fixture(name: &str) -> (PathBuf, PathBuf) {
     (here, on_the_host)
 }
 
-/// A file name the toolchain accepts, from the catalogue rather than guessed.
+/// A file name the toolchain accepts, from the catalog rather than guessed.
 ///
 /// This suite is about judging and not about the extension check, so every job
 /// in it carries a name that matches what it says it is.
@@ -435,8 +435,8 @@ groups:
             .await,
     );
 
-    assert_eq!(judged.judgement.verdict, "PolicyViolation");
-    assert_eq!(judged.judgement.score, 0.0);
+    assert_eq!(judged.judgment.verdict, "PolicyViolation");
+    assert_eq!(judged.judgment.score, 0.0);
 
     let said = &judged.details.compilation.log;
     assert!(
@@ -456,14 +456,14 @@ groups:
 #[ignore = "needs a container runtime and the language images"]
 async fn an_assignment_that_names_no_languages_allows_them_all() {
     let judged = verdict(judge("no-language-list", "cpp20-gcc", CORRECT_CPP).await);
-    assert_eq!(judged.judgement.verdict, "Accepted");
+    assert_eq!(judged.judgment.verdict, "Accepted");
 }
 
-// ── The whole catalogue ─────────────────────────────────────────────────────
+// ── The whole catalog ───────────────────────────────────────────────────────
 
 /// **Every row of the table, built and run for real.**
 ///
-/// The catalogue is data, and data is exactly the kind of change that looks
+/// The catalog is data, and data is exactly the kind of change that looks
 /// right and is not: `-std=c23` is a flag GCC 12 rejects and GCC 14 accepts,
 /// `-static` needs a static libstdc++ that a Clang image does not get by
 /// installing Clang, and `pypy3` is a binary that either is on the path or is
@@ -480,10 +480,10 @@ async fn an_assignment_that_names_no_languages_allows_them_all() {
 /// run already knew.
 #[tokio::test]
 #[ignore = "needs a container runtime and the language images"]
-async fn every_toolchain_in_the_catalogue_builds_and_runs() {
+async fn every_toolchain_in_the_catalog_builds_and_runs() {
     let mut broken: Vec<String> = Vec::new();
 
-    for language in catalogue(&Images::default()) {
+    for language in catalog(&Images::default()) {
         let source = match language.family {
             Family::C => CORRECT_C,
             Family::Cpp => CORRECT_CPP,
@@ -492,12 +492,12 @@ async fn every_toolchain_in_the_catalogue_builds_and_runs() {
 
         match judge(language.id, language.id, source).await {
             Evaluated::Judged(judged) => {
-                if judged.judgement.verdict != "Accepted" {
+                if judged.judgment.verdict != "Accepted" {
                     broken.push(format!(
                         "{} ({}): {} — {}",
                         language.id,
                         language.image,
-                        judged.judgement.verdict,
+                        judged.judgment.verdict,
                         judged.details.compilation.log.trim(),
                     ));
                 }
@@ -527,8 +527,8 @@ async fn every_toolchain_in_the_catalogue_builds_and_runs() {
 async fn the_ids_packages_were_written_with_still_judge() {
     for (alias, source) in [("cpp", CORRECT_CPP), ("python", CORRECT_PYTHON)] {
         let judged = verdict(judge(&format!("alias-{alias}"), alias, source).await);
-        assert_eq!(judged.judgement.verdict, "Accepted", "{alias}");
-        assert_eq!(judged.judgement.score, 100.0, "{alias}");
+        assert_eq!(judged.judgment.verdict, "Accepted", "{alias}");
+        assert_eq!(judged.judgment.score, 100.0, "{alias}");
     }
 }
 
@@ -562,8 +562,8 @@ async fn a_file_the_chosen_toolchain_does_not_accept_is_a_compilation_error() {
             .await,
     );
 
-    assert_eq!(judged.judgement.verdict, "Compilation error");
-    assert_eq!(judged.judgement.score, 0.0);
+    assert_eq!(judged.judgment.verdict, "Compilation error");
+    assert_eq!(judged.judgment.score, 0.0);
 
     let said = &judged.details.compilation.log;
     assert!(said.contains("solution.py"), "{said}");
@@ -584,9 +584,9 @@ async fn a_file_the_chosen_toolchain_does_not_accept_is_a_compilation_error() {
 async fn a_correct_cpp_solution_is_accepted_with_full_marks() {
     let judged = verdict(judge("cpp-correct", "cpp", CORRECT_CPP).await);
 
-    assert_eq!(judged.judgement.verdict, "Accepted");
-    assert_eq!(judged.judgement.score, 100.0);
-    assert_eq!(judged.judgement.max_score, 100.0);
+    assert_eq!(judged.judgment.verdict, "Accepted");
+    assert_eq!(judged.judgment.score, 100.0);
+    assert_eq!(judged.judgment.max_score, 100.0);
 
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
     assert_eq!(document["type"], "standard-io@1");
@@ -608,8 +608,8 @@ async fn a_correct_cpp_solution_is_accepted_with_full_marks() {
 async fn a_correct_python_solution_is_accepted() {
     let judged = verdict(judge("python-correct", "python", CORRECT_PYTHON).await);
 
-    assert_eq!(judged.judgement.verdict, "Accepted");
-    assert_eq!(judged.judgement.score, 100.0);
+    assert_eq!(judged.judgment.verdict, "Accepted");
+    assert_eq!(judged.judgment.score, 100.0);
 }
 
 /// The memory a solution used reaches the result document.
@@ -788,7 +788,7 @@ async fn memory_a_forked_child_spends_counts_against_the_submission() {
 /// reported about 2.4 s, the sleep plus the container's own start, and came back
 /// `Time limit exceeded`. The same source, the same limit, the opposite verdict.
 ///
-/// **It also documents a real behaviour change rather than only proving one.**
+/// **It also documents a real behavior change rather than only proving one.**
 /// Waiting is free up to the reaping deadline, which is four times the limit
 /// and four seconds. Every judge that limits processor time works this way, and
 /// Codeforces gives it a verdict of its own — *Idleness limit exceeded* —
@@ -977,10 +977,10 @@ groups:
     );
 
     assert_eq!(
-        judged.judgement.verdict, "Accepted",
+        judged.judgment.verdict, "Accepted",
         "the answer came back through the channels it was pointed at",
     );
-    assert_eq!(judged.judgement.score, judged.judgement.max_score);
+    assert_eq!(judged.judgment.score, judged.judgment.max_score);
 
     let _ = std::fs::remove_dir_all(&elsewhere.here);
 }
@@ -1045,7 +1045,7 @@ int main() {
          which is not the shape of a run somebody waited out: {document}"
     );
 
-    assert_ne!(judged.judgement.score, judged.judgement.max_score);
+    assert_ne!(judged.judgment.score, judged.judgment.max_score);
 }
 
 /// **What is left of the output limit, and why it is still needed.**
@@ -1086,7 +1086,7 @@ int main() {
             .starts_with("Output limit exceeded"),
         "the note says so in the words the Client and every package share: {document}"
     );
-    assert_ne!(judged.judgement.score, judged.judgement.max_score);
+    assert_ne!(judged.judgment.score, judged.judgment.max_score);
 }
 
 /// A package like [`package`], with a checker of the caller's own.
@@ -1213,7 +1213,7 @@ int main(int argc, char** argv) {
          accepted however happy the checker was: {document}"
     );
     assert!(
-        judged.judgement.score < judged.judgement.max_score,
+        judged.judgment.score < judged.judgment.max_score,
         "and it does not score as though it had: {document}"
     );
 }
@@ -1266,10 +1266,10 @@ async fn an_interactor_judges_a_conversation() {
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
 
     assert_eq!(
-        judged.judgement.verdict, "Accepted",
+        judged.judgment.verdict, "Accepted",
         "the guesser found every number: {document}"
     );
-    assert_eq!(judged.judgement.score, judged.judgement.max_score);
+    assert_eq!(judged.judgment.score, judged.judgment.max_score);
     assert!(
         document["tests"][0]["note"]
             .as_str()
@@ -1441,10 +1441,10 @@ async fn an_interactor_may_write_to_its_own_stderr_without_being_failed() {
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
 
     assert_eq!(
-        judged.judgement.verdict, "Accepted",
+        judged.judgment.verdict, "Accepted",
         "a talkative interactor is not a broken one: {document}"
     );
-    assert_eq!(judged.judgement.score, judged.judgement.max_score);
+    assert_eq!(judged.judgment.score, judged.judgment.max_score);
 }
 
 /// **A judging program is told which test it is judging, and which group.**
@@ -1496,7 +1496,7 @@ int main(int argc, char** argv) {
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
 
     assert_eq!(
-        judged.judgement.verdict, "Accepted",
+        judged.judgment.verdict, "Accepted",
         "the checker found both variables and they agreed with argv[1]: {document}"
     );
 
@@ -1520,7 +1520,7 @@ int main(int argc, char** argv) {
 /// **`open` and `read` are deliberately not on the forbidden list**, pinned as
 /// intended by `policy.rs`'s `ordinary_words_that_are_also_syscalls_are_not_matched`
 /// — so nothing has to be switched off for this, and the probe exercises the
-/// real defence rather than a weakened one. `<fcntl.h>` *is* denied, which is
+/// real defense rather than a weakened one. `<fcntl.h>` *is* denied, which is
 /// why the three functions are declared here and `O_RDONLY` is spelled `0`.
 ///
 /// **A reachable file's bytes go into the report.** If the answer key is ever
@@ -1732,8 +1732,8 @@ int main(int argc, char** argv) {
             .await,
     );
 
-    assert_eq!(judged.judgement.verdict, "Accepted");
-    assert_eq!(judged.judgement.score, judged.judgement.max_score);
+    assert_eq!(judged.judgment.verdict, "Accepted");
+    assert_eq!(judged.judgment.score, judged.judgment.max_score);
 }
 
 /// **An interactive package may ship no test files at all**, naming its tests
@@ -1813,11 +1813,11 @@ int main() { long long n; if (std::scanf("%lld", &n) != 1) return 1; std::printf
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
 
     assert_eq!(
-        judged.judgement.verdict, "Accepted",
+        judged.judgment.verdict, "Accepted",
         "three declared tests judged: {document}"
     );
     assert_eq!(
-        judged.judgement.score, 100.0,
+        judged.judgment.score, 100.0,
         "and the group is whole: {document}"
     );
     for (index, test) in ["1a", "1b", "1c"].iter().enumerate() {
@@ -1843,8 +1843,8 @@ int main() { long long a, b; std::cin >> a >> b; std::cout << (a > 100 ? 0 : a +
     let judged = verdict(judge("cpp-wrong", "cpp", wrong).await);
 
     // Group 2's test uses numbers over 100, so only it is wrong.
-    assert_eq!(judged.judgement.score, 40.0, "groups 0 and 1 are untouched");
-    assert_ne!(judged.judgement.verdict, "Accepted");
+    assert_eq!(judged.judgment.score, 40.0, "groups 0 and 1 are untouched");
+    assert_ne!(judged.judgment.verdict, "Accepted");
 
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
     let group2 = document["groups"]
@@ -1867,7 +1867,7 @@ int main() { long long a, b; std::cin >> a >> b; while (true) { } }
 "#;
     let judged = verdict(judge("cpp-loop", "cpp", looping).await);
 
-    assert_eq!(judged.judgement.score, 0.0);
+    assert_eq!(judged.judgment.score, 0.0);
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
     assert!(
         document["tests"][0]["note"]
@@ -1893,7 +1893,7 @@ int main() { long long a, b; std::cin >> a >> b; volatile int *p = nullptr; *p =
 "#;
     let judged = verdict(judge("cpp-crash", "cpp", crashing).await);
 
-    assert_eq!(judged.judgement.score, 0.0);
+    assert_eq!(judged.judgment.score, 0.0);
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
     let note = document["tests"][0]["note"].as_str().unwrap().to_owned();
 
@@ -1914,8 +1914,8 @@ int main() { long long a, b; std::cin >> a >> b; volatile int *p = nullptr; *p =
 async fn a_submission_that_does_not_build_says_why() {
     let judged = verdict(judge("cpp-broken", "cpp", "int main() { this is not c++ }").await);
 
-    assert_eq!(judged.judgement.verdict, "Compilation error");
-    assert_eq!(judged.judgement.score, 0.0);
+    assert_eq!(judged.judgment.verdict, "Compilation error");
+    assert_eq!(judged.judgment.score, 0.0);
 
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
     assert_eq!(document["compilation"]["status"], "ERROR");
@@ -1924,7 +1924,7 @@ async fn a_submission_that_does_not_build_says_why() {
             .as_str()
             .unwrap()
             .contains("error"),
-        "the compiler's own words are the participant's most useful artefact",
+        "the compiler's own words are the participant's most useful artifact",
     );
 }
 
@@ -1935,7 +1935,7 @@ async fn a_submission_that_does_not_build_says_why() {
 async fn a_python_syntax_error_is_a_compilation_error_and_not_three_failures() {
     let judged = verdict(judge("python-broken", "python", "if True\n  print(1)\n").await);
 
-    assert_eq!(judged.judgement.verdict, "Compilation error");
+    assert_eq!(judged.judgment.verdict, "Compilation error");
 
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
     assert_eq!(document["compilation"]["status"], "ERROR");
@@ -1974,7 +1974,7 @@ int main() {
 "#;
     let judged = verdict(judge("cpp-network", "cpp", reaching).await);
 
-    assert_eq!(judged.judgement.verdict, "PolicyViolation");
+    assert_eq!(judged.judgment.verdict, "PolicyViolation");
 
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
     let said = document["compilation"]["log"].as_str().unwrap();
@@ -2011,8 +2011,8 @@ async fn a_submission_too_large_to_be_a_program_is_a_policy_violation() {
 
     let judged = verdict(judge("cpp-too-large", "cpp", &huge).await);
 
-    assert_eq!(judged.judgement.verdict, "PolicyViolation");
-    assert_eq!(judged.judgement.score, 0.0);
+    assert_eq!(judged.judgment.verdict, "PolicyViolation");
+    assert_eq!(judged.judgment.score, 0.0);
 
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
     // Nothing failed to compile, because nothing reached a compiler.
@@ -2040,8 +2040,8 @@ int main() { long long a, b; std::cin >> a >> b; system("ls"); std::cout << a + 
 "#;
     let judged = verdict(judge("cpp-policy", "cpp", forbidden).await);
 
-    assert_eq!(judged.judgement.verdict, "PolicyViolation");
-    assert_eq!(judged.judgement.score, 0.0);
+    assert_eq!(judged.judgment.verdict, "PolicyViolation");
+    assert_eq!(judged.judgment.score, 0.0);
 
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
     // Not an ERROR: nothing failed to compile, because nothing reached a
@@ -2074,7 +2074,7 @@ int main() { long long a, b; std::cin >> a >> b; std::cout << a + b; }
 "#;
     let judged = verdict(judge("cpp-comment", "cpp", innocent).await);
 
-    assert_eq!(judged.judgement.verdict, "Accepted");
+    assert_eq!(judged.judgment.verdict, "Accepted");
 }
 
 // ── The committed package ───────────────────────────────────────────────────
@@ -2127,8 +2127,8 @@ async fn the_committed_package_judges_a_correct_solution() {
         .await;
 
     let judged = verdict(evaluated);
-    assert_eq!(judged.judgement.verdict, "Accepted");
-    assert_eq!(judged.judgement.score, 100.0);
+    assert_eq!(judged.judgment.verdict, "Accepted");
+    assert_eq!(judged.judgment.score, 100.0);
 
     // The package declares a checker, so this also proves the checker was
     // built, run in its own sandbox, and read according to the SIO2 contract.
@@ -2389,7 +2389,7 @@ groups:
 
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
     assert_ne!(
-        judged.judgement.verdict, "Accepted",
+        judged.judgment.verdict, "Accepted",
         "a solution that took longer than its limit was accepted: {document}",
     );
     assert!(
@@ -2430,11 +2430,11 @@ int main() {
 
     let judged = verdict(judge("cpp-rewind", "cpp", twice).await);
     assert_eq!(
-        judged.judgement.verdict, "Accepted",
+        judged.judgment.verdict, "Accepted",
         "a solution that reads its input twice was judged wrong: {:?}",
-        judged.judgement.tests,
+        judged.judgment.tests,
     );
-    assert_eq!(judged.judgement.score, judged.judgement.max_score);
+    assert_eq!(judged.judgment.score, judged.judgment.max_score);
 }
 
 // == lanes: one submission's tests, judged at once ===========================
@@ -2573,8 +2573,8 @@ async fn several_tests_of_one_submission_are_judged_at_once() {
 
     // **The same submission, the same answer.** Widening a Runner may not
     // change a verdict, a score, or the order the table is read in.
-    assert_eq!(alone.judgement.verdict, together.judgement.verdict);
-    assert_eq!(alone.judgement.score, together.judgement.score);
+    assert_eq!(alone.judgment.verdict, together.judgment.verdict);
+    assert_eq!(alone.judgment.score, together.judgment.score);
     assert_eq!(test_names(&alone), test_names(&together));
     assert_eq!(
         test_names(&together),
@@ -2622,7 +2622,7 @@ async fn each_lane_measures_in_a_home_of_its_own() {
     );
     assert!(
         held("1a") < 32 * 1024 * 1024,
-        "the test that held nothing reported {} bytes, which is its neighbour's",
+        "the test that held nothing reported {} bytes, which is its neighbor's",
         held("1a"),
     );
 }

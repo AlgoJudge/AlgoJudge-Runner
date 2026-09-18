@@ -135,7 +135,7 @@ Nothing here is claimed without a test that runs it.
 
 | Suite | What it proves |
 |---|---|
-| `cargo test` | the pure parts — the checker contract, comparison, scoring, the archive defences |
+| `cargo test` | the pure parts — the checker contract, comparison, scoring, the archive defenses |
 | `--test conformance` | the wire protocol, against a real Server, with this Runner as the client |
 | `--test adversarial` | the isolation, against real containers, one case per attack |
 | `--test judging` | a real submission compiled, run and marked, against the committed package |

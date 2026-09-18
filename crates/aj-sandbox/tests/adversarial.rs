@@ -34,7 +34,7 @@ const SUITE: &str = "test-adversarial";
 
 /// A sandbox with the image present and nothing left over from before.
 ///
-/// The sweep is not tidiness — it is the production behaviour, run here for the
+/// The sweep is not tidiness — it is the production behavior, run here for the
 /// same reason it runs at start: sibling containers outlive whatever made them.
 async fn sandbox() -> Docker {
     // A name of this suite's own, and a fixed one. Fixed so a previous run's
@@ -45,7 +45,7 @@ async fn sandbox() -> Docker {
     let docker = Docker::connect(SUITE).expect("a container runtime");
 
     // The Runner refuses a host it cannot measure on — cgroup v1, a driver it
-    // knows neither of, or a tree it cannot use. That is the right behaviour and
+    // knows neither of, or a tree it cannot use. That is the right behavior and
     // is **not relaxed here**: the escape hatch is in this harness, is opt-in,
     // and says so on every run.
     //
@@ -538,7 +538,7 @@ fn cgroups_under(root: &std::path::Path) -> Vec<String> {
 // ── A3 — it eats memory ─────────────────────────────────────────────────────
 
 /// A cgroup OOM, not a timeout. The two are different things to tell a
-/// participant, and reporting one as the other sends them optimising the wrong
+/// participant, and reporting one as the other sends them optimizing the wrong
 /// thing.
 #[tokio::test]
 #[ignore = "needs a container runtime"]
@@ -645,7 +645,7 @@ async fn a_read_only_mount_cannot_be_written() {
 /// that is real here and meaningless there produces an empty directory rather
 /// than an error — which is the quietest possible failure.
 ///
-/// **This is a deployment constraint, not a test artefact.** A Runner in a
+/// **This is a deployment constraint, not a test artifact.** A Runner in a
 /// container must be given its working directory in a form the daemon can
 /// resolve: the same path on both sides, or a named volume.
 fn fixture(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -705,7 +705,7 @@ async fn there_is_no_network() {
 /// **The other half is not observable from here** and was measured on the host
 /// instead: the same container under the default driver leaves a 95-byte
 /// `*-json.log`, and under `none` leaves none at all (2026-09-05). That is the
-/// half the 76 MB was, and it is the daemon's own behaviour rather than
+/// half the 76 MB was, and it is the daemon's own behavior rather than
 /// something this code can assert.
 #[tokio::test]
 #[ignore = "needs a container runtime"]
@@ -987,20 +987,20 @@ async fn a_sweep_leaves_another_runners_containers_alone() {
 
 /// **What comes back from a build is bounded, and refused rather than cut.**
 ///
-/// The artefact is whatever compiling untrusted code produced, and it is read
+/// The artifact is whatever compiling untrusted code produced, and it is read
 /// into the *trusted* process. It used to be collected chunk by chunk into a
 /// `Vec<Bytes>` and then joined, so the whole of it existed twice at once with
 /// nothing capping either copy — and `char pad[240*1024*1024] = {1};` is one
 /// line of source.
 ///
 /// The container's own `fsize` is the first bound and the better one, because
-/// it makes an oversized artefact the participant's compilation error. This is
+/// it makes an oversized artifact the participant's compilation error. This is
 /// the second, and the one that holds if a backend ever applies the first
 /// differently: the limit **we** apply, in the process that would otherwise
 /// hold the bytes.
 #[tokio::test]
 #[ignore = "needs a container runtime"]
-async fn an_artefact_over_the_cap_is_refused_rather_than_held() {
+async fn an_artifact_over_the_cap_is_refused_rather_than_held() {
     let docker = sandbox().await;
 
     let outcome = docker
@@ -1009,7 +1009,7 @@ async fn an_artefact_over_the_cap_is_refused_rather_than_held() {
             // chowns it precisely because a container running as nobody cannot
             // create a directory at its own root, and `alpine` has no such
             // directory. On the writable layer either way, which is where a
-            // real build's artefact goes.
+            // real build's artifact goes.
             &shell("dd if=/dev/zero of=/tmp/program bs=1M count=8 2>/dev/null")
                 .writable_root()
                 .collect("/tmp", 1024 * 1024)
@@ -1035,7 +1035,7 @@ async fn an_artefact_over_the_cap_is_refused_rather_than_held() {
 /// submission, which is the failure a one-sided test does not see.
 #[tokio::test]
 #[ignore = "needs a container runtime"]
-async fn an_artefact_under_the_cap_comes_back_whole() {
+async fn an_artifact_under_the_cap_comes_back_whole() {
     let docker = sandbox().await;
 
     let outcome = docker
@@ -1048,7 +1048,7 @@ async fn an_artefact_under_the_cap_comes_back_whole() {
         .await
         .expect("the run");
 
-    let collected = outcome.collected.expect("the artefact");
+    let collected = outcome.collected.expect("the artifact");
     assert!(
         collected.len() > 64 * 1024,
         "a tar of 64 KiB cannot be {} bytes",
@@ -1268,7 +1268,7 @@ async fn a_program_holds_no_capabilities_and_cannot_regain_any() {
 /// `docs/SECURITY.md` lists this flag as one of four rows with no test at all.
 /// This is that row.
 ///
-/// **The behavioural half is not reachable from `alpine:3`, and that is
+/// **The behavioral half is not reachable from `alpine:3`, and that is
 /// reported rather than faked.** Watching a setuid-root binary fail to raise
 /// privilege needs one to exist, and the third assertion below is the measured
 /// claim that this image has none. Nor can the program make one: `chmod u+s` on
@@ -1312,7 +1312,7 @@ async fn no_privilege_can_be_gained_after_the_program_starts() {
     assert!(
         said.contains("setuid=0"),
         "alpine:3 has gained a setuid binary, so the note above is stale and the \
-         behavioural half of this property can now be tested for real: {said}",
+         behavioral half of this property can now be tested for real: {said}",
     );
 
     assert_eq!(leftovers(&docker).await, 0, "the container was not removed");
@@ -1335,7 +1335,7 @@ async fn no_privilege_can_be_gained_after_the_program_starts() {
 /// **Observed rather than timed, deliberately.** The timing version was measured
 /// first and it is not a gate: four spinners burning 1.4 s of CPU under
 /// `--cpus=1` took 1835/1867/1886 ms unpinned against 1902/1909/1919 ms pinned,
-/// because over that many periods the quota alone already equalises the wall
+/// because over that many periods the quota alone already equalizes the wall
 /// clock. The advantage exists only in a burst shorter than one period, which is
 /// far smaller than the container start-up it would have to be measured through.
 /// An affinity mask is exact and costs two containers.

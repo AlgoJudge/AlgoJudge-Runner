@@ -37,7 +37,7 @@ use std::time::Duration;
 /// something else, and reached the open it needed rescuing from afterwards.
 ///
 /// [`open_for_reading`] has its own deadline, so for every reader that uses it
-/// this is an optimisation — it ends a wait at once when the Runner already
+/// this is an optimization — it ends a wait at once when the Runner already
 /// knows nothing is coming — rather than the thing correctness rests on.
 ///
 /// **It is still load-bearing for one reader**, and saying otherwise would be
@@ -339,7 +339,7 @@ impl Drop for Fifo {
 
 /// One Unix socket, removed when this is dropped.
 ///
-/// **A socket where the neighbours are pipes**, because what travels on it is
+/// **A socket where the neighbors are pipes**, because what travels on it is
 /// not bytes but a descriptor: the test's input, as a sealed file in memory.
 /// See [`crate::memfd`] for what is on the other end of it and why.
 pub struct Socket {

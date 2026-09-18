@@ -264,7 +264,7 @@ record that it is owed.
   them — and `./x test -p aj-sandbox --test shim`, 13 passed. The adversarial,
   judging, conformance and end-to-end suites were not, and neither was `./x
   gate` whole.
-- **`ghcr.io/algojudge` was not read.** Listing the organisation's packages needs
+- **`ghcr.io/algojudge` was not read.** Listing the organization's packages needs
   a `read:packages` scope this checkout's token does not carry; that the registry
   is empty is somebody else's report.
 - **Whether a newer stable Rust, Debian, CPython or PyPy exists** was not

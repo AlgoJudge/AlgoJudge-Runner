@@ -61,7 +61,7 @@ pub struct Config {
     ///
     /// Ids as `language.rs` names them, so `cpp17-gcc` rather than `cpp17` —
     /// and the family shorthands `cpp` and `python` resolve too, because that is
-    /// what every package written before the catalogue uses.
+    /// what every package written before the catalog uses.
     ///
     /// A limit on *what may be sent* rather than on how it runs, which is why it
     /// is a list here rather than an entry in `overrideLimits`.
@@ -316,8 +316,8 @@ impl Config {
             });
         }
 
-        // Normalised on the way in, so nothing downstream has to know which
-        // spelling arrived — and so a merged or re-serialised document carries
+        // Normalized on the way in, so nothing downstream has to know which
+        // spelling arrived — and so a merged or re-serialized document carries
         // the new one.
         config.kind = Some(declared);
         config.format = None;
@@ -506,7 +506,7 @@ impl Config {
     /// **Keys, plural, least specific first.** A language id used to be one
     /// word (`python`) and is now two levels (`python3`, `pypy3` — see the
     /// Runner's `language.rs`), so an override written the way this format
-    /// documents it would have stopped matching anything the day the catalogue
+    /// documents it would have stopped matching anything the day the catalog
     /// grew, and stopped **silently**: every Python submission held to the C++
     /// limit, no error anywhere. The caller passes the family and then the
     /// toolchain, and both are applied in that order, so `overrideLimits`
@@ -514,7 +514,7 @@ impl Config {
     /// field by field.
     ///
     /// This crate deliberately does not know what a family is. It is handed
-    /// the keys rather than deriving them, because the catalogue that decides
+    /// the keys rather than deriving them, because the catalog that decides
     /// them belongs to the problem type and not to the package format.
     pub fn for_language(&self, keys: &[&str]) -> Limits {
         let mut limits = self.limits;
@@ -868,7 +868,7 @@ extraCompilationFiles: []
     ///
     /// It carries `format` and `version` rather than `type`, and refusing it
     /// would be an infrastructure failure on every submission to it — not a
-    /// message anybody could act on. Read, normalised, and never written back
+    /// message anybody could act on. Read, normalized, and never written back
     /// in that spelling.
     #[test]
     fn the_two_fields_that_used_to_say_this_are_still_read() {

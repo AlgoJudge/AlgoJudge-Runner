@@ -22,7 +22,7 @@ pub struct Checked {
     pub accepted: bool,
     /// Shown to the participant. **Originates beside untrusted code** — a
     /// checker may echo a program's output into it — so it is carried as text
-    /// and rendered as text, and nothing here pretends to sanitise it.
+    /// and rendered as text, and nothing here pretends to sanitize it.
     pub comment: String,
     /// 0–100. Absent in the output means full marks for an accepted test.
     pub percentage: u32,

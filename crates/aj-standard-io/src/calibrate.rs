@@ -96,16 +96,16 @@ pub async fn measure<S: Sandbox>(
         // **A model solution that does not pass is not a measurement.** Timing a
         // wrong answer would derive a limit from a program that never did the
         // work, and the number would look entirely reasonable.
-        if verdict.judgement.score < verdict.judgement.max_score {
+        if verdict.judgment.score < verdict.judgment.max_score {
             return Err(format!(
                 "the model solution {} scored {} of {}, so it is not a reference to measure",
-                model.source, verdict.judgement.score, verdict.judgement.max_score
+                model.source, verdict.judgment.score, verdict.judgment.max_score
             ));
         }
 
         // Ordered, so two runs of the same package produce the same document.
         let mut peaks: BTreeMap<u32, (u64, Option<u64>)> = BTreeMap::new();
-        for test in &verdict.judgement.tests {
+        for test in &verdict.judgment.tests {
             let entry = peaks.entry(test.outcome.group).or_insert((0, None));
             entry.0 = entry.0.max(test.outcome.time_ms);
             // Absent stays absent: a group where one test could not be measured

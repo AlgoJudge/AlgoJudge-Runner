@@ -21,7 +21,7 @@
 //!   between contestants — file locks, `F_NOTIFY` — that `docs/SECURITY.md` §6
 //!   names and refuses. Each run gets a memory file of its own.
 //!
-//! **The seals are the defence.** A memfd's inode is created world-writable and
+//! **The seals are the defense.** A memfd's inode is created world-writable and
 //! owned by whoever made it, so a submission can reopen its own standard input
 //! through `/proc/self/fd/0` and ask for `O_RDWR`; what stops it writing is
 //! `F_SEAL_WRITE`, and what stops it changing the length is `F_SEAL_SHRINK`

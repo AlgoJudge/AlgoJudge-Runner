@@ -24,7 +24,7 @@ use std::path::Path;
 use aj_package::{Config, TestSet};
 use aj_standard_io::compare::compare;
 use aj_standard_io::details::{Compilation, Details, Limits};
-use aj_standard_io::score::{judge, Judgement, Reason, Status, TestOutcome};
+use aj_standard_io::score::{judge, Judgment, Reason, Status, TestOutcome};
 
 /// What the participant sent, unpacked: their answer for each test.
 pub struct Answers {
@@ -34,7 +34,7 @@ pub struct Answers {
 impl Answers {
     /// Unpacks the submitted archive.
     ///
-    /// **The same defences as a package**, and for a better reason: this archive
+    /// **The same defenses as a package**, and for a better reason: this archive
     /// came from a participant rather than from a problem author, so it is not
     /// semi-trusted — it is untrusted, and it is the only untrusted archive the
     /// product opens.
@@ -95,7 +95,7 @@ fn limits() -> aj_package::ArchiveLimits {
 /// would add a sandbox to a handler whose whole point is that it needs none.
 /// When one is wanted it is the same contract as `standard-io@1` — the checker
 /// module is already shared.
-pub fn mark(package: &Path, config: &Config, tests: &TestSet, answers: &Answers) -> Judgement {
+pub fn mark(package: &Path, config: &Config, tests: &TestSet, answers: &Answers) -> Judgment {
     let mut outcomes = Vec::new();
 
     for test in tests.iter() {
@@ -169,7 +169,7 @@ fn missing(test: &aj_package::Test, why: &str) -> TestOutcome {
 
 /// The document a Client renders. Same schema as `standard-io@1` apart from its
 /// `kind`, because a per-test table is a per-test table.
-pub fn details(judged: &Judgement, config: &Config) -> Details {
+pub fn details(judged: &Judgment, config: &Config) -> Details {
     let mut document = Details::of(
         judged,
         Limits {
