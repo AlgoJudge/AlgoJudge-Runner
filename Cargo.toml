@@ -29,7 +29,7 @@ async-trait = "0.1"
 base64 = "0.23"
 # The container layer. Speaks to Docker and to Podman, which keeps the
 # evaluation host's runtime a deployment choice rather than a code one.
-bollard = "0.19"
+bollard = "0.21"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 bytes = "1"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
