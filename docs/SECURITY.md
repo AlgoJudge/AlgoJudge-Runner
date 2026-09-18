@@ -382,5 +382,5 @@ Stated so that absence is not read as a decision:
 
 This is a component that runs code written by people who are being marked. If
 you find a way out of §2, or a way to reach the host that §3 does not describe,
-say so before it is interesting: `AlgoJudge-Runner` issues, or privately to the
-maintainers listed in `AUTHORS.txt`.
+report it privately, as [SECURITY.md](../SECURITY.md) describes — not in a
+public issue.
