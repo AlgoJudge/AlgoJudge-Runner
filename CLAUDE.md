@@ -37,11 +37,13 @@ A Runner:
 ## The contract is accepted, and it is not here
 
 `AlgoJudge-Design/specifications/server-runner/SERVER_RUNNER_API.md`, **v1.1**,
-**`Accepted` 2026-08-08, and amended seven times since: 2026-08-09, §9,
-unavailability; 2026-08-22, §5 and §6; 2026-08-24, §3 and §5, Runner tags; and
-four on 2026-09-04 — §5 and §11, releasing a job; §5, §10 and §11, waiting for
-work; §3 and §5, proving a key and one Runner per submission; §5 and §7, what a
-refusal tells a Runner.** It is the contract; where this repository and that document disagree, **the document wins
+**`Accepted` 2026-08-08, and amended since: 2026-08-09, §9, unavailability;
+2026-08-22, §5 and §6; 2026-08-24, §3 and §5, Runner tags; four on 2026-09-04 —
+§5 and §11, releasing a job; §5, §10 and §11, waiting for work; §3 and §5,
+proving a key and one Runner per submission; §5 and §7, what a refusal tells a
+Runner; and 2026-09-13, §5, §5.1, §9 and §11, renewing and releasing in
+batches. The specification's Status row is the list — read the count there, not
+from here.** It is the contract; where this repository and that document disagree, **the document wins
 and the difference is reported** rather than worked around. Read its amendment
 tables before the body: an amended section still states its pre-amendment form.
 
