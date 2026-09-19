@@ -156,7 +156,7 @@ impl Drop for Keeper {
 ///
 /// The floor is for a caller that passes nothing sensible; a real configuration
 /// cannot reach it, because the granted lease is itself floored at a minute.
-/// **Liveness is not this timer's business any more.** A renewal does refresh
+/// **Liveness is not this timer's business anymore.** A renewal does refresh
 /// `LastSeenAt` as a side effect, and for a while this was capped at the
 /// heartbeat interval to keep a judging Runner from being shown as
 /// disconnected. The Runner now beats on a timer of its own — see

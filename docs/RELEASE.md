@@ -110,7 +110,7 @@ and what the answer is worth.
 **A newer base is not automatically a better one here.** The four language
 images decide what a submission is compiled and run by, and a problem author's
 limits were measured against one compiler. Raising them is a decision with a
-date, taken between releases rather than inside one.
+date, made between releases rather than inside one.
 
 ## The dependencies
 

@@ -1,4 +1,4 @@
-//! Turning tests into a mark.
+//! Turning tests into a score.
 //!
 //! Two rules from `PACKAGE_FORMAT.md`, and the second is the one that makes a
 //! group mean something:
@@ -215,7 +215,7 @@ fn word_for(reason: Option<Reason>) -> &'static str {
     }
 }
 
-/// Two decimals. A mark shown to a participant with fifteen of them reads as a
+/// Two decimals. A number shown to a participant with fifteen of them reads as a
 /// machine's arithmetic rather than as their score.
 fn round(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
@@ -347,7 +347,7 @@ groups:
     fn partial_credit_is_a_pass_and_scores_proportionally() {
         let (config, tests) = package();
         let mut outcomes = all_passing();
-        outcomes[1].percentage = 50; // 1a, worth 15 at full marks
+        outcomes[1].percentage = 50; // 1a, worth 15 at full credit
 
         let judged = judge(&config, &tests, &outcomes);
 

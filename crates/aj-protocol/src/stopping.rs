@@ -108,7 +108,7 @@ impl Stopping {
         while !*told.borrow_and_update() {
             if told.changed().await.is_err() {
                 // Cannot happen while `_tell` is held, and if it somehow did,
-                // waiting for ever is the safe reading: nobody said stop.
+                // waiting forever is the safe reading: nobody said stop.
                 std::future::pending::<()>().await;
             }
         }
@@ -173,7 +173,7 @@ mod tests {
 
     /// **A wait that was cut short says so**, and one that ran its course says
     /// that instead. Every caller of `sleep` branches on the answer, so getting
-    /// the two the wrong way round would turn "we are stopping" into "try
+    /// the two the wrong way around would turn "we are stopping" into "try
     /// again" at three sites at once.
     #[tokio::test]
     async fn a_sleep_says_whether_it_was_cut_short() {

@@ -119,7 +119,7 @@ impl Error {
     }
 
     /// Registered, or revoked, and either way not evaluating anything. Waiting
-    /// is the right answer: an administrator has not got to it yet.
+    /// is the right answer: an administrator has not gotten to it yet.
     pub fn not_approved(&self) -> bool {
         self.code() == "runner.notApproved"
     }

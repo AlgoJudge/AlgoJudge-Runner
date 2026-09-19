@@ -324,14 +324,14 @@ impl Server {
     ///
     /// A second endpoint rather than a flag on `claim`, matching the Server: a
     /// Runner that has not been taught about trials keeps working, and a queue
-    /// of trials can never delay the queue that decides somebody's mark.
+    /// of trials can never delay the queue that decides somebody's score.
     pub async fn claim_trial(&self, lease_seconds: Option<u32>) -> Result<Option<ClaimedTrial>> {
         let response = accept(
             self.bearer(self.http.post(self.url("runner/trials/claim")))
                 .json(&ClaimRequest {
                     lease_seconds,
                     // A trial is a manager waiting for a calibration, not a
-                    // participant waiting for a mark, and it has its own queue.
+                    // participant waiting for a score, and it has its own queue.
                     // Holding this open would keep a connection for the rarer
                     // of the two and buy nobody anything.
                     wait_seconds: None,

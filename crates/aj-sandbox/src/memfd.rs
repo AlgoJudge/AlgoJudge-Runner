@@ -23,8 +23,8 @@
 //!
 //! **The seals are the defense.** A memfd's inode is created world-writable and
 //! owned by whoever made it, so a submission can reopen its own standard input
-//! through `/proc/self/fd/0` and ask for `O_RDWR`; what stops it writing is
-//! `F_SEAL_WRITE`, and what stops it changing the length is `F_SEAL_SHRINK`
+//! through `/proc/self/fd/0` and ask for `O_RDWR`; what stops it from writing is
+//! `F_SEAL_WRITE`, and what stops it from changing the length is `F_SEAL_SHRINK`
 //! and `F_SEAL_GROW`. The read-only re-open below is not a second lock — it
 //! only gives the descriptor an offset of its own.
 

@@ -61,7 +61,7 @@ tables before the body: an amended section still states its pre-amendment form.
 Its conformance suite is `AlgoJudge.Server.Tests/RunnerConformanceTests.cs` in
 AlgoJudge-Server — **thirty cases** a second implementation must also pass,
 counted 2026-09-07. The tenth arrived on 2026-08-16, when a second
-implementation found the defect it was written for: a Runner marking out of one
+implementation found the defect it was written for: a Runner scoring out of one
 was read as a hundredth; the four amendments of 2026-09-04 brought most of the
 rest.
 
@@ -157,7 +157,7 @@ Judging dispatches on `job.problem_type`; calibration dispatches on
 `trial.problem_type` some two hundred lines above it, and the code names it "the
 same dispatch as judging, on the same string". The calibration one has a single
 arm — `standard-io@1` — so `output-only@1`, the very type this section is about,
-falls to its error arm and cannot be trialled. A third type is therefore **two**
+falls to its error arm and cannot be trialed. A third type is therefore **two**
 arms plus a crate, and a type added by following the old instruction judges but
 silently cannot be measured.
 
@@ -184,7 +184,7 @@ standard; a submit form offers the toolchain. `cpp` and `python` still resolve,
 to `cpp20-gcc` and `python3`, because every package on disk names them.
 
 **Two things are keyed by *family*, not by toolchain, and both fail silently
-when that is got wrong**: the forbidden-identifier dictionary and a package's
+when that is gotten wrong**: the forbidden-identifier dictionary and a package's
 `overrideLimits`. A lookup that misses returns *no violations* and *no
 override* — indistinguishable from a clean submission judged under the package's
 own limits. Both now try the id and then the family, and `policy.rs` matches the
@@ -273,7 +273,7 @@ Four things about it are easy to get wrong:
 - **An answer flat in the archive and an answer one directory deep both count.**
   Zipping a selection and zipping a folder are both what people do.
 - **A missing answer is a wrong answer, not a failure.** Somebody who answered
-  four tests of five is marked on four and told which one is absent; nothing
+  four tests of five is scored on four and told which one is absent; nothing
   crashes and nothing is rejudgeable on that account.
 
 **There is no checker**, deliberately: one would add a sandbox to the one handler

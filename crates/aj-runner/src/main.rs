@@ -26,7 +26,7 @@ use aj_runner::run;
 /// gigabyte, and the relay threads a container that never started leaves
 /// waiting. A container runtime allows thirty seconds between `SIGTERM` and
 /// `SIGKILL`, and the whole of the stopping arrangement is about giving the
-/// jobs in hand back inside it. Waiting out an extraction nobody wants any more
+/// jobs in hand back inside it. Waiting out an extraction nobody wants anymore
 /// would spend that grace on work whose result is already abandoned.
 ///
 /// Five seconds after `work` has returned, which is long past anything that is

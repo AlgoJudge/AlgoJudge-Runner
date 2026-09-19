@@ -2,7 +2,7 @@
 
 > What the Runner needs from a host's control groups, why the requirement is
 > hard, and how to tell whether a machine satisfies it before it is asked to
-> mark anybody's work.
+> grade anybody's work.
 >
 > Measured 2026-08-09 on one development host, and again on 2026-09-03 for §5,
 > where a second measurement backend arrived and the numbers behind it are dated
@@ -172,7 +172,7 @@ trivial C++ solution:
 | the **container's** cgroup, which is what carries a run with no shim | 6.68 MiB |
 
 A container running the shim and nothing else peaks at **6.02 MiB** — Docker's
-own stated minimum for `--memory`, near enough exactly. That is why the runtime's
+own stated minimum for `--memory`, almost exactly. That is why the runtime's
 minimum is no longer the smallest limit a problem can state: `memory.max` on a
 cgroup has no minimum, and a two-mebibyte limit is written and enforced.
 

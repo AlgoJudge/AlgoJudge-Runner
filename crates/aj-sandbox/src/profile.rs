@@ -166,7 +166,7 @@ pub struct Profile {
     ///
     /// **Capping CPU is not the same as pinning it.** `--cpus=1` limits how much
     /// processor time a program may spend per second; it does not stop two
-    /// threads running on two cores and finishing in half the wall-clock time.
+    /// threads from running on two cores and finishing in half the wall-clock time.
     /// Neither does it need to: `cpu.stat` sums the whole subtree, so threads
     /// spend the budget faster rather than escaping it, and a limit is processor
     /// time.
@@ -553,7 +553,7 @@ pub enum Stopped {
     /// **The absolute cap passed while the program was still making progress.**
     /// Not [`Stopped::WallClock`]: that one says the processor time stopped
     /// growing, and here it never did — this is the program that wakes for a
-    /// millisecond every tick, resetting the no-progress window for ever
+    /// millisecond every tick, resetting the no-progress window forever
     /// without ever approaching its limit.
     ///
     /// A variant of its own because the note a participant reads states which

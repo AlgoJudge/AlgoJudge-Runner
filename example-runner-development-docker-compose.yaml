@@ -130,7 +130,7 @@ services:
       context: .
     restart: unless-stopped
     # Root **in its own container**, and it is not only a development
-    # convenience any more.
+    # convenience anymore.
     #
     # The image runs as `nonroot`. Two things need root here. Docker Desktop's
     # socket is `root:root` mode 755 — world-readable, not world-writable — so

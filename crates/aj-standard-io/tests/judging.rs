@@ -1,7 +1,7 @@
 //! Judging a real package, with a real compiler, in real containers.
 //!
 //! Everything under `src/` is tested in isolation and none of it proves the
-//! thing that matters: that a submission goes in and a correct mark comes out.
+//! thing that matters: that a submission goes in and a correct score comes out.
 //! This does, and it is the only test here that can.
 //!
 //! **Nothing builds the four language images for you**, and every case here
@@ -471,7 +471,7 @@ async fn an_assignment_that_names_no_languages_allows_them_all() {
 /// are fine in all four failing cases.
 ///
 /// So this judges a correct solution through each of the eighteen and expects
-/// full marks. It is the slowest test in the repository and it is the only
+/// a full score. It is the slowest test in the repository and it is the only
 /// evidence that the toolchains exist.
 ///
 /// **Every failure is collected rather than the first one panicking.** A broken
@@ -551,7 +551,7 @@ async fn a_file_the_chosen_toolchain_does_not_accept_is_a_compilation_error() {
                 tests: &tests,
                 language: "cpp17-gcc",
                 // Python, submitted as C++. The Client offers a select and a
-                // file field, and nothing stops the two disagreeing.
+                // file field, and nothing stops the two from disagreeing.
                 file_name: "solution.py",
                 source: CORRECT_PYTHON.as_bytes(),
                 judge: None,
@@ -626,7 +626,7 @@ async fn a_judged_solution_reports_what_memory_it_used() {
     let document: serde_json::Value = serde_json::from_slice(&judged.details.to_bytes()).unwrap();
 
     // Bytes, like every memory figure in the product since 2026-08-09.
-    // **No skip any more.** It used to return quietly where the host gave the
+    // **No skip anymore.** It used to return quietly where the host gave the
     // Runner nowhere to measure from; `preflight` refuses such a host outright
     // since 2026-09-02, so an absence here is the reporting having been dropped
     // rather than the machine, and skipping would be a green test over nothing.
@@ -1325,7 +1325,7 @@ int main() {
 /// The other half of *a submission has to end by itself*: the case above keeps
 /// writing, this one keeps listening. The judge answers the one question,
 /// records `OK` and leaves — and the submission never checks whether its read
-/// worked, so it never notices the conversation ended and goes round for ever.
+/// worked, so it never notices the conversation ended and goes around forever.
 /// Being accepted is not enough; it never ended, so a limit ends it.
 ///
 /// **The shape is a real mistake rather than a contrived one**: a `scanf` whose
@@ -1350,7 +1350,7 @@ int main(int argc, char** argv) {
     return 0;
 }
 "#;
-    // Asks once, hears the answer, and then reads for ever without ever asking
+    // Asks once, hears the answer, and then reads forever without ever asking
     // whether the read worked.
     let waiting = r#"
 #include <cstdio>
@@ -1883,7 +1883,7 @@ int main() { long long a, b; std::cin >> a >> b; while (true) { } }
 /// in different places: the wall clock is the Runner killing the container, the
 /// crash is the exit code of a container that stopped on its own. This asserts
 /// they do not bleed into each other — a segmentation fault must not be
-/// reported as a time limit, nor the other way round.
+/// reported as a time limit, nor the other way around.
 #[tokio::test]
 #[ignore = "needs a container runtime and the language images"]
 async fn a_program_that_crashes_is_a_runtime_error_and_not_a_time_limit() {
@@ -1949,7 +1949,7 @@ async fn a_python_syntax_error_is_a_compilation_error_and_not_three_failures() {
 /// A submission that reaches for the network never gets as far as the sandbox.
 ///
 /// This test asserted the opposite first — that the program compiles, fails to
-/// connect, and passes — and it **could not be written that way any more**:
+/// connect, and passes — and it **could not be written that way anymore**:
 /// opening a socket in C++ needs `<sys/socket.h>`, `<netinet/in.h>` and
 /// `<arpa/inet.h>`, and all three are on the header deny-list. The dictionary
 /// stops it at the source.

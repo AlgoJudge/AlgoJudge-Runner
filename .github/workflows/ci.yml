@@ -116,7 +116,7 @@ jobs:
           AJ_TEST_SERVER: http://server:8080/api/v1
         run: ./x test --test conformance -- --include-ignored --test-threads=1
 
-      # The milestone: a submission goes in and the right mark comes out, with
+      # The milestone: a submission goes in and the right score comes out, with
       # the Runner in the stack doing the judging and nobody helping it.
       - name: Judge every outcome, end to end
         env:
@@ -250,8 +250,8 @@ jobs:
           ./x test -p aj-sandbox --test adversarial
           -- --include-ignored --test-threads=1
 
-      # The one that proves the whole thing: a submission goes in, a mark comes
-      # out, and it is the right mark.
+      # The one that proves the whole thing: a submission goes in, a score comes
+      # out, and it is the right score.
       - name: Judge real submissions
         env:
           AJ_DOCKER_SOCKET: "1"

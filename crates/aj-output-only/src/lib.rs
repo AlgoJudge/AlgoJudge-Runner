@@ -89,7 +89,7 @@ fn limits() -> aj_package::ArchiveLimits {
     }
 }
 
-/// Marks a set of answers against the package's expected output.
+/// Grades a set of answers against the package's expected output.
 ///
 /// No checker yet: the type is here to test the Server's boundary, and a checker
 /// would add a sandbox to a handler whose whole point is that it needs none.

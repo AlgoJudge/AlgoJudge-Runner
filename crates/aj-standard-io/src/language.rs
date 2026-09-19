@@ -604,7 +604,7 @@ pub fn with_channels(start: &[String], input: &str, output: &str) -> Vec<String>
         .join(" ");
     let input = quoted(input);
     let output = quoted(output);
-    // **There is no branch any more, and that is the change of 2026-09-05.**
+    // **There is no branch anymore, and that is the change of 2026-09-05.**
     // It used to fall back to running the program directly when the image had
     // no shim, with stdout left on the container's stream for the collector to
     // count. That stream now goes nowhere — a judged container is started with

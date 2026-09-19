@@ -729,7 +729,7 @@ async fn a_trial_is_measured_end_to_end_and_the_package_does_not_survive() {
     assert_eq!(created["state"], "queued");
     assert_eq!(created["hasPackage"], true);
 
-    // Trials are claimed only when there is no marking to do, so this waits on
+    // Trials are claimed only when there is no grading to do, so this waits on
     // an idle Runner rather than on a queue position.
     let mut settled = serde_json::Value::Null;
     for _ in 0..240 {
@@ -939,7 +939,7 @@ async fn a_window_does_not_cost_a_participant_their_submission() {
     }
     assert!(closed, "the Server never finished draining");
 
-    // Nothing has been marked in the meantime, because nothing was allowed to
+    // Nothing has been graded in the meantime, because nothing was allowed to
     // be — but nothing has been thrown away either.
     maintenance(&http, "on=false").await;
     assert_eq!(level(&http).await, "open");
@@ -1256,7 +1256,7 @@ async fn a_runner_told_to_stop_hands_its_job_back_at_once() {
     // before it claims anything.
     // **Waited out first.** A container in the middle of shutting down still
     // reads as running and answers a start with "nothing changed", so asking
-    // "is it up?" straight after the signal is answered yes by the process on
+    // "is it up?" right after the signal is answered yes by the process on
     // its way out -- and every test after this one then runs without a Runner,
     // which is exactly how this was found. Twice.
     let mut down = false;

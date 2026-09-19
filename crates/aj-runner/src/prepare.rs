@@ -109,7 +109,7 @@ pub async fn prepare(
     // configuration may repoint either — `Config::overlaid` merges `checker`
     // like any other member — and the third because a language image
     // republished under the same tag is a different compiler, and a program
-    // built by the old one would go on being served for ever.
+    // built by the old one would go on being served forever.
     let judge = match config.checker.as_ref().or(config.interactor.as_ref()) {
         None => None,
         Some(declares) => {

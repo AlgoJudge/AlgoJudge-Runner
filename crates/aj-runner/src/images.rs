@@ -92,7 +92,7 @@ pub async fn ready<O: Obtains + ?Sized>(
             )),
             // **A warning and not a refusal**, deliberately. `socket_input` is
             // asked for only by problems carrying an interactor, so refusing the
-            // whole Runner over it would stop a fleet judging everything else.
+            // whole Runner over it would stop a fleet from judging everything else.
             Some(features) if !features.socket_input => tracing::warn!(
                 image = wanted.image,
                 "this image's shim predates the input arriving as a descriptor, \
@@ -305,7 +305,7 @@ mod tests {
 
     /// **The difference between this gate and the one-line fix.** An image that
     /// is already here is pulled anyway, because a moving tag answers "here"
-    /// for ever and the image it names may have moved underneath it.
+    /// forever and the image it names may have moved underneath it.
     #[test]
     fn an_image_that_is_already_here_is_pulled_anyway() {
         let images = all_named();
@@ -398,7 +398,7 @@ mod tests {
     }
 
     /// Refusing a whole Runner over a capability most problems never use would
-    /// stop a fleet judging everything else.
+    /// stop a fleet from judging everything else.
     #[test]
     fn a_shim_that_cannot_take_a_descriptor_is_a_warning_and_not_a_refusal() {
         let images = all_named();

@@ -50,7 +50,7 @@ int main(int argc, char **argv) {
          * on every pass and the kernel does that work. */
         volatile unsigned long long sum = 0;
         for (long long i = 0; i < atoll(argv[2]); i++) sum += (unsigned long long)i;
-        printf("burnt %llu\n", sum);
+        printf("burned %llu\n", sum);
     } else if (!strcmp(what, "grow")) {
         long long mib = atoll(argv[2]);
         char *held = malloc((size_t)mib * 1024 * 1024);
@@ -224,7 +224,7 @@ impl Built {
         std::fs::create_dir_all(&self.outputs).expect("a place for the output");
         // **Writable by anybody, and only here.** One test runs the shim as
         // 65534 to prove the nonce scrub does not depend on privilege, and a
-        // root-owned directory would stop it opening the file at all -- which
+        // root-owned directory would stop it from opening the file at all -- which
         // is the production arrangement and the point of it: there the shim is
         // root, the directory is root's, and the submission gets the descriptor
         // and never a path. `container_user` and the mount are what hold that,
@@ -244,7 +244,7 @@ impl Built {
         std::fs::File::create(&at).expect("a destination for the output");
         // **Writable by anybody, and only here.** One test runs the shim as
         // 65534 to prove the nonce scrub does not depend on privilege, and a
-        // root-owned destination would stop it writing at all. In the product
+        // root-owned destination would stop it from writing at all. In the product
         // the far end is a 0600 pipe the Runner made and the shim is root when
         // it opens it, which is what keeps the submission away from it.
         #[cfg(unix)]
@@ -701,7 +701,7 @@ async fn the_input_arrives_on_a_socket() {
             .expect("the shim runs");
 
     // **Bounded, and the program's own output is the evidence.** A shim that
-    // never connected would leave this waiting for ever, which is a test that
+    // never connected would leave this waiting forever, which is a test that
     // hangs rather than one that fails.
     handing.abort();
     assert_eq!(
