@@ -153,7 +153,7 @@ impl Config {
         // split then drops every fragment and leaves an empty list. The Server
         // stores it without complaint and `p."Type" = ANY(ARRAY[]::text[])` is
         // false for every row, so the Runner registers, is approved, heartbeats,
-        // shows as connected in the panel, and sits there for ever.
+        // shows as connected in the panel, and sits there forever.
         //
         // Refused rather than defaulted, for the reason `number` gives: an
         // operator who meant to narrow this and mistyped it should learn that

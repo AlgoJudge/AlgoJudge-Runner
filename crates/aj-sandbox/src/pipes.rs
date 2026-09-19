@@ -30,7 +30,7 @@ use std::time::Duration;
 ///
 /// **This used to be the only way out, and that is what made it dangerous.**
 /// Every path out of a run had to remember to call it, or a blocking thread
-/// waited for ever — a rule kept in comments across four channels, which failed
+/// waited forever — a rule kept in comments across four channels, which failed
 /// twice in as many days: the interactor's verdict, and a judged run's own
 /// output. The second was worse than a leaked thread, because `release` was
 /// called and *landed on nobody*: the thread was still inside a bounded wait for
@@ -119,12 +119,12 @@ pub fn open_for_writing(at: &Path, waiting: Duration) -> io::Result<std::fs::Fil
 /// Opens a pipe for reading, waiting — with a deadline — for a writer to exist.
 ///
 /// **The mirror of [`open_for_writing`], and it exists so that a reader needs no
-/// rescue.** A blocking `O_RDONLY` open waits for a writer for ever, which is
+/// rescue.** A blocking `O_RDONLY` open waits for a writer forever, which is
 /// safe only as long as every path out of every run remembers to call
 /// [`release`]. That rule held in comments across four channels and failed
 /// twice: once on the interactor's verdict, once on a judged run's own output,
-/// each time as a Runner that never reported and re-claimed its job for ever.
-/// A reader that cannot wait for ever needs nobody to remember anything.
+/// each time as a Runner that never reported and re-claimed its job forever.
+/// A reader that cannot wait forever needs nobody to remember anything.
 ///
 /// **Why a read and not a `poll`.** Measured on Linux 6.18: `poll` reports
 /// nothing at all both when no writer has opened the pipe and when one has and

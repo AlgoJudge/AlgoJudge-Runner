@@ -301,7 +301,7 @@ async fn peak_memory_is_measured_and_is_the_programs_own() {
 ///
 /// The memory case above proves a large allocation is seen; it cannot tell that
 /// apart from a mark left by an earlier run, because both are large. So this
-/// runs a small program straight after a large one and asserts the small number.
+/// runs a small program right after a large one and asserts the small number.
 ///
 /// **Two ways the systemd backend can report somebody else's memory, and this
 /// catches both.** One slice serves every run there, so `memory.peak` is reset
@@ -698,7 +698,7 @@ async fn there_is_no_network() {
 /// test can see.
 ///
 /// `Profile::silent` does two things and this asserts one of them. It stops the
-/// daemon attaching to the container's stdio, so nothing is captured and the
+/// daemon from attaching to the container's stdio, so nothing is captured and the
 /// collector is not started — and that is what this proves, against a control,
 /// because "the output was empty" is also what a broken run looks like.
 ///

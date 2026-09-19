@@ -93,7 +93,7 @@ const CHECKER_WALL_CLOCK: Duration = Duration::from_secs(30);
 /// How long a channel waits for the container that is supposed to open it.
 ///
 /// **A bound rather than a rescue.** Every one of these pipes is read by a
-/// blocking thread, and a blocking open waits for a writer for ever — which was
+/// blocking thread, and a blocking open waits for a writer forever — which was
 /// safe only while every path out of a run remembered to call `release`. That
 /// rule failed twice: the interactor's verdict, and a judged run's own output,
 /// each time as a Runner that never reported and re-claimed its job until it was
@@ -110,7 +110,7 @@ const CHANNEL_WALL_CLOCK: Duration = Duration::from_secs(30);
 ///
 /// **The manager's limit is not this one and is not enforced here.** It is
 /// `Activity.MaxUploadBytes`, narrowed per problem by `SeriesProblem`, and the
-/// Server applies it to the bytes as they arrive. That is a decision, taken
+/// Server applies it to the bytes as they arrive. That is a decision, made
 /// 2026-08-04: *a limit the Server must enforce is an explicit column, never
 /// part of the opaque configuration — the Server cannot police what it cannot
 /// read*, and it rejects the request before anything runs. Time and memory stay
@@ -218,7 +218,7 @@ pub struct Job<'a> {
     pub source: &'a [u8],
     /// The unpacked package, in the shared cache and read-only.
     ///
-    /// **Not a copy of this job's own any more.** It is unpacked once per
+    /// **Not a copy of this job's own anymore.** It is unpacked once per
     /// archive and read by every submission to that problem; nothing here
     /// writes into it, and the judged container is given none of it at all.
     pub package: Places,
@@ -483,7 +483,7 @@ impl<S: Sandbox> Pipeline<S> {
 
         // ── the languages this assignment allows ────────────────────────────
         //
-        // **The Server used to refuse this and cannot any more**: the language
+        // **The Server used to refuse this and cannot anymore**: the language
         // is one member of a document it does not read. The set travels with the
         // job instead, in the assignment's `config`, and the refusal happens
         // here — where a language id means something.
@@ -942,7 +942,7 @@ impl<S: Sandbox> Pipeline<S> {
         };
 
         // **Ends the relay's wait at once where it is already waiting.** It
-        // is not what keeps that thread from hanging any more -- its opens
+        // is not what keeps that thread from hanging anymore -- its opens
         // have their own deadline -- and this call is deliberately unreliable
         // in one direction: the relay may still be inside its wait for the
         // checker's answer channel, in which case this lands on nobody and the
@@ -1628,7 +1628,7 @@ fn relay(
         let mut total: u64 = 0;
 
         // **Bounded, and that is the whole of the fix.** This was a blocking
-        // open, which waits for a writer for ever — and the one thing that
+        // open, which waits for a writer forever — and the one thing that
         // could end that wait, `release`, had already been called by the time
         // this thread reached here whenever the judged run finished inside the
         // wait above. A container that never started then held the job for
@@ -1703,7 +1703,7 @@ fn relay(
                         // program. The same submission earned two verdicts.
                         //
                         // **A submission has to end by itself to be accepted.**
-                        // Nothing here stops it any more: the far end is dropped,
+                        // Nothing here stops it anymore: the far end is dropped,
                         // the bytes go on being drained and counted, and whatever
                         // limit the program reaches is what ends it. One that
                         // keeps writing reaches the cap; one that waits for input
@@ -1715,7 +1715,7 @@ fn relay(
                                 far = None;
                             }
                         }
-                        // Nothing is listening any more — the judge exited, or
+                        // Nothing is listening anymore — the judge exited, or
                         // the cap closed its end. Draining is still what keeps the
                         // program out of a blocking `write` until it is stopped,
                         // and it is now also what lets a submission that will not
@@ -2099,7 +2099,7 @@ pub fn scratch(root: &Path, job_id: &str) -> PathBuf {
 mod tests {
     /// A checker that never started, and the thread that used to wait for it.
     ///
-    /// **This is the shape that held a Runner for ever.** The judged run ends,
+    /// **This is the shape that held a Runner forever.** The judged run ends,
     /// `one_test` calls `release` on its way out — and this thread is still
     /// inside the wait for the checker's answer channel, so that release lands
     /// on nobody. It then opened the run's own output, for which no writer would
@@ -2484,7 +2484,7 @@ mod tests {
     }
 
     /// **A lane comes back when the test that had it ends**, or the second
-    /// submission to a Runner waits for ever.
+    /// submission to a Runner waits forever.
     #[tokio::test]
     async fn a_lane_is_given_back_when_the_test_that_had_it_ends() {
         let lanes = Lanes::new(vec![Some("0".to_owned()), Some("1".to_owned())]);
@@ -2531,7 +2531,7 @@ mod tests {
         assert_eq!(in_test_order(done).unwrap_err(), "the second");
     }
 
-    /// A test that never began is not an outcome. Scoring one would mark a
+    /// A test that never began is not an outcome. Scoring one would grade a
     /// submission on tests nobody ran.
     #[test]
     fn a_test_that_never_began_is_not_an_outcome() {

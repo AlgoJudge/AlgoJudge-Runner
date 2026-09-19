@@ -422,7 +422,7 @@ impl Docker {
     ///
     /// **Production wants [`Self::pull_image`] instead**, and the difference is
     /// the early return below: this asks *is one here*, which a moving tag
-    /// answers yes to for ever.
+    /// answers yes to forever.
     pub async fn ensure_image(&self, image: &str) -> Result<()> {
         if self.client.inspect_image(image).await.is_ok() {
             return Ok(());
@@ -1718,7 +1718,7 @@ const _: () = assert!(
 /// the participant for that difference whenever it exceeds whatever constant
 /// stands in for it.
 ///
-/// **Measured, and that is why this is the way round it is.** Across 7077 runs
+/// **Measured, and that is why this is the way around it is.** Across 7077 runs
 /// under load, 2026-09-04, the difference ran to a median of 77 ms and a
 /// maximum of 619 ms -- so a 120 ms allowance charged 5% of honest runs for work
 /// they did not do, by up to half a second, and six correct submissions in a
@@ -1963,7 +1963,7 @@ impl Reaper {
                     // an uninterruptible call is not runnable, and a program
                     // waiting on input is not runnable, so neither raises
                     // pressure and both are still reaped. And a program starved
-                    // for ever is bounded by `cap` below, which nothing resets.
+                    // forever is bounded by `cap` below, which nothing resets.
                     self.idle += since;
                 }
             }
@@ -2556,8 +2556,8 @@ mod tests {
         }
     }
 
-    /// **And the deadline still ends it.** A program starved for ever is not
-    /// left running for ever: nothing resets the absolute cap, so the run stops
+    /// **And the deadline still ends it.** A program starved forever is not
+    /// left running forever: nothing resets the absolute cap, so the run stops
     /// at five times the processor ceiling whatever the pressure says — and it
     /// is reported as [`Stopped::Overall`] rather than as no progress, because
     /// this program was making some.
@@ -2853,7 +2853,7 @@ mod tests {
     /// Two programs deadlocked against each other — each blocked on a read the
     /// other will never satisfy — are the case the window exists for, and the
     /// rule above must not exempt them. What separates this from the test
-    /// before it is a single fact: nothing is crossing any more.
+    /// before it is a single fact: nothing is crossing anymore.
     #[test]
     fn a_seam_that_stops_moving_is_reaped_like_a_silent_program() {
         let mut reaper = timed();
@@ -2881,7 +2881,7 @@ mod tests {
 
     /// The end of it, however busy the program looks. Without this a program
     /// waking for a millisecond every quarter-second never stalls and never
-    /// approaches its limit, and holds a Runner for ever.
+    /// approaches its limit, and holds a Runner forever.
     #[test]
     fn a_trickle_still_ends_at_the_cap() {
         let mut reaper = timed();

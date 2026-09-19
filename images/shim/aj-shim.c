@@ -64,7 +64,7 @@
  * three things that made a forged report hard are down to one that makes it
  * impossible. Absent, the report goes to stderr as it always did.
  *
- * **There is no output cap here any more.** `RLIMIT_FSIZE` was it, and it does
+ * **There is no output cap here anymore.** `RLIMIT_FSIZE` was it, and it does
  * not apply to a pipe -- keeping it would have gone on capping the scratch
  * while silently not capping the thing it was written for. The Runner counts
  * what it reads.
@@ -179,7 +179,7 @@ static void take_nonce(void) {
  *
  * A path that is given and cannot be opened is fatal. There is no third
  * behavior: a Runner that named a channel is waiting on it, and a shim that
- * quietly wrote somewhere else would leave that Runner waiting for ever. */
+ * quietly wrote somewhere else would leave that Runner waiting forever. */
 static void take_report_channel(void) {
     static const char key[] = "AJ_SHIM_REPORT=";
     for (char **entry = environ; *entry != NULL; entry++) {
@@ -220,7 +220,7 @@ static void take_report_channel(void) {
  * **Only memory has to be written.** A child of the container's cgroup is bound
  * by every limit the container has -- processes, processor, the pinned core --
  * because those are hierarchical. That is the whole of what nesting buys over
- * copying four controls into a sibling and keeping them in step for ever. */
+ * copying four controls into a sibling and keeping them in step forever. */
 static char cgroup_at[256];
 static long long memory_bytes;
 static char submissions_procs[512];

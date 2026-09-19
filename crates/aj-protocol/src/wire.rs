@@ -110,7 +110,7 @@ pub struct Register {
     ///
     /// **A seed, and the Server honors it once.** Every other field here is
     /// refreshed whenever this Runner registers again — which is how a restart
-    /// is reported — and this one is not: from the first registration onwards
+    /// is reported — and this one is not: from the first registration onward
     /// the operator owns it in the panel. A Runner that could re-declare its
     /// tags on restart would put itself into an examination's pool with nobody
     /// approving it.
@@ -152,7 +152,7 @@ pub struct ChallengeRequest {
 #[serde(rename_all = "camelCase")]
 pub struct Challenge {
     /// Single-use and short-lived. Both matter: without single use a captured
-    /// exchange replays for ever, and without expiry one captured today works
+    /// exchange replays forever, and without expiry one captured today works
     /// next year.
     pub nonce: String,
     pub expires_at: String,
@@ -285,7 +285,7 @@ pub struct ClaimedJob {
     pub problem_version_props: Option<serde_json::Value>,
     /// The assignment's own configuration, to be laid over the package's.
     ///
-    /// **One layer, not a merged chain.** The Server merges nothing any more;
+    /// **One layer, not a merged chain.** The Server merges nothing anymore;
     /// the only merge left is `Config::overlaid`, here.
     #[serde(default)]
     pub config: Option<serde_json::Value>,

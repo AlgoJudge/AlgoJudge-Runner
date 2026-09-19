@@ -1,4 +1,4 @@
-//! Marking answers, without a container in sight.
+//! Grading answers, without a container in sight.
 //!
 //! `output-only@1` had no test of its own until 2026-08-30, which is an odd gap
 //! for the crate that exists **to be evidence**: it is the second problem type,
@@ -16,7 +16,7 @@ use aj_output_only::{details, mark, Answers};
 use aj_package::{Config, TestSet};
 use aj_standard_io::score::{Judgment, Reason, Status};
 
-/// Two groups worth 40 and 60, so a partial mark is distinguishable from both
+/// Two groups worth 40 and 60, so a partial score is distinguishable from both
 /// zero and full — with one group, a wrong answer and a missing one would look
 /// alike and half these tests would pass for the wrong reason.
 const CONFIG: &str = r#"
@@ -33,7 +33,7 @@ groups:
 
 /// One test's working directory, emptied once so a previous run cannot leak
 /// into this one. **Called once per test**: it deletes, so a second call would
-/// take the package away from the answers that were about to be marked
+/// take the package away from the answers that were about to be graded
 /// against it.
 fn case(name: &str) -> PathBuf {
     let mut root = std::env::temp_dir();

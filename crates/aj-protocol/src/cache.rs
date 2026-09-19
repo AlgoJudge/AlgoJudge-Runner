@@ -151,7 +151,7 @@ impl Entry {
     ///
     /// **Preparing a package is what makes an entry larger after it arrived**,
     /// and eviction otherwise runs only where something was downloaded — so a
-    /// cache that hits every time would unpack and build into itself for ever
+    /// cache that hits every time would unpack and build into itself forever
     /// without ever being asked whether it still fits.
     pub fn evict_to_fit(&self) {
         self.cache.evict_to_fit();
@@ -275,7 +275,7 @@ pub struct Locked<'a> {
 /// A product being assembled, removed if it is not published.
 ///
 /// **The removal is the point of the type.** `aj_package::extract` refuses a
-/// target that already exists, so a fill abandoned half way — a refused
+/// target that already exists, so a fill abandoned halfway — a refused
 /// archive, a full disk, a build that would not run — would otherwise make
 /// every later job of that package fail with "already exists" on this Runner,
 /// naming a cause that has nothing to do with what went wrong.
@@ -526,7 +526,7 @@ impl Cache {
     ///
     /// **Run at start**, like the sandbox's sweep and for the same reason: a
     /// Runner that stopped mid-evaluation left markers saying it was reading
-    /// entries it is not reading any more, and an entry nobody can evict is a
+    /// entries it is not reading anymore, and an entry nobody can evict is a
     /// disk that fills. The instance name survives a restart, so this finds its
     /// own and leaves every other Runner's alone.
     ///
@@ -1574,7 +1574,7 @@ mod tests {
         );
     }
 
-    /// **A dotted file id cannot reach a neighbor's name any more**, because
+    /// **A dotted file id cannot reach a neighbor's name anymore**, because
     /// what is being named sits *inside* the entry rather than beside it. The
     /// hazard was real while the suffix replaced an extension: a file id of
     /// `a.b` produced `a.partial`, which is where the entry named `a` would

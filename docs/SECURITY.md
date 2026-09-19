@@ -57,7 +57,7 @@ trusted code.
 | wall clock = **four times the limit plus four seconds without progress** | not a limit anybody is judged against: a time limit is processor time, so this reaps what is *not* spending any — one stuck in an uninterruptible syscall, or one that waits for input that never comes. It counts **consecutive** time: any processor time at all resets it, so a program descheduled on a busy host is never reaped for it. Four times the limit is roughly a host loaded four times past what it can carry, and the four seconds are what make this the guard against a hang at a limit small enough that four times it would not be |
 | processor time past **the limit plus two seconds** | there is no reason to keep waiting; the verdict is still decided afterwards on the measurement. Added rather than multiplied: the reading is the cgroup's, so it carries the container's own start, and a container costs what it costs whatever limit the problem set |
 | wall clock past **five times that ceiling**, whatever the progress | the last bound there is, and the only one a program making steady progress can reach — one waking for a millisecond a tick never stalls and never approaches its limit. Five times what the run was entitled to spend, so a problem allowed more processor time has earned more wall clock. It is reported as its own outcome, because "no processor time for four seconds" is false about a run that spent some in every one of them |
-| an output cap counted **as the bytes cross** | 2026-09-05. Nothing stores a submission's output any more: it goes from the program to whatever is comparing it, one 64 KiB copy at a time, and the count is taken there. It used to be `RLIMIT_FSIZE` on a file, and before that a count of what the daemon had already written to its own log — 76 MB of it, measured, for one flooding submission against a 64 MiB cap. What the cap now bounds is what one submission can make the **Runner** hold, and it is reached only by output with no separator in it: anything else is decided wrong long before |
+| an output cap counted **as the bytes cross** | 2026-09-05. Nothing stores a submission's output anymore: it goes from the program to whatever is comparing it, one 64 KiB copy at a time, and the count is taken there. It used to be `RLIMIT_FSIZE` on a file, and before that a count of what the daemon had already written to its own log — 76 MB of it, measured, for one flooding submission against a 64 MiB cap. What the cap now bounds is what one submission can make the **Runner** hold, and it is reached only by output with no separator in it: anything else is decided wrong long before |
 | **nothing on the container's own streams** | 2026-09-05. A judged container is started with no log driver at all, its output travels on a pipe, and its standard error goes to `/dev/null`. There is nothing for the daemon to write down, which is what removed the write amplification above; and an image with no measuring shim can no longer judge, because for it that silence would be indistinguishable from a program that printed nothing |
 
 **No step that runs a submission is given a tmpfs.** The two profiles that ask
@@ -207,7 +207,7 @@ Two things that follow, and are easy to get wrong in the opposite direction:
 
 - **The submission's output is a pipe in every case** (2026-09-05), and this is
   where the paragraph above stops applying: nobody re-reads their own output. It
-  is read once, forwards, by the Runner, which either compares it token by token
+  is read once, forward, by the Runner, which either compares it token by token
   or copies it onward to a checker. What that buys is the point of it — a wrong
   answer is found at the first differing token and the program is stopped there,
   instead of being left to produce an answer nobody was going to look at.
@@ -380,7 +380,7 @@ Stated so that absence is not read as a decision:
 
 ## 7. Reporting something
 
-This is a component that runs code written by people who are being marked. If
+This is a component that runs code written by people who are being graded. If
 you find a way out of §2, or a way to reach the host that §3 does not describe,
 report it privately, as [SECURITY.md](../SECURITY.md) describes — not in a
 public issue.

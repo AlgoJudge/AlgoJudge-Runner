@@ -72,7 +72,7 @@ ENV AJ_Runner__KeyPath=/var/lib/algojudge-runner/identity.key \
     AJ_Cache__Path=/var/cache/algojudge-runner
 
 # No port is published, and none is listened on: the Runner dials out, which is
-# the whole reason one can sit behind a domestic router.
+# the whole reason one can sit behind a home router.
 
 USER nonroot
 ENTRYPOINT ["/usr/local/bin/algojudge-runner"]

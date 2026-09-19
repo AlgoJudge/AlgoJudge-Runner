@@ -114,7 +114,7 @@ impl Beside {
                 // The sender lives in this same `Arc`, so it cannot have been
                 // dropped while this future is held — but a branch of a
                 // `select!` that resolved on a closed channel would silently
-                // kill every run, so it waits for ever instead.
+                // kill every run, so it waits forever instead.
                 std::future::pending::<()>().await;
             }
         }

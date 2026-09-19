@@ -1354,7 +1354,7 @@ oom_kill 0
     /// shape.** A lane's slice has to be a sibling of the slice a Runner has
     /// always had, not a child of it: `-l1` would nest, and both the leak check
     /// in CI and `a_measured_run_leaves_no_cgroup_behind` read a level that a
-    /// nested slice would sit in for ever.
+    /// nested slice would sit in forever.
     #[test]
     fn a_lanes_slice_is_a_sibling_of_the_one_a_single_lane_runner_has() {
         let alone = Cgroups::choose("systemd", root(), "abc").expect("a backend");

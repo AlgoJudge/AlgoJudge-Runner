@@ -24,7 +24,7 @@ pub struct Checked {
     /// checker may echo a program's output into it — so it is carried as text
     /// and rendered as text, and nothing here pretends to sanitize it.
     pub comment: String,
-    /// 0–100. Absent in the output means full marks for an accepted test.
+    /// 0–100. Absent in the output means full credit for an accepted test.
     pub percentage: u32,
 }
 
@@ -64,7 +64,7 @@ pub fn checker_said(exit_code: i64, stdout: &[u8]) -> Result<Checked, Broken> {
     let comment = lines.next().unwrap_or("").trim().to_owned();
 
     let percentage = match lines.next().map(str::trim).filter(|l| !l.is_empty()) {
-        // Absent means full marks — for an accepted test. A rejected one is
+        // Absent means full credit — for an accepted test. A rejected one is
         // worth nothing whatever the checker left out.
         None => {
             if accepted {
@@ -83,7 +83,7 @@ pub fn checker_said(exit_code: i64, stdout: &[u8]) -> Result<Checked, Broken> {
         accepted,
         comment,
         // A checker that says WRONG and 100 is contradicting itself. The
-        // rejection wins: it is the explicit statement, and awarding full marks
+        // rejection wins: it is the explicit statement, and awarding full credit
         // for a wrong answer is the worse way to resolve it.
         percentage: if accepted { percentage } else { 0 },
     })

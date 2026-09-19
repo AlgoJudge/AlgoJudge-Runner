@@ -393,7 +393,7 @@ mod tests {
 
     /// An empty `cpuset_cpus` is a container the daemon refuses, so a lane
     /// without a processor of its own must be given the whole set rather than
-    /// nothing. The refusal that stops an operator getting here lives at
+    /// nothing. The refusal that stops an operator from getting here lives at
     /// start-up, where it can name the variable.
     #[test]
     fn a_lane_is_never_given_no_processors() {

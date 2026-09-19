@@ -15,7 +15,7 @@
 //!   scan of roughly fifteen seconds — a slower Runner would not be the reason
 //!   anybody waited.
 //! - **Jitter**, because without it a room full of Runners that started
-//!   together stays synchronized for ever and asks in one burst.
+//!   together stays synchronized forever and asks in one burst.
 
 use std::time::Duration;
 

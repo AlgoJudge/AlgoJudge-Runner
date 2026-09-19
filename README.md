@@ -3,7 +3,7 @@
 AlgoJudge is open-source, self-hosted software for programming contests and
 courses, with automatic evaluation of submitted solutions.
 
-This is the component that does the evaluating: isolated execution and marking,
+This is the component that does the evaluating: isolated execution and grading,
 for [AlgoJudge](https://github.com/AlgoJudge).
 
 ## Documentation
@@ -22,7 +22,7 @@ This README contains repository-specific information about development, building
 **It judges.** This Runner registers, is approved, authenticates, claims jobs,
 holds and renews a lease, downloads and verifies packages, unpacks them,
 compiles and runs a submission in isolated containers, scores it by groups, and
-reports the mark with the compiler's log and a per-test table attached.
+reports the result with the compiler's log and a per-test table attached.
 
 **Two problem types, and eighteen toolchains.** `standard-io@1` in C, C++ and
 Python — the table is `crates/aj-standard-io/src/language.rs` — and
@@ -47,7 +47,7 @@ for a reader at
 Three properties of it shape everything here:
 
 1. **The Runner opens an outbound connection.** The Server never calls a Runner,
-   which is what lets one sit behind a domestic router with no public address.
+   which is what lets one sit behind a home router with no public address.
 2. **There is no socket for a Runner.** The queue is polled, and an empty one
    answers `204` — a normal state, not an error. This is simpler than a socket,
    survives a dropped connection with no reconnection logic, and cannot deliver
@@ -55,7 +55,7 @@ Three properties of it shape everything here:
 3. **The Runner is stateless apart from a package cache.** It holds each
    archive it has downloaded, the package unpacked from it and the judge
    compiled out of that — prepared once for every submission to the problem,
-   under a lock several Runners can share — and discarding the lot costs a
+   under a lock several Runners can share — and discarding all of it costs a
    download rather than a result. One that dies mid-evaluation resumes nothing
    and nobody comes back for that work. The
    Server's **lease** is the whole recovery story: it expires, the job returns
@@ -138,7 +138,7 @@ Nothing here is claimed without a test that runs it.
 | `cargo test` | the pure parts — the checker contract, comparison, scoring, the archive defenses |
 | `--test conformance` | the wire protocol, against a real Server, with this Runner as the client |
 | `--test adversarial` | the isolation, against real containers, one case per attack |
-| `--test judging` | a real submission compiled, run and marked, against the committed package |
+| `--test judging` | a real submission compiled, run and graded, against the committed package |
 | `--test end_to_end` | **the whole product**: a manager publishes, a participant submits, this Runner judges, and what is asserted is what the participant reads |
 
 The last four need a container runtime and are `#[ignore]`d so an ordinary

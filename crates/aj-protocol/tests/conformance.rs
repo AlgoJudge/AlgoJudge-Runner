@@ -843,7 +843,7 @@ impl Participant {
 
         // One opaque document, and a file name. The language was a field the
         // Server read; it is a member of `props` now, and pasted source is named
-        // by the sender because the Server has no extension table any more.
+        // by the sender because the Server has no extension table anymore.
         let form = reqwest::multipart::Form::new()
             .text("props", r#"{"type":"standard-io@1","language":"python"}"#)
             .text("code", source.to_owned())

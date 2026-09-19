@@ -478,7 +478,7 @@ impl Config {
         for (name, value) in members {
             // These say what the document *is*; an overlay does not get to
             // change that. `format` and `version` are the spelling used before
-            // 2026-08-22 and are skipped too, so an overlay cannot reach round
+            // 2026-08-22 and are skipped too, so an overlay cannot reach around
             // the front door by using the old name.
             if name == "type" || name == "format" || name == "version" {
                 continue;
@@ -1192,7 +1192,7 @@ calibration:
     }
 
     /// **Both is not a richer package, it is an unanswered question**, and the
-    /// refusal is what stops this Runner answering it on the author's behalf.
+    /// refusal is what stops this Runner from answering it on the author's behalf.
     #[test]
     fn a_package_declaring_both_a_checker_and_an_interactor_is_refused() {
         let yaml = FROM_THE_SPECIFICATION.replace(

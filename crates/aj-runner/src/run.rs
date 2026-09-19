@@ -19,7 +19,7 @@ use aj_protocol::stopping::Stopping;
 ///
 /// None of the waiting here is a failure. A Runner announces itself and an
 /// administrator approves it, possibly tomorrow; a process that exited because
-/// nobody had got to it yet would have to be watched by something else.
+/// nobody had gotten to it yet would have to be watched by something else.
 pub async fn admitted(
     server: &Server,
     identity: &Identity,
@@ -198,7 +198,7 @@ async fn wait_out(
     stopping.sleep(delay).await
 }
 
-/// Claim, evaluate, report. For ever.
+/// Claim, evaluate, report. Forever.
 pub async fn work(
     server: &Arc<Server>,
     cache: &Arc<Cache>,
@@ -286,7 +286,7 @@ pub async fn work(
             }
             // An empty queue is the ordinary state of a Runner, not a fault.
             Ok(None) => {
-                // **Only when there is no marking to do.** A trial produces
+                // **Only when there is no grading to do.** A trial produces
                 // timings for somebody who asked; a job decides somebody's
                 // grade. Asking for trials first would let a busy trial queue
                 // delay a verdict, which is the one thing the separate table
@@ -689,7 +689,7 @@ async fn evaluate(
 
         Err(Trouble::Away(e)) => {
             // Warning rather than error, and worded for whoever reads the log
-            // afterwards: nothing was lost and nothing needs doing.
+            // afterwards: nothing was lost and nothing needs to be done.
             tracing::warn!(
                 job = %job.job_id,
                 submission = %job.submission_id,
