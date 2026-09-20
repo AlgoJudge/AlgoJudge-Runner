@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "aj-output-only"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aj-package",
  "aj-standard-io",
@@ -23,7 +23,7 @@ dependencies = [
 
 [[package]]
 name = "aj-package"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "aj-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "aj-runner"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aj-output-only",
  "aj-package",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "aj-sandbox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bollard",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "aj-standard-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aj-package",
  "aj-sandbox",
@@ -1559,9 +1559,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.44"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6725596c3f2c3a0aef021139e145d4eafe314a6623e4680ca83852b2c67ab2ba"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "once_cell",
  "ring",

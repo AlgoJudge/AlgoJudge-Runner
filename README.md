@@ -68,19 +68,19 @@ Pushing a `v*` tag publishes **five images under one version**, to GitHub's
 container registry:
 
 ```bash
-docker pull ghcr.io/algojudge/algojudge-runner:0.1.0
-docker pull ghcr.io/algojudge/lang-gcc:0.1.0
-docker pull ghcr.io/algojudge/lang-clang:0.1.0
-docker pull ghcr.io/algojudge/lang-python:0.1.0
-docker pull ghcr.io/algojudge/lang-pypy:0.1.0
+docker pull ghcr.io/algojudge/algojudge-runner:0.2.0
+docker pull ghcr.io/algojudge/lang-gcc:0.2.0
+docker pull ghcr.io/algojudge/lang-clang:0.2.0
+docker pull ghcr.io/algojudge/lang-python:0.2.0
+docker pull ghcr.io/algojudge/lang-pypy:0.2.0
 ```
 
 **All five, because a Runner without the language images judges nothing**, and
 because a release is tested as one set: the images and the binary are built,
 checked and pushed together, or not at all.
 
-`0.1.0`, `0.1`, `0` and `latest` point at the same image; **a prerelease
-(`v0.1.0-rc.1`) publishes only its own tag**, so nothing moving ever points at a
+`0.2.0`, `0.2`, `0` and `latest` point at the same image; **a prerelease
+(`v0.2.0-rc.1`) publishes only its own tag**, so nothing moving ever points at a
 release candidate.
 
 The Runner is `linux/amd64` only. That is not an oversight: cgroup v2 on amd64 is
@@ -91,10 +91,10 @@ A deployment names the language images explicitly, because the built-in defaults
 (`algojudge/lang-gcc:local`) are what the development stack builds locally:
 
 ```sh
-AJ_Sandbox__Image__Gcc=ghcr.io/algojudge/lang-gcc:0.1.0
-AJ_Sandbox__Image__Clang=ghcr.io/algojudge/lang-clang:0.1.0
-AJ_Sandbox__Image__Python=ghcr.io/algojudge/lang-python:0.1.0
-AJ_Sandbox__Image__Pypy=ghcr.io/algojudge/lang-pypy:0.1.0
+AJ_Sandbox__Image__Gcc=ghcr.io/algojudge/lang-gcc:0.2.0
+AJ_Sandbox__Image__Clang=ghcr.io/algojudge/lang-clang:0.2.0
+AJ_Sandbox__Image__Python=ghcr.io/algojudge/lang-python:0.2.0
+AJ_Sandbox__Image__Pypy=ghcr.io/algojudge/lang-pypy:0.2.0
 ```
 
 Each is independent: anything left unset keeps its compiled-in default, so an
