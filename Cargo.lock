@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "aj-output-only"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aj-package",
  "aj-standard-io",
@@ -23,7 +23,7 @@ dependencies = [
 
 [[package]]
 name = "aj-package"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "aj-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "aj-runner"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aj-output-only",
  "aj-package",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "aj-sandbox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bollard",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "aj-standard-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aj-package",
  "aj-sandbox",
